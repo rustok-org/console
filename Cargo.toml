@@ -1,0 +1,15 @@
+[package]
+name = "rustok-console"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Rustok Console — terminal approval screen for the Rustok self-custody wallet (the human face)"
+repository = "https://github.com/rustok-org/console"
+
+# Dependencies (ratatui, crossterm) land with the C-PR-1 implementation; the
+# bootstrap crate stays dependency-free so CI/deny are meaningful from day one.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
