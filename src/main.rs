@@ -6,15 +6,26 @@
 //! C-PR-1b. UI goes to stderr (ratatui's alternate screen); the exit code carries
 //! the outcome.
 
+use std::io::{self, Stderr};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use ratatui::DefaultTerminal;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 
 use rustok_console::app::{Model, Msg, Phase};
 use rustok_console::transport::{Transport, TransportError};
 use rustok_console::ui;
+
+/// The console's terminal — rendered to **stderr**, so stdout stays clean for a
+/// machine-readable decision (invariant #7; the approval verdict lands on stdout
+/// in C-PR-1b). `ratatui::init` would use stdout, so the setup is done by hand.
+type Tui = Terminal<CrosstermBackend<Stderr>>;
 
 /// Default approver socket path (overridable for tests / non-standard layouts).
 const DEFAULT_SOCKET: &str = "/run/wallet/approve.sock";
@@ -33,20 +44,50 @@ fn main() -> ExitCode {
 
     // No TTY → view-only is not possible for an interactive approver; fail clearly
     // rather than half-render. (The full no-TTY view-only gate is C-PR-1b.)
-    let Ok(terminal) = ratatui::try_init() else {
+    let Ok(terminal) = try_init() else {
         eprintln!("rustok-console needs an interactive terminal (a TTY).");
         return ExitCode::from(EXIT_NO_TTY);
     };
 
     let transport = Transport::connect(&path);
     let code = run(terminal, &transport);
-    ratatui::restore();
+    let _ = restore();
     ExitCode::from(code)
+}
+
+/// Set up the terminal on **stderr** (raw mode + alternate screen) and install a
+/// panic hook that restores it. Mirrors `ratatui::init`, but targets stderr so
+/// stdout stays clean. `enable_raw_mode` opens `/dev/tty` directly, so only the
+/// alternate-screen escape and the backend are pointed at stderr.
+///
+/// # Errors
+/// Propagates the raw-mode / alternate-screen error — notably when there is no TTY.
+fn try_init() -> io::Result<Tui> {
+    set_panic_hook();
+    enable_raw_mode()?;
+    let mut stderr = io::stderr();
+    execute!(stderr, EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(stderr))
+}
+
+/// Restore the terminal: leave the alternate screen, disable raw mode.
+fn restore() -> io::Result<()> {
+    execute!(io::stderr(), LeaveAlternateScreen)?;
+    disable_raw_mode()
+}
+
+/// Restore the terminal before a panic prints, so the message stays readable.
+fn set_panic_hook() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore();
+        hook(info);
+    }));
 }
 
 /// The event loop: draw, read input, drain worker replies, tick the poll. Returns
 /// the exit code. A `Fatal` phase is shown until a keypress, then exits.
-fn run(mut terminal: DefaultTerminal, transport: &Transport) -> u8 {
+fn run(mut terminal: Tui, transport: &Transport) -> u8 {
     let mut model = Model::new();
     let mut last_tick = Instant::now();
 

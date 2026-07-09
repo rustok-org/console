@@ -9,20 +9,15 @@ repository = "https://github.com/rustok-org/console"
 
 [dependencies]
 # TUI: immediate-mode render + its own event loop (crossterm::event::poll), no async
-# runtime — per AGENTS.md. crossterm is pinned to the version ratatui 0.30 re-exports
-# so the event API and the backend agree.
+# runtime — per AGENTS.md. crossterm is used through ratatui's re-export
+# (ratatui::crossterm::…), so it is not a direct dependency; ratatui pins the
+# matching version.
 ratatui = "0.30"
-crossterm = "0.29"
 # Wire protocol (JSON Lines) — serde types mirror docs/APPROVER-PROTOCOL.md.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # PIN hygiene: the PIN and its serialized auth request live in Zeroizing buffers.
 zeroize = "1"
-
-[dev-dependencies]
-# Snapshot assertions for TUI render tests (TestBackend), where a snapshot reads
-# clearer than field-by-field checks.
-insta = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

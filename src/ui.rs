@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AuthError, Model, Phase};
 use crate::protocol::{Card, Summary};
@@ -171,7 +171,15 @@ fn render_detail(frame: &mut Frame, card: Option<&Card>, area: ratatui::layout::
             }
         }
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    // Wrap (never truncate): a clear-signing card must show the whole value —
+    // a silently clipped raw_data or address would be the one lie this screen
+    // exists to prevent. trim: false keeps the exact bytes, including leading space.
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn kv(key: &str, value: &str) -> Line<'static> {
@@ -193,19 +201,29 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    /// Render the model into a fixed grid and flatten the buffer to a String for
-    /// substring assertions.
-    fn draw(model: &Model, w: u16, h: u16) -> String {
+    /// Render into a fixed grid, returning the screen as rows. Row-level checks
+    /// catch a field rendered under the WRONG label (a swap) — which a
+    /// whole-screen substring check would miss.
+    fn draw_rows(model: &Model, w: u16, h: u16) -> Vec<String> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, model)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
+        let buffer = terminal.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    /// Flatten to one String for checks that do not care about layout.
+    fn draw(model: &Model, w: u16, h: u16) -> String {
+        draw_rows(model, w, h).join("\n")
+    }
+
+    /// True if some rendered line contains all `fragments` — a label+value
+    /// adjacency check, so a swapped field is caught.
+    fn has_line_with(rows: &[String], fragments: &[&str]) -> bool {
+        rows.iter()
+            .any(|row| fragments.iter().all(|f| row.contains(f)))
     }
 
     fn summary(id: &str, to: &str, amount: &str, high_risk: bool) -> Summary {
@@ -266,10 +284,19 @@ mod tests {
                 false,
             )],
         );
-        let screen = draw(&m, 90, 20);
-        // the address and the decimal wei render exactly as received (verbatim).
-        assert!(screen.contains("0x742d35Cc6634C0532925a3b844Bc454e4438f44e"));
-        assert!(screen.contains("100000000000000000"));
+        let rows = draw_rows(&m, 90, 20);
+        // Address AND decimal wei on the SAME line, verbatim — a swap would split
+        // them across lines.
+        assert!(
+            has_line_with(
+                &rows,
+                &[
+                    "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                    "100000000000000000",
+                ],
+            ),
+            "address and amount must render together, exactly as received"
+        );
     }
 
     #[test]
@@ -302,13 +329,27 @@ mod tests {
         m.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
             boxed,
         ))));
-        let screen = draw(&m, 100, 24);
-        assert!(screen.contains("approve"), "method rendered");
-        assert!(screen.contains("0xdeadbeef"), "spender verbatim");
+        let rows = draw_rows(&m, 100, 24);
+        // Each value under its OWN label on one line — catches a field swap (e.g.
+        // spender rendered where `to` should be).
+        assert!(
+            has_line_with(&rows, &["method", "approve"]),
+            "method under its label"
+        );
+        assert!(
+            has_line_with(&rows, &["spender", "0xdeadbeef"]),
+            "spender under its label (not swapped into another field)"
+        );
         // the 0x-hex amount is shown as received, not converted to a number
-        assert!(screen.contains("0xffffffffffffffff"), "hex amount verbatim");
-        assert!(screen.contains("0x095ea7b3deadbeef"), "raw_data verbatim");
-        assert!(screen.contains("UNLIMITED"));
+        assert!(
+            has_line_with(&rows, &["amount", "0xffffffffffffffff"]),
+            "hex amount verbatim under its label"
+        );
+        assert!(
+            has_line_with(&rows, &["raw_data", "0x095ea7b3deadbeef"]),
+            "raw_data verbatim under its label"
+        );
+        assert!(rows.iter().any(|r| r.contains("UNLIMITED")));
     }
 
     #[test]

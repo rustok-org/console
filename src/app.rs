@@ -63,10 +63,17 @@ impl Pin {
     /// so no JSON escaping is needed.
     #[must_use]
     pub fn auth_line(&self) -> Zeroizing<String> {
-        let mut line = Zeroizing::new(String::with_capacity(21 + self.0.len()));
-        line.push_str(r#"{"op":"auth","pin":""#);
+        const PREFIX: &str = r#"{"op":"auth","pin":""#;
+        const SUFFIX: &str = r#""}"#;
+        // Reserve exactly so the buffer never reallocates — a realloc would free
+        // the old allocation (with the PIN in it) WITHOUT zeroizing. Named
+        // constants keep the reservation correct if the format ever changes.
+        let mut line = Zeroizing::new(String::with_capacity(
+            PREFIX.len() + self.0.len() + SUFFIX.len(),
+        ));
+        line.push_str(PREFIX);
         line.push_str(&self.0);
-        line.push_str(r#""}"#);
+        line.push_str(SUFFIX);
         line
     }
 }
@@ -486,6 +493,24 @@ mod tests {
         assert_eq!(&*line, r#"{"op":"auth","pin":"123"}"#);
     }
 
+    #[test]
+    fn pin_auth_line_reserves_exactly_so_the_buffer_never_reallocates() {
+        // A realloc frees the old buffer (with the PIN) WITHOUT zeroizing it. The
+        // reserved capacity must fit the assembled line exactly, for any PIN length.
+        for n in 1..=12 {
+            let mut pin = Pin::default();
+            for _ in 0..n {
+                pin.push('9');
+            }
+            let line = pin.auth_line();
+            assert_eq!(
+                line.capacity(),
+                line.len(),
+                "auth_line must reserve exactly (no realloc) for pin_len {n}"
+            );
+        }
+    }
+
     // ── one request in flight ──
 
     #[test]
@@ -620,5 +645,32 @@ mod tests {
             m.phase(),
             Phase::Fatal(TransportError::ConnectionLost)
         ));
+    }
+
+    #[test]
+    fn pin_pop_on_empty_is_safe() {
+        let mut pin = Pin::default();
+        pin.pop(); // must not panic on an empty PIN
+        assert!(pin.is_empty());
+    }
+
+    #[test]
+    fn navigation_saturates_at_the_edges() {
+        let mut m = watching(vec![summary("a"), summary("b")]);
+        m.update(Msg::MoveUp); // already at the top → stays at 0
+        let Phase::Watching { selected, .. } = m.phase() else {
+            panic!("watching");
+        };
+        assert_eq!(*selected, 0);
+        for _ in 0..5 {
+            m.update(Msg::MoveDown); // past the end → clamps to the last row
+        }
+        let Phase::Watching {
+            selected, items, ..
+        } = m.phase()
+        else {
+            panic!("watching");
+        };
+        assert_eq!(*selected, items.len() - 1);
     }
 }

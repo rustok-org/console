@@ -97,28 +97,49 @@ impl std::fmt::Display for TransportError {
     }
 }
 
+impl std::error::Error for TransportError {}
+
 /// The MVU layer's handle to the worker: send [`Request`]s, receive [`Reply`]s.
-/// Dropping it closes the request channel, which ends the worker.
+/// Dropping it ends the worker (see [`Transport::drop`]).
 pub struct Transport {
     req_tx: Sender<Request>,
     reply_rx: Receiver<Reply>,
     worker: Option<JoinHandle<()>>,
+    /// A clone of the socket kept solely so `Drop` can `shutdown` it and unblock a
+    /// worker parked in a blocking read. `None` if the connect failed.
+    shutdown: Option<UnixStream>,
 }
 
 impl Transport {
     /// Connect to the approver socket at `path` and start the worker. The worker
     /// performs the `hello` handshake immediately; its first [`Reply`] is either
-    /// [`Reply::Hello`] or a [`Reply::Fatal`]. Non-blocking: returns at once.
+    /// [`Reply::Hello`] or a [`Reply::Fatal`]. The connect itself is synchronous —
+    /// a local UNIX connect does not block on a handshake — so a clone of the
+    /// stream can be kept for [`Transport::drop`] to shut down; everything after
+    /// (handshake, requests) runs on the worker thread.
     #[must_use]
     pub fn connect(path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref().to_path_buf();
         let (req_tx, req_rx) = channel::<Request>();
         let (reply_tx, reply_rx) = channel::<Reply>();
-        let worker = std::thread::spawn(move || worker_loop(&path, &req_rx, &reply_tx));
+
+        let (worker, shutdown) = match UnixStream::connect(path.as_ref()) {
+            Ok(stream) => {
+                // Closing the request channel does NOT interrupt a blocking
+                // read_line in the worker; a shutdown on this clone does.
+                let shutdown = stream.try_clone().ok();
+                let worker = std::thread::spawn(move || worker_loop(stream, &req_rx, &reply_tx));
+                (Some(worker), shutdown)
+            }
+            Err(_) => {
+                let _ = reply_tx.send(Reply::Fatal(TransportError::NotConnected));
+                (None, None)
+            }
+        };
         Self {
             req_tx,
             reply_rx,
-            worker: Some(worker),
+            worker,
+            shutdown,
         }
     }
 
@@ -143,9 +164,15 @@ impl Transport {
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        // Closing the request channel ends the worker's `recv` loop; join so the
-        // thread (and its socket) is gone before we return.
+        // Close the request channel (ends the worker's idle `recv`) AND shut the
+        // socket down. Closing the channel alone does NOT interrupt a worker parked
+        // in a blocking read — a stalled server would then hang `join` forever; the
+        // shutdown unblocks that read. Then join so the thread and its socket are
+        // gone before we return.
         drop(std::mem::replace(&mut self.req_tx, channel().0));
+        if let Some(stream) = &self.shutdown {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -154,13 +181,9 @@ impl Drop for Transport {
 
 /// The worker body: connect, handshake, then serve one request at a time until
 /// the request channel closes or the connection fails.
-fn worker_loop(path: &Path, req_rx: &Receiver<Request>, reply_tx: &Sender<Reply>) {
-    let Ok(stream) = UnixStream::connect(path) else {
-        let _ = reply_tx.send(Reply::Fatal(TransportError::NotConnected));
-        return;
-    };
+fn worker_loop(stream: UnixStream, req_rx: &Receiver<Request>, reply_tx: &Sender<Reply>) {
     let Ok(write_half) = stream.try_clone() else {
-        let _ = reply_tx.send(Reply::Fatal(TransportError::NotConnected));
+        let _ = reply_tx.send(Reply::Fatal(TransportError::ConnectionLost));
         return;
     };
     let mut writer = write_half;
@@ -479,5 +502,75 @@ mod tests {
             t.recv(),
             Some(Reply::Fatal(TransportError::Protocol(_)))
         ));
+    }
+
+    /// Accepts and reads the hello, signals `ready`, then blocks on a second read —
+    /// holding the connection open without ever replying. Only a client-side
+    /// shutdown ends it.
+    struct StallServer {
+        path: PathBuf,
+        handle: Option<JoinHandle<()>>,
+        ready: Receiver<()>,
+    }
+
+    impl StallServer {
+        fn start(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rustok_console_t1a_{}_{tag}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind stall socket");
+            let (ready_tx, ready) = channel();
+            let handle = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line); // read the hello request
+                let _ = ready_tx.send(()); // the worker is now parked on the reply read
+                let mut sink = String::new();
+                let _ = reader.read_line(&mut sink); // block until the client shuts down
+            });
+            Self {
+                path,
+                handle: Some(handle),
+                ready,
+            }
+        }
+
+        fn wait_ready(&self) {
+            let _ = self.ready.recv();
+        }
+    }
+
+    impl Drop for StallServer {
+        fn drop(&mut self) {
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn drop_does_not_hang_when_the_server_stalls() {
+        // The server reads the hello but never replies, so the worker is parked in
+        // a blocking read. Dropping the Transport must shut the socket down and
+        // return — not hang on join. Red without the Drop shutdown (times out).
+        let server = StallServer::start("stall");
+        let t = Transport::connect(&server.path);
+        server.wait_ready();
+
+        let (done_tx, done_rx) = channel();
+        std::thread::spawn(move || {
+            drop(t);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "Transport::drop must shut the socket down and return, not hang"
+        );
     }
 }
