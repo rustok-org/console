@@ -9,8 +9,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{AuthError, Model, Phase};
-use crate::protocol::{Card, Summary};
+use crate::app::{AuthError, Confirm, ExitOutcome, Model, Phase, ResolveError};
+use crate::protocol::{Card, ResolveOutcome, Summary};
 
 /// Render the whole screen for the current model.
 pub fn render(frame: &mut Frame, model: &Model) {
@@ -22,11 +22,32 @@ pub fn render(frame: &mut Frame, model: &Model) {
         Phase::Watching {
             items,
             selected,
-            card,
+            confirm,
             note,
-        } => render_watch(frame, items, *selected, card.as_deref(), note.as_deref()),
+        } => render_watch(frame, items, *selected, confirm.as_deref(), note.as_deref()),
+        Phase::Resolved { outcome, exit } => render_centered(frame, &resolved_text(outcome, *exit)),
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
+}
+
+/// The terminal answer, shown verbatim before the console exits.
+fn resolved_text(outcome: &ResolveOutcome, exit: ExitOutcome) -> String {
+    let detail = match outcome {
+        ResolveOutcome::Executed { tx_hash } => format!("executed — {tx_hash}"),
+        ResolveOutcome::Failed { reason } => format!("execution failed — {reason}"),
+        ResolveOutcome::Denied => "denied".to_owned(),
+        ResolveOutcome::AlreadyResolved { state } => {
+            format!("already resolved by someone else ({state:?})")
+        }
+        other => format!("{other:?}"),
+    };
+    let headline = match exit {
+        ExitOutcome::Approved => "APPROVED",
+        ExitOutcome::Rejected => "REJECTED",
+        ExitOutcome::Expired => "EXPIRED",
+        ExitOutcome::Failed => "FAILED",
+    };
+    format!("{headline}\n\n{detail}\n\nPress any key to close.")
 }
 
 fn render_centered(frame: &mut Frame, message: &str) {
@@ -66,7 +87,7 @@ fn render_watch(
     frame: &mut Frame,
     items: &[Summary],
     selected: usize,
-    card: Option<&Card>,
+    confirm: Option<&Confirm>,
     note: Option<&str>,
 ) {
     let chunks = Layout::vertical([
@@ -83,9 +104,19 @@ fn render_watch(
     );
 
     render_queue(frame, items, selected, chunks[1]);
-    render_detail(frame, card, chunks[2]);
+    render_detail(frame, confirm, chunks[2]);
 
-    let footer = note.unwrap_or("↑/↓ select · enter open · q quit  (approve/deny in C-PR-1b)");
+    let footer = note.unwrap_or_else(|| {
+        confirm.map_or("↑/↓ select · enter open · q quit", |c| {
+            if c.is_resolving() {
+                "sending your decision…"
+            } else if c.pin_len().is_some() {
+                "enter your PIN · enter approve · esc reject"
+            } else {
+                "y approve · n/esc reject"
+            }
+        })
+    });
     frame.render_widget(Paragraph::new(footer), chunks[3]);
 }
 
@@ -129,16 +160,17 @@ fn kind_word(s: &Summary) -> &'static str {
     }
 }
 
-/// Render the selected card **verbatim** — the core's fields as received, no
-/// re-derivation. `None` shows a hint to open one.
-fn render_detail(frame: &mut Frame, card: Option<&Card>, area: ratatui::layout::Rect) {
+/// Render the open confirmation's card **verbatim** — the core's fields as
+/// received, no re-derivation. `None` shows a hint to open one.
+fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
     let block = Block::bordered().title(" Card ");
-    let Some(card) = card else {
+    let Some(confirm) = confirm else {
         let hint =
             Paragraph::new("Select a request and press enter to see the full card.").block(block);
         frame.render_widget(hint, area);
         return;
     };
+    let card: &Card = confirm.card();
 
     let mut lines = vec![
         kv("to", &card.to),
@@ -171,6 +203,20 @@ fn render_detail(frame: &mut Frame, card: Option<&Card>, area: ratatui::layout::
             }
         }
     }
+    if let Some(pin_len) = confirm.pin_len() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("High-risk approval — enter your PIN:"));
+        // Only the count is shown — never the digits.
+        lines.push(Line::from(Span::styled(
+            "●".repeat(pin_len),
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(err) = confirm.error() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(resolve_error_text(err)));
+    }
+
     // Wrap (never truncate): a clear-signing card must show the whole value —
     // a silently clipped raw_data or address would be the one lie this screen
     // exists to prevent. trim: false keeps the exact bytes, including leading space.
@@ -180,6 +226,17 @@ fn render_detail(frame: &mut Frame, card: Option<&Card>, area: ratatui::layout::
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn resolve_error_text(err: &ResolveError) -> String {
+    match err {
+        ResolveError::PinRequired => "This approval needs your PIN.".to_owned(),
+        ResolveError::BadPin(left) => format!("Wrong PIN — {left} attempt(s) left."),
+        ResolveError::Locked(secs) => format!("Locked out. Try again in {secs}s."),
+        ResolveError::NotSet => "This wallet has no PIN set (run set-pin).".to_owned(),
+        ResolveError::Unavailable => "PIN check unavailable — try again.".to_owned(),
+        ResolveError::Busy => "Another approval is executing this request — retry.".to_owned(),
+    }
 }
 
 fn kv(key: &str, value: &str) -> Line<'static> {
