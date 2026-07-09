@@ -306,6 +306,9 @@ impl Model {
             Reply::Auth(outcome) => self.apply_auth(outcome),
             Reply::List(items) => self.apply_list(items),
             Reply::Get(outcome) => self.apply_get(outcome),
+            // approve/deny outcomes are wired into the confirmation flow in the
+            // next T1b commit; the MVU does not send those requests yet.
+            Reply::Resolve(_) => {}
             Reply::Fatal(err) => {
                 self.phase = Phase::Fatal(err);
                 self.pending = None;
