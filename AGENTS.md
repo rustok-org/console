@@ -20,9 +20,12 @@ the money lives in `core/` (private). Управляющая спека арки
 
 ## Invariants (do not break in any PR)
 
-1. **Display-only client.** The console renders the core's `DecodedCall` /
-   `SimulationResult` verbatim — it contains **no decoding/interpretation logic of
-   its own** and never re-derives transaction meaning.
+1. **Display-only client.** The console renders the core's `DecodedCall` + raw
+   calldata verbatim — it contains **no decoding/interpretation logic of its own**
+   and never re-derives transaction meaning. Re-basing a value for display (a
+   `0x`-hex `amount` shown in decimal) is formatting, not re-derivation, and is
+   allowed. The `SimulationResult` on the card is deferred to v0.2 (decision A′);
+   v0.1 renders `decoded_call` + `raw_data`.
 2. **No key material.** No seeds, keys, keystores, or PIN hashes in this codebase,
    its logs, or its tests.
 3. **Protocol canon lives here:** `docs/APPROVER-PROTOCOL.md`. Wire changes land in
