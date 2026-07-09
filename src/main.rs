@@ -1,14 +1,16 @@
 //! Rustok Console — terminal approval screen (the human face of the wallet).
 //!
-//! v0.1 (C-PR-1a): connect → hello → PIN → **watch** the queue read-only. Keys are
+//! v0.1: connect → hello → PIN → watch the queue → approve or deny. Keys are
 //! mapped to [`Msg`] and folded into the [`Model`]; the socket worker runs on its
-//! own thread so a slow core never freezes the UI. `approve`/`deny` land in
-//! C-PR-1b. UI goes to stderr (ratatui's alternate screen); the exit code carries
-//! the outcome.
+//! own thread so a slow core never freezes the UI. UI goes to stderr (ratatui's
+//! alternate screen), the machine-readable decision goes to stdout, and the exit
+//! code carries the outcome (invariant #7).
 
-use std::io::{self, Stderr};
+use std::io::{self, IsTerminal, Stderr};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -19,18 +21,22 @@ use ratatui::crossterm::terminal::{
 };
 
 use rustok_console::app::{ExitOutcome, Model, Msg, Phase};
+use rustok_console::protocol::ResolveOutcome;
 use rustok_console::transport::{Transport, TransportError};
 use rustok_console::ui;
 
-/// The console's terminal — rendered to **stderr**, so stdout stays clean for a
-/// machine-readable decision (invariant #7; the approval verdict lands on stdout
-/// in C-PR-1b). `ratatui::init` would use stdout, so the setup is done by hand.
+/// The console's terminal — rendered to **stderr**, so stdout stays clean for the
+/// machine-readable decision (invariant #7). `ratatui::init` would use stdout, so
+/// the setup is done by hand.
 type Tui = Terminal<CrosstermBackend<Stderr>>;
 
 /// Default approver socket path (overridable for tests / non-standard layouts).
 const DEFAULT_SOCKET: &str = "/run/wallet/approve.sock";
 /// How often the watch screen polls `list`.
 const POLL: Duration = Duration::from_millis(2500);
+/// Longest the loop sleeps between redraws — the countdown ticks in seconds, so it
+/// must repaint far more often than the `list` poll.
+const FRAME: Duration = Duration::from_millis(250);
 
 // Exit codes (AGENTS.md #7) — each decision outcome is distinguishable.
 /// The transaction was signed and broadcast.
@@ -52,16 +58,30 @@ const EXIT_ABORTED: u8 = 6;
 fn main() -> ExitCode {
     let path = std::env::var("RUSTOK_APPROVE_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET.to_owned());
 
-    // No TTY → view-only is not possible for an interactive approver; fail clearly
-    // rather than half-render. (The full no-TTY view-only gate is C-PR-1b.)
-    let Ok(terminal) = try_init() else {
+    // Invariant #4, checked before anything is opened: an approval may never come
+    // from a pipe. `enable_raw_mode` opens `/dev/tty` directly, so a successful
+    // `try_init` proves nothing about stdin — only this does. Nothing is connected
+    // and no terminal is touched until stdin is known to be interactive.
+    if !io::stdin().is_terminal() {
         eprintln!("rustok-console needs an interactive terminal (a TTY).");
+        eprintln!("Approval from a pipe is never accepted.");
+        return ExitCode::from(EXIT_NO_TTY);
+    }
+
+    let Ok(terminal) = try_init() else {
+        eprintln!("rustok-console could not take the terminal.");
         return ExitCode::from(EXIT_NO_TTY);
     };
 
     let transport = Transport::connect(&path);
-    let code = run(terminal, &transport);
+    let (code, decision) = run(terminal, &transport);
     let _ = restore();
+
+    // The decision lands on stdout only after the alternate screen is gone, so no
+    // escape sequence can ever reach a caller parsing it (invariant #7).
+    if let Some(decision) = decision {
+        println!("{decision}");
+    }
     ExitCode::from(code)
 }
 
@@ -96,8 +116,9 @@ fn set_panic_hook() {
 }
 
 /// The event loop: draw, read input, drain worker replies, tick the poll. Returns
-/// the exit code. A `Fatal` phase is shown until a keypress, then exits.
-fn run(mut terminal: Tui, transport: &Transport) -> u8 {
+/// the exit code and, once an item is terminal, the machine-readable decision.
+/// A `Fatal` phase is shown until a keypress, then exits.
+fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
     let mut model = Model::new();
     let mut last_tick = Instant::now();
 
@@ -106,25 +127,37 @@ fn run(mut terminal: Tui, transport: &Transport) -> u8 {
             .draw(|f| ui::render(f, &model, now_unix()))
             .is_err()
         {
-            return EXIT_FATAL;
+            return (EXIT_FATAL, None);
         }
 
         match model.phase() {
             Phase::Fatal(err) => {
                 let code = fatal_code(err);
                 wait_for_key();
-                return code;
+                return (code, None);
             }
-            // The item is terminal: show the answer, then carry it in the exit code.
-            Phase::Resolved { exit, .. } => {
+            // The item is terminal: show the answer, then carry it out in both the
+            // exit code and the decision line.
+            Phase::Resolved { outcome, exit } => {
                 let code = exit_code(*exit);
+                let decision = decision_line(outcome, *exit);
                 wait_for_key();
-                return code;
+                return (code, Some(decision));
             }
             _ => {}
         }
 
-        let timeout = POLL.saturating_sub(last_tick.elapsed());
+        // The deadline says no on its own (`AGENTS.md` #5). `Msg::Expire` denies the
+        // card and reports `expired` rather than `rejected` — no human pressed a key.
+        if deadline_passed(model.phase(), now_unix())
+            && let Some(req) = model.update(Msg::Expire)
+        {
+            transport.send(req);
+        }
+
+        // Wake up at least every FRAME so the countdown's seconds actually tick,
+        // and the deadline above is noticed within a frame of passing.
+        let timeout = POLL.saturating_sub(last_tick.elapsed()).min(FRAME);
         match event::poll(timeout) {
             Ok(true) => {
                 if let Ok(Event::Key(key)) = event::read()
@@ -136,7 +169,7 @@ fn run(mut terminal: Tui, transport: &Transport) -> u8 {
                 }
             }
             Ok(false) => {}
-            Err(_) => return EXIT_FATAL,
+            Err(_) => return (EXIT_FATAL, None),
         }
 
         // Drain everything the worker has answered since the last pass.
@@ -154,9 +187,41 @@ fn run(mut terminal: Tui, transport: &Transport) -> u8 {
         }
 
         if model.should_quit() {
-            return EXIT_ABORTED;
+            return (EXIT_ABORTED, None);
         }
     }
+}
+
+/// Whether the open card's deadline has passed and nothing is on the wire yet.
+///
+/// A decision already in flight is left alone: the server, not the clock, gets the
+/// last word on an item we have already answered.
+fn deadline_passed(phase: &Phase, now_unix: u64) -> bool {
+    matches!(
+        phase,
+        Phase::Watching { confirm: Some(c), .. }
+            if !c.is_resolving() && now_unix >= c.card().not_after_unix
+    )
+}
+
+/// The one line a caller parses (invariant #7). It names **what happened to the
+/// money**, and carries a detail only when we actually know it: an item another
+/// session executed comes back as `approved` with no hash, because the hash was
+/// never ours to report.
+fn decision_line(outcome: &ResolveOutcome, exit: ExitOutcome) -> String {
+    let value = match (exit, outcome) {
+        (ExitOutcome::Approved, ResolveOutcome::Executed { tx_hash }) => {
+            json!({ "decision": "approved", "tx_hash": tx_hash })
+        }
+        (ExitOutcome::Approved, _) => json!({ "decision": "approved" }),
+        (ExitOutcome::Rejected, _) => json!({ "decision": "rejected" }),
+        (ExitOutcome::Expired, _) => json!({ "decision": "expired" }),
+        (ExitOutcome::Failed, ResolveOutcome::Failed { reason }) => {
+            json!({ "decision": "failed", "reason": reason })
+        }
+        (ExitOutcome::Failed, _) => json!({ "decision": "failed" }),
+    };
+    value.to_string()
 }
 
 /// Wall-clock seconds since the Unix epoch, used to render the expiry countdown.
@@ -262,7 +327,9 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
 mod tests {
     use super::*;
     use rustok_console::app::Pin;
-    use rustok_console::protocol::{AuthOutcome, Card, GetOutcome, Kind, Risk, Summary};
+    use rustok_console::protocol::{
+        AuthOutcome, Card, GetOutcome, Kind, Risk, Summary, TerminalState,
+    };
     use rustok_console::transport::Reply;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -285,9 +352,13 @@ mod tests {
         }
     }
 
+    fn confirming(high_risk: bool) -> Model {
+        confirming_at(high_risk, 1)
+    }
+
     /// A model parked on an open confirmation — the only way to build one from
     /// outside the crate, and the same path the real loop takes.
-    fn confirming(high_risk: bool) -> Model {
+    fn confirming_at(high_risk: bool, not_after_unix: u64) -> Model {
         let mut m = Model::new();
         m.update(Msg::Reply(Reply::Hello {
             server: "s".to_owned(),
@@ -304,7 +375,7 @@ mod tests {
             amount_wei: "0".to_owned(),
             risk: Risk::Safe,
             high_risk,
-            not_after_unix: 1,
+            not_after_unix,
         }])));
         m.update(Msg::Open);
         m.update(Msg::Reply(Reply::Get(GetOutcome::Card(Box::new(Card {
@@ -316,7 +387,7 @@ mod tests {
             high_risk,
             high_risk_reasons: vec![],
             raw_data: "0x".to_owned(),
-            not_after_unix: 1,
+            not_after_unix,
         })))));
         m
     }
@@ -456,6 +527,103 @@ mod tests {
             .is_none(),
             "a resolved item can no longer be approved"
         );
+    }
+
+    #[test]
+    fn the_deadline_denies_an_open_card_and_nothing_else() {
+        // Nothing is open: the clock has nothing to say, however late it is.
+        assert!(!deadline_passed(&watching(), u64::MAX));
+        assert!(!deadline_passed(&authing(), u64::MAX));
+
+        let m = confirming_at(false, 1_000);
+        assert!(
+            !deadline_passed(m.phase(), 999),
+            "a second before the deadline the human still owns the decision"
+        );
+        assert!(
+            deadline_passed(m.phase(), 1_000),
+            "at the deadline the clock says no (AGENTS.md #5)"
+        );
+        assert!(deadline_passed(m.phase(), 1_001));
+    }
+
+    #[test]
+    fn a_decision_on_the_wire_outranks_the_deadline() {
+        let mut m = confirming_at(false, 1_000);
+        m.update(Msg::Approve);
+
+        assert!(
+            !deadline_passed(m.phase(), u64::MAX),
+            "an approve is already on the wire — the server, not the clock, has the \
+             last word; expiring here would deny what we just approved"
+        );
+    }
+
+    #[test]
+    fn the_decision_line_names_what_happened_to_the_money() {
+        assert_eq!(
+            decision_line(
+                &ResolveOutcome::Executed {
+                    tx_hash: "0xabc".to_owned()
+                },
+                ExitOutcome::Approved
+            ),
+            r#"{"decision":"approved","tx_hash":"0xabc"}"#
+        );
+        assert_eq!(
+            decision_line(&ResolveOutcome::Denied, ExitOutcome::Rejected),
+            r#"{"decision":"rejected"}"#
+        );
+        // The same server answer, denied by the deadline rather than by a human.
+        assert_eq!(
+            decision_line(&ResolveOutcome::Denied, ExitOutcome::Expired),
+            r#"{"decision":"expired"}"#
+        );
+        assert_eq!(
+            decision_line(
+                &ResolveOutcome::Failed {
+                    reason: "nonce too low".to_owned()
+                },
+                ExitOutcome::Failed
+            ),
+            r#"{"decision":"failed","reason":"nonce too low"}"#
+        );
+    }
+
+    #[test]
+    fn an_approval_by_another_session_reports_no_hash_we_never_saw() {
+        let line = decision_line(
+            &ResolveOutcome::AlreadyResolved {
+                state: TerminalState::Executed,
+            },
+            ExitOutcome::Approved,
+        );
+
+        assert_eq!(line, r#"{"decision":"approved"}"#);
+        assert!(
+            !line.contains("tx_hash"),
+            "we never invent a hash the server did not give us"
+        );
+    }
+
+    #[test]
+    fn the_decision_line_survives_a_hostile_server_reason() {
+        // `reason` is server-controlled text landing on a caller's stdout.
+        let line = decision_line(
+            &ResolveOutcome::Failed {
+                reason: "\"}\n{\"decision\":\"approved\"".to_owned(),
+            },
+            ExitOutcome::Failed,
+        );
+
+        assert!(
+            !line.contains('\n'),
+            "the decision is exactly one line — a reason cannot forge a second one"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("one parsable JSON object");
+        assert_eq!(parsed["decision"], "failed");
+        assert_eq!(parsed["reason"], "\"}\n{\"decision\":\"approved\"");
     }
 
     #[test]
