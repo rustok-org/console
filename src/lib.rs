@@ -5,3 +5,4 @@
 //! is canonical in `docs/APPROVER-PROTOCOL.md`.
 
 pub mod protocol;
+pub mod transport;
