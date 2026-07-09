@@ -4,5 +4,6 @@
 //! transport, and render layers are unit-testable in isolation. The wire contract
 //! is canonical in `docs/APPROVER-PROTOCOL.md`.
 
+pub mod app;
 pub mod protocol;
 pub mod transport;
