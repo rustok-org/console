@@ -55,15 +55,13 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
   and **no state change**. The server never executes anything as a result of an
   ambiguous message. (An *extra* unknown field is silently ignored, not rejected —
   the request structs are not `deny_unknown_fields`; see `client` in §3.1.)
-  - *Known edge (shipped, tracked as core follow-up #27):* on `oversize` the server
-    answers `oversize` but does **not** close the connection — it keeps reading the
-    same underlying stream, so the overflow tail is parsed as subsequent lines. A
-    crafted padding could make that tail a well-formed request executed in the
-    current session's context (protocol-smuggling, not privilege escalation — the
-    writer already has socket access). The console never sends > 64 KiB lines, so
-    this cannot arise from the intended client. The parity fix (close on `oversize`,
-    like `unsupported_proto`) is core follow-up **#27**; until then the canon
-    describes the shipped behaviour.
+  - On `oversize` the server answers once and then **closes the connection**
+    (parity with `unsupported_proto`, §3.1). The capped read leaves the over-long
+    line's tail unread; closing drops it rather than parsing it as subsequent
+    request lines — so a crafted padding cannot smuggle a well-formed request past
+    the size guard. A client must reconnect (fresh `hello`, then `auth`) after an
+    `oversize`. (The console never sends > 64 KiB lines, so this does not arise
+    from the intended client.)
 
 ## 3. Messages
 
@@ -264,7 +262,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | Code | Op(s) | Meaning |
 |---|---|---|
 | `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello` |
-| `oversize` | any | request line > 64 KiB (see §2 known edge / follow-up #27) |
+| `oversize` | any | request line > 64 KiB; the connection is then closed (§2) |
 | `unsupported_proto` | hello | major `proto` mismatch; server then closes |
 | `unauthorized` | approve, deny | no successful `auth` on this connection |
 | `bad_pin` | auth, approve | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
