@@ -13,7 +13,10 @@ use crate::app::{AuthError, Confirm, ExitOutcome, Model, Phase, ResolveError};
 use crate::protocol::{Card, ResolveOutcome, Summary};
 
 /// Render the whole screen for the current model.
-pub fn render(frame: &mut Frame, model: &Model) {
+///
+/// `now_unix` is the wall clock, passed in rather than read here: the [`Model`]
+/// stays a pure function of its messages, and the countdown stays testable.
+pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
     match model.phase() {
         Phase::Connecting => {
             render_centered(frame, "Connecting to the wallet…");
@@ -24,7 +27,14 @@ pub fn render(frame: &mut Frame, model: &Model) {
             selected,
             confirm,
             note,
-        } => render_watch(frame, items, *selected, confirm.as_deref(), note.as_deref()),
+        } => render_watch(
+            frame,
+            items,
+            *selected,
+            confirm.as_deref(),
+            note.as_deref(),
+            now_unix,
+        ),
         Phase::Resolved { outcome, exit } => render_centered(frame, &resolved_text(outcome, *exit)),
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
@@ -89,14 +99,21 @@ fn render_watch(
     selected: usize,
     confirm: Option<&Confirm>,
     note: Option<&str>,
+    now_unix: u64,
 ) {
-    let chunks = Layout::vertical([
+    // The note's row is claimed only when there is a note. An always-reserved row
+    // would take its space from the card, and the card is the one thing on this
+    // screen that must never be silently clipped (`AGENTS.md` #1).
+    let mut constraints = vec![
         Constraint::Length(1), // header
         Constraint::Min(3),    // queue
         Constraint::Min(6),    // card / hint
-        Constraint::Length(1), // note / footer
-    ])
-    .split(frame.area());
+        Constraint::Length(1), // decision row / navigation hint
+    ];
+    if note.is_some() {
+        constraints.push(Constraint::Length(1)); // transient note
+    }
+    let chunks = Layout::vertical(constraints).split(frame.area());
 
     frame.render_widget(
         Paragraph::new(format!(" Pending approvals: {}", items.len())),
@@ -105,19 +122,73 @@ fn render_watch(
 
     render_queue(frame, items, selected, chunks[1]);
     render_detail(frame, confirm, chunks[2]);
+    render_actions(frame, confirm, now_unix, chunks[3]);
 
-    let footer = note.unwrap_or_else(|| {
-        confirm.map_or("↑/↓ select · enter open · q quit", |c| {
-            if c.is_resolving() {
-                "sending your decision…"
-            } else if c.pin_len().is_some() {
-                "enter your PIN · enter approve · esc reject"
-            } else {
-                "y approve · n/esc reject"
-            }
-        })
-    });
-    frame.render_widget(Paragraph::new(footer), chunks[3]);
+    if let Some(note) = note {
+        frame.render_widget(Paragraph::new(note), chunks[4]);
+    }
+}
+
+/// Seconds left before the open card's deadline.
+///
+/// Saturating on purpose: a deadline already in the past reads as `0`, never as a
+/// wrapped-around eternity. An unreadable clock reaches us as `u64::MAX` (see
+/// `main::now_unix`) and lands here as `0` too — a broken clock can never hand an
+/// approval more time.
+fn seconds_left(not_after_unix: u64, now_unix: u64) -> u64 {
+    not_after_unix.saturating_sub(now_unix)
+}
+
+/// The decision row.
+///
+/// The countdown rides the **Reject** button and nothing else on this screen moves
+/// (`AGENTS.md` #5). Reject is drawn as the focused button — reversed and bold —
+/// because it is what happens if the human does nothing; Approve is a quiet outline
+/// that has to be chosen. The copy says so out loud: `auto in 27s`.
+fn render_actions(
+    frame: &mut Frame,
+    confirm: Option<&Confirm>,
+    now_unix: u64,
+    area: ratatui::layout::Rect,
+) {
+    let Some(confirm) = confirm else {
+        frame.render_widget(Paragraph::new("  ↑/↓ select · enter open · q quit"), area);
+        return;
+    };
+    if confirm.is_resolving() {
+        // The decision is on the wire and the buttons are gone with it, so a second
+        // press cannot be mistaken for a second decision.
+        frame.render_widget(Paragraph::new("  Sending your decision…"), area);
+        return;
+    }
+
+    // The PIN prompt owns Enter, so Enter — not `y` — is what approves while it is up.
+    let approve_key = if confirm.pin_len().is_some() {
+        "enter"
+    } else {
+        "y"
+    };
+    let reject_key = if confirm.pin_len().is_some() {
+        "esc"
+    } else {
+        "n / esc"
+    };
+    let left = seconds_left(confirm.card().not_after_unix, now_unix);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(format!("[ {approve_key}  Approve ]")),
+            Span::raw("    "),
+            Span::styled(
+                format!("[ {reject_key}  Reject · auto in {left}s ]"),
+                Style::new()
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::REVERSED),
+            ),
+        ])),
+        area,
+    );
 }
 
 fn render_queue(
@@ -258,22 +329,37 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// A fixed "now" for the countdown tests. Real time never enters the renderer.
+    const NOW: u64 = 1_000_000_000;
+
     /// Render into a fixed grid, returning the screen as rows. Row-level checks
     /// catch a field rendered under the WRONG label (a swap) — which a
     /// whole-screen substring check would miss.
-    fn draw_rows(model: &Model, w: u16, h: u16) -> Vec<String> {
+    fn draw_rows_at(model: &Model, w: u16, h: u16, now_unix: u64) -> Vec<String> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, model)).unwrap();
+        terminal.draw(|f| render(f, model, now_unix)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
     }
 
+    fn draw_rows(model: &Model, w: u16, h: u16) -> Vec<String> {
+        draw_rows_at(model, w, h, NOW)
+    }
+
     /// Flatten to one String for checks that do not care about layout.
     fn draw(model: &Model, w: u16, h: u16) -> String {
         draw_rows(model, w, h).join("\n")
+    }
+
+    /// The rendered decision row (the line carrying the buttons).
+    fn action_row(rows: &[String]) -> String {
+        rows.iter()
+            .find(|r| r.contains("Approve"))
+            .expect("the decision row must render")
+            .clone()
     }
 
     /// True if some rendered line contains all `fragments` — a label+value
@@ -429,5 +515,123 @@ mod tests {
         )));
         let screen = draw(&m, 80, 10);
         assert!(screen.contains("wallet not running"));
+    }
+
+    fn card(id: &str, not_after_unix: u64, high_risk: bool) -> Box<Card> {
+        Box::new(Card {
+            id: id.to_owned(),
+            chain_id: 1,
+            to: "0xabc".to_owned(),
+            amount_wei: "0".to_owned(),
+            decoded_call: None,
+            high_risk,
+            high_risk_reasons: if high_risk {
+                vec!["unlimited_approval".to_owned()]
+            } else {
+                vec![]
+            },
+            raw_data: "0x".to_owned(),
+            not_after_unix,
+        })
+    }
+
+    /// Drive the model to an open confirmation on a single queued item.
+    fn open_card(model: &mut Model, id: &str, not_after_unix: u64, high_risk: bool) {
+        to_watching(model, vec![summary(id, "0xabc", "0", high_risk)]);
+        model.update(Msg::Open);
+        model.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
+            card(id, not_after_unix, high_risk),
+        ))));
+    }
+
+    #[test]
+    fn the_countdown_rides_the_reject_button_never_the_approve_one() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+
+        let row = action_row(&draw_rows(&m, 100, 24));
+        // The Approve button closes at the first `]`; everything after it is Reject.
+        let (approve_side, reject_side) = row.split_once(']').expect("two buttons render");
+
+        assert!(approve_side.contains("Approve"));
+        assert!(
+            !approve_side.contains("27s"),
+            "the deadline must never count down on the button that moves money \
+             (AGENTS.md #5); found: {row}"
+        );
+        assert!(
+            reject_side.contains("Reject") && reject_side.contains("auto in 27s"),
+            "the countdown belongs to Reject, and says it will fire on its own: {row}"
+        );
+    }
+
+    #[test]
+    fn the_countdown_floors_at_zero_once_the_deadline_has_passed() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+
+        let row = action_row(&draw_rows_at(&m, 100, 24, NOW + 99));
+        assert!(
+            row.contains("auto in 0s"),
+            "an elapsed deadline reads as 0s, never as a wrapped-around eternity: {row}"
+        );
+
+        // An unreadable clock reaches the renderer as u64::MAX (`main::now_unix`).
+        // It must floor to 0s too — a broken clock never buys the approval more time.
+        let row = action_row(&draw_rows_at(&m, 100, 24, u64::MAX));
+        assert!(
+            row.contains("auto in 0s"),
+            "an unreadable clock fails closed, it does not grant time: {row}"
+        );
+    }
+
+    #[test]
+    fn the_pin_prompt_moves_approve_onto_enter_and_masks_the_digits() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, true);
+        m.update(Msg::Approve); // high risk: `y` opens the PIN prompt, it does not approve
+        m.update(Msg::PinDigit('7'));
+        m.update(Msg::PinDigit('3'));
+
+        let rows = draw_rows(&m, 100, 24);
+        let row = action_row(&rows);
+        let screen = rows.join("\n");
+
+        assert!(
+            row.contains("enter  Approve") && row.contains("esc  Reject"),
+            "while the PIN prompt is up, Enter approves and Esc rejects: {row}"
+        );
+        assert!(screen.contains("●●"), "two dots for two digits");
+        assert!(!screen.contains("73"), "the digits must never render");
+    }
+
+    #[test]
+    fn a_decision_on_the_wire_replaces_the_buttons() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+        m.update(Msg::Reject);
+
+        let screen = draw(&m, 100, 24);
+
+        assert!(screen.contains("Sending your decision"));
+        assert!(
+            !screen.contains("Approve"),
+            "with a decision on the wire there is no button left to press twice"
+        );
+    }
+
+    #[test]
+    fn the_resolved_screen_names_the_outcome_and_shows_the_tx_hash() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+        m.update(Msg::Approve);
+        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Executed {
+            tx_hash: "0xfeed".to_owned(),
+        })));
+
+        let screen = draw(&m, 80, 12);
+
+        assert!(screen.contains("APPROVED"));
+        assert!(screen.contains("0xfeed"), "the tx hash is shown verbatim");
     }
 }

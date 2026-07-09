@@ -8,7 +8,7 @@
 
 use std::io::{self, Stderr};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -102,7 +102,10 @@ fn run(mut terminal: Tui, transport: &Transport) -> u8 {
     let mut last_tick = Instant::now();
 
     loop {
-        if terminal.draw(|f| ui::render(f, &model)).is_err() {
+        if terminal
+            .draw(|f| ui::render(f, &model, now_unix()))
+            .is_err()
+        {
             return EXIT_FATAL;
         }
 
@@ -154,6 +157,17 @@ fn run(mut terminal: Tui, transport: &Transport) -> u8 {
             return EXIT_ABORTED;
         }
     }
+}
+
+/// Wall-clock seconds since the Unix epoch, used to render the expiry countdown.
+///
+/// A clock that cannot be read reports `u64::MAX` — *past every deadline* — so the
+/// countdown floors at zero rather than granting the approval unbounded time. The
+/// broken clock fails closed, like everything else on this path (`AGENTS.md` #5).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |d| d.as_secs())
 }
 
 /// Block until the next key press (so a human can read a fatal message).
