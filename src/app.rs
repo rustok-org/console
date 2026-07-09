@@ -1167,6 +1167,26 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_high_risk_approve_is_sent_after_the_reply_pin_and_all() {
+        let mut m = confirming("a", true);
+        m.update(Msg::Approve); // high risk: opens the PIN prompt
+        type_pin(&mut m, "483920");
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        assert!(m.update(Msg::PinSubmit).is_none(), "parked behind the poll");
+
+        let flushed = m.update(Msg::Reply(Reply::List(vec![summary("a")])));
+
+        // Dropping this arm would silently lose an approval the human confirmed.
+        let Some(transport::Request::ApprovePin(line)) = flushed else {
+            panic!("the parked high-risk approve must be sent once the wire is free");
+        };
+        assert_eq!(&*line, r#"{"op":"approve","id":"a","pin":"483920"}"#);
+    }
+
+    #[test]
     fn a_money_intent_parked_behind_a_poll_is_sent_after_the_reply() {
         let mut m = confirming("a", false);
         assert!(matches!(
@@ -1387,6 +1407,35 @@ mod tests {
             ),
             Some(ExitOutcome::Rejected),
             "somebody else's deny is a rejection, never our deadline"
+        );
+        assert_eq!(
+            terminal_exit(
+                &R::AlreadyResolved {
+                    state: TerminalState::Failed
+                },
+                false
+            ),
+            Some(ExitOutcome::Failed),
+            "somebody else's approval that failed to broadcast is a failure, not a rejection"
+        );
+        assert_eq!(
+            terminal_exit(
+                &R::AlreadyResolved {
+                    state: TerminalState::Executed
+                },
+                true
+            ),
+            Some(ExitOutcome::Approved),
+            "somebody else executed it while our deadline denied — the money moved"
+        );
+        assert_eq!(
+            terminal_exit(
+                &R::AlreadyResolved {
+                    state: TerminalState::Expired
+                },
+                false
+            ),
+            Some(ExitOutcome::Expired)
         );
         assert_eq!(
             terminal_exit(
