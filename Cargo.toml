@@ -7,9 +7,17 @@ license = "MIT"
 description = "Rustok Console — terminal approval screen for the Rustok self-custody wallet (the human face)"
 repository = "https://github.com/rustok-org/console"
 
-# Dependencies (ratatui, crossterm) land with the C-PR-1 implementation; the
-# bootstrap crate stays dependency-free so CI/deny are meaningful from day one.
 [dependencies]
+# TUI: immediate-mode render + its own event loop (crossterm::event::poll), no async
+# runtime — per AGENTS.md. crossterm is used through ratatui's re-export
+# (ratatui::crossterm::…), so it is not a direct dependency; ratatui pins the
+# matching version.
+ratatui = "0.30"
+# Wire protocol (JSON Lines) — serde types mirror docs/APPROVER-PROTOCOL.md.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# PIN hygiene: the PIN and its serialized auth request live in Zeroizing buffers.
+zeroize = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
