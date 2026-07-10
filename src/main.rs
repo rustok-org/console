@@ -122,6 +122,18 @@ fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
     let mut model = Model::new();
     let mut last_tick = Instant::now();
 
+    // Report the terminal size before anything else: the model approves only a
+    // card it knows to be fully readable, so an unknown size (this call
+    // failing) leaves approval gated off — fail closed.
+    if let Ok(size) = terminal.size()
+        && let Some(req) = model.update(Msg::Resize {
+            width: size.width,
+            height: size.height,
+        })
+    {
+        transport.send(req);
+    }
+
     loop {
         if terminal
             .draw(|f| ui::render(f, &model, now_unix()))
@@ -159,15 +171,23 @@ fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
         // and the deadline above is noticed within a frame of passing.
         let timeout = POLL.saturating_sub(last_tick.elapsed()).min(FRAME);
         match event::poll(timeout) {
-            Ok(true) => {
-                if let Ok(Event::Key(key)) = event::read()
-                    && key.kind == KeyEventKind::Press
-                    && let Some(msg) = map_key(&key, model.phase())
-                    && let Some(req) = model.update(msg)
-                {
-                    transport.send(req);
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    if let Some(msg) = map_key(&key, model.phase())
+                        && let Some(req) = model.update(msg)
+                    {
+                        transport.send(req);
+                    }
                 }
-            }
+                // The approve gate follows the terminal: shrink below the card's
+                // priority fields and `y` dies, grow back and it re-arms.
+                Ok(Event::Resize(width, height)) => {
+                    if let Some(req) = model.update(Msg::Resize { width, height }) {
+                        transport.send(req);
+                    }
+                }
+                _ => {}
+            },
             Ok(false) => {}
             Err(_) => return (EXIT_FATAL, None),
         }
@@ -360,6 +380,11 @@ mod tests {
     /// outside the crate, and the same path the real loop takes.
     fn confirming_at(high_risk: bool, not_after_unix: u64) -> Model {
         let mut m = Model::new();
+        // The size report main sends at startup — a standard 80×24 terminal.
+        m.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
         m.update(Msg::Reply(Reply::Hello {
             server: "s".to_owned(),
         }));

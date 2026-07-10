@@ -93,24 +93,25 @@ fn auth_error_text(err: &AuthError) -> String {
     }
 }
 
-fn render_watch(
-    frame: &mut Frame,
-    items: &[Summary],
-    selected: usize,
-    confirm: Option<&Confirm>,
-    note: Option<&str>,
-    now_unix: u64,
-) {
-    // The note's row is claimed only when there is a note. An always-reserved row
-    // would take its space from the card, and the card is the one thing on this
-    // screen whose priority fields must never leave the screen (`AGENTS.md` #1).
-    //
-    // While a confirmation is open the card is the decision surface: the queue
-    // collapses to a single-item strip (the List keeps the selection in view)
-    // and the card takes every remaining row. Splitting the height evenly would
-    // starve the card of the rows its risk warnings and PIN prompt need on a
-    // 24-row terminal.
-    let queue_rows = if confirm.is_some() {
+/// Split the watch screen. One function for the renderer AND for
+/// [`priority_fields_fit`], so the approve gate can never disagree with the
+/// layout actually drawn.
+///
+/// The note's row is claimed only when there is a note. An always-reserved row
+/// would take its space from the card, and the card is the one thing on this
+/// screen whose priority fields must never leave the screen (`AGENTS.md` #1).
+///
+/// While a confirmation is open the card is the decision surface: the queue
+/// collapses to a single-item strip (the List keeps the selection in view)
+/// and the card takes every remaining row. Splitting the height evenly would
+/// starve the card of the rows its risk warnings and PIN prompt need on a
+/// 24-row terminal.
+fn watch_chunks(
+    area: ratatui::layout::Rect,
+    confirm_open: bool,
+    has_note: bool,
+) -> std::rc::Rc<[ratatui::layout::Rect]> {
+    let queue_rows = if confirm_open {
         Constraint::Length(3) // borders + the selected row
     } else {
         Constraint::Min(3)
@@ -121,10 +122,21 @@ fn render_watch(
         Constraint::Min(6),    // card / hint
         Constraint::Length(1), // decision row / navigation hint
     ];
-    if note.is_some() {
+    if has_note {
         constraints.push(Constraint::Length(1)); // transient note
     }
-    let chunks = Layout::vertical(constraints).split(frame.area());
+    Layout::vertical(constraints).split(area)
+}
+
+fn render_watch(
+    frame: &mut Frame,
+    items: &[Summary],
+    selected: usize,
+    confirm: Option<&Confirm>,
+    note: Option<&str>,
+    now_unix: u64,
+) {
+    let chunks = watch_chunks(frame.area(), confirm.is_some(), note.is_some());
 
     frame.render_widget(
         Paragraph::new(format!(" Pending approvals: {}", items.len())),
@@ -133,7 +145,10 @@ fn render_watch(
 
     render_queue(frame, items, selected, chunks[1]);
     render_detail(frame, confirm, chunks[2]);
-    render_actions(frame, confirm, now_unix, chunks[3]);
+    // The same fit the model gates approve on (`priority_fields_fit`), taken
+    // from the very chunk the card is drawn into.
+    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, chunks[2]));
+    render_actions(frame, confirm, approve_ok, now_unix, chunks[3]);
 
     if let Some(note) = note {
         frame.render_widget(Paragraph::new(note), chunks[4]);
@@ -159,6 +174,7 @@ fn seconds_left(not_after_unix: u64, now_unix: u64) -> u64 {
 fn render_actions(
     frame: &mut Frame,
     confirm: Option<&Confirm>,
+    approve_ok: bool,
     now_unix: u64,
     area: ratatui::layout::Rect,
 ) {
@@ -185,21 +201,30 @@ fn render_actions(
         "n / esc"
     };
     let left = seconds_left(confirm.card().not_after_unix, now_unix);
+    let reject_button = Span::styled(
+        format!("[ {reject_key}  Reject · auto in {left}s ]"),
+        Style::new()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::REVERSED),
+    );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    // No live Approve button on a card the human cannot read (the model refuses
+    // the key too — `priority_fields_fit`). Reject stays: default-deny may
+    // never depend on the terminal being big enough (`AGENTS.md` #5).
+    let row = if approve_ok {
+        Line::from(vec![
             Span::raw("  "),
             Span::raw(format!("[ {approve_key}  Approve ]")),
             Span::raw("    "),
-            Span::styled(
-                format!("[ {reject_key}  Reject · auto in {left}s ]"),
-                Style::new()
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::REVERSED),
-            ),
-        ])),
-        area,
-    );
+            reject_button,
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("  approve disabled — terminal too small    "),
+            reject_button,
+        ])
+    };
+    frame.render_widget(Paragraph::new(row), area);
 }
 
 fn render_queue(
@@ -242,30 +267,13 @@ fn kind_word(s: &Summary) -> &'static str {
     }
 }
 
-/// Render the open confirmation's card — the core's fields **verbatim**, no
-/// re-derivation. `None` shows a hint to open one.
-///
-/// Priority fields (everything except `raw_data`) render first, and
-/// `raw_data` — the only elastic element — gets exactly the rows that remain,
-/// truncated with an explicit marker when it cannot fit. A long calldata can
-/// therefore never push a risk warning or the PIN prompt off the screen. That
-/// guarantee is against `raw_data`: priority fields that alone overflow the
-/// card (pathological server data) still clip at the bottom until scrolling
-/// lands. Every line is pre-wrapped to the card's inner width so one logical
-/// line is one visual row and the height budget is exact, not an estimate.
-fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
-    let block = Block::bordered().title(" Card ");
-    let Some(confirm) = confirm else {
-        let hint =
-            Paragraph::new("Select a request and press enter to see the full card.").block(block);
-        frame.render_widget(hint, area);
-        return;
-    };
+/// The card's priority lines — every field except `raw_data` — pre-wrapped to
+/// `width` display cells, so one logical line is one visual row and the height
+/// arithmetic downstream is exact. One source for the renderer AND for
+/// [`priority_fields_fit`]: the approve gate can never disagree with what is
+/// actually drawn.
+fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
     let card: &Card = confirm.card();
-
-    let inner = block.inner(area);
-    let width = usize::from(inner.width);
-    let height = usize::from(inner.height);
     let bold = Style::new().add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -326,6 +334,70 @@ fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::la
         lines.push(Line::from(""));
         push_wrapped(&mut lines, width, resolve_error_text(err), Style::new());
     }
+    lines
+}
+
+/// Whether the card's priority lines fit its inner area.
+fn card_priority_fits(confirm: &Confirm, area: ratatui::layout::Rect) -> bool {
+    let inner = Block::bordered().inner(area);
+    priority_lines(confirm, usize::from(inner.width)).len() <= usize::from(inner.height)
+}
+
+/// The approve gate: can a `width`×`height` terminal show every priority field
+/// of the open card? Runs the same layout ([`watch_chunks`]) and the same line
+/// pre-wrap ([`priority_lines`]) as the renderer, so the gate, the banner and
+/// the missing Approve button always agree. The [`Model`] consults this before
+/// letting `y` or a PIN submit do anything — a "yes" to a card the human could
+/// not read is not a decision (`AGENTS.md` #1).
+///
+/// `has_note` is `false` by construction: a note and an open confirmation never
+/// coexist (`apply_get`/`apply_resolve` set one while clearing the other).
+#[must_use]
+pub fn priority_fields_fit(confirm: &Confirm, width: u16, height: u16) -> bool {
+    let area = ratatui::layout::Rect::new(0, 0, width, height);
+    let chunks = watch_chunks(area, true, false);
+    card_priority_fits(confirm, chunks[2])
+}
+
+/// Render the open confirmation's card — the core's fields **verbatim**, no
+/// re-derivation. `None` shows a hint to open one.
+///
+/// Priority fields (everything except `raw_data`) render first, and
+/// `raw_data` — the only elastic element — gets exactly the rows that remain,
+/// truncated with an explicit marker when it cannot fit. A long calldata can
+/// therefore never push a risk warning or the PIN prompt off the screen. When
+/// the priority fields alone cannot fit (a terminal below ~24 rows, or
+/// pathological server data), the card says so with a banner and the approve
+/// path is gated off ([`priority_fields_fit`]) until the terminal grows.
+fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
+    let block = Block::bordered().title(" Card ");
+    let Some(confirm) = confirm else {
+        let hint =
+            Paragraph::new("Select a request and press enter to see the full card.").block(block);
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    let inner = block.inner(area);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+
+    let mut lines = priority_lines(confirm, width);
+    if lines.len() > height {
+        // The card cannot show what the human must read; approve is gated off
+        // (`priority_fields_fit` — the model refuses `y` and PIN submits). The
+        // banner goes on top: the one row guaranteed visible when rows clip.
+        let mut banner = Vec::new();
+        push_wrapped(
+            &mut banner,
+            width,
+            "TERMINAL TOO SMALL — approve disabled; resize to read the card (reject works)"
+                .to_owned(),
+            Style::new().add_modifier(Modifier::BOLD),
+        );
+        banner.append(&mut lines);
+        lines = banner;
+    }
 
     // raw_data comes LAST and absorbs whatever rows the priority fields above
     // left over. Never truncate priority fields; a truncated raw_data says so
@@ -333,7 +405,7 @@ fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::la
     // prevent. Wrap stays on as a backstop only (every line already fits the
     // width); trim: false keeps the exact bytes, including leading space.
     let budget = height.saturating_sub(lines.len());
-    push_raw_data(&mut lines, width, budget, &card.raw_data);
+    push_raw_data(&mut lines, width, budget, &confirm.card().raw_data);
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -528,6 +600,11 @@ mod tests {
     }
 
     fn to_watching(model: &mut Model, items: Vec<Summary>) {
+        // The size report main sends at startup — a standard 80×24 terminal.
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
         model.update(Msg::Reply(Reply::Hello {
             server: "s".to_owned(),
         }));
@@ -930,6 +1007,41 @@ mod tests {
             "a 2002-char payload on 24 rows is mostly hidden — the shown and \
              not-shown counters look swapped: {marker_row}"
         );
+    }
+
+    #[test]
+    fn a_cramped_terminal_pulls_approve_and_says_why() {
+        let mut m = Model::new();
+        open_risk_card(&mut m, stage1_raw_data());
+
+        // 80×14: the stage-1 card's priority fields cannot all fit (B4).
+        let rows = draw_rows(&m, 80, 14);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("TOO SMALL"),
+            "the human is told the card is cut, never left guessing"
+        );
+        assert!(
+            !screen.contains("Approve"),
+            "no live Approve button on a card the human cannot read"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Reject") && r.contains("auto in")),
+            "reject and its countdown survive at any size (AGENTS.md #5)"
+        );
+    }
+
+    #[test]
+    fn the_gate_lifts_when_the_terminal_grows() {
+        let mut m = Model::new();
+        open_risk_card(&mut m, stage1_raw_data());
+
+        let screen = draw(&m, 80, 24);
+
+        assert!(screen.contains("Approve"), "a full card arms the button");
+        assert!(!screen.contains("TOO SMALL"), "no banner on a full card");
     }
 
     #[test]

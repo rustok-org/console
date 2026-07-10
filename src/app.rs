@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::protocol::{AuthOutcome, Card, GetOutcome, ResolveOutcome, Summary, TerminalState};
 use crate::transport::{self, Reply, TransportError};
+use crate::ui;
 
 /// The approval PIN as it is typed. Zeroized on drop (via [`Zeroizing`]) and
 /// **redacted in `Debug`** so it never lands in a log line, a panic message, or a
@@ -281,6 +282,14 @@ pub enum Msg {
     Reject,
     /// The open card's deadline passed: deny it fail-closed, and report `expired`.
     Expire,
+    /// The terminal was resized (or its size first learned). The model gates
+    /// approval on the card being fully readable at this size.
+    Resize {
+        /// Terminal width, in columns.
+        width: u16,
+        /// Terminal height, in rows.
+        height: u16,
+    },
     /// Quit.
     Quit,
 }
@@ -295,6 +304,9 @@ pub struct Model {
     /// [`Self::on_open`] refuses new card requests: two card requests racing is
     /// how a confirmation could be rebound to a card the human never opened.
     awaiting_card: bool,
+    /// Last known terminal size, fed by [`Msg::Resize`]. Starts at zero — until
+    /// the size is known, nothing fits and approval is refused (fail closed).
+    viewport: (u16, u16),
     quit: bool,
 }
 
@@ -331,6 +343,7 @@ impl Default for Model {
             in_flight: false,
             pending: None,
             awaiting_card: false,
+            viewport: (0, 0),
             quit: false,
         }
     }
@@ -395,6 +408,10 @@ impl Model {
                 }
                 None
             }
+            Msg::Resize { width, height } => {
+                self.viewport = (width, height);
+                None
+            }
             Msg::Open => self.on_open(),
         }
     }
@@ -454,6 +471,12 @@ impl Model {
         if c.sent.is_some() {
             return None;
         }
+        if !ui::priority_fields_fit(c, self.viewport.0, self.viewport.1) {
+            // The prompt (or a warning above it) is off-screen: a PIN typed
+            // into a card the human cannot read must not sign (the card shows
+            // the TOO SMALL banner). Esc still rejects.
+            return None;
+        }
         let Some(pin) = &c.pin else {
             return None; // the prompt is not up: `y` opens it
         };
@@ -483,6 +506,13 @@ impl Model {
         };
         if c.sent.is_some() || c.pin.is_some() {
             return None; // decided already, or the PIN prompt owns Enter
+        }
+        if !ui::priority_fields_fit(c, self.viewport.0, self.viewport.1) {
+            // A "yes" to a card the human could not read is not a decision:
+            // while the priority fields do not fit the terminal, `y` is dead —
+            // it neither approves nor opens the PIN prompt. The card shows the
+            // TOO SMALL banner; reject stays available (AGENTS.md #5).
+            return None;
         }
         if c.card.high_risk {
             c.pin = Some(Pin::default());
@@ -909,6 +939,11 @@ mod tests {
     /// Drive a model to the watch phase with the given items.
     fn watching(items: Vec<Summary>) -> Model {
         let mut m = Model::new();
+        // The size report main sends at startup — a standard 80×24 terminal.
+        m.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
         assert!(
             m.update(Msg::Reply(Reply::Hello {
                 server: "s".to_owned()
@@ -1182,6 +1217,136 @@ mod tests {
             ),
             "once the get is answered the console can open the next card"
         );
+    }
+
+    // ── the approve gate: no "yes" to a card the human cannot read ──
+
+    /// A card whose priority fields need more rows than an 80×14 terminal's
+    /// card area can show (8 priority lines vs 7 inner rows).
+    fn tall_card(id: &str) -> Box<Card> {
+        Box::new(Card {
+            id: id.to_owned(),
+            chain_id: 1,
+            to: "0xabc".to_owned(),
+            amount_wei: "0".to_owned(),
+            decoded_call: Some(crate::protocol::DecodedCall {
+                method: "approve".to_owned(),
+                spender: Some("0xdeadbeef".to_owned()),
+                operator: None,
+                from: None,
+                to: None,
+                token: None,
+                amount: Some("0xffffffffffffffff".to_owned()),
+                deadline: None,
+                approved: None,
+                is_unlimited: Some(true),
+            }),
+            high_risk: true,
+            high_risk_reasons: vec!["unlimited_approval".to_owned()],
+            raw_data: "0x".to_owned(),
+            not_after_unix: 1,
+        })
+    }
+
+    fn confirming_tall(id: &str) -> Model {
+        let mut m = watching(vec![summary(id)]);
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(_))
+        ));
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(tall_card(id)))));
+        m
+    }
+
+    #[test]
+    fn approve_is_dead_while_the_priority_fields_cannot_fit_the_terminal() {
+        let mut m = confirming_tall("a");
+        m.update(Msg::Resize {
+            width: 80,
+            height: 14,
+        });
+
+        assert!(m.update(Msg::Approve).is_none());
+        let c = confirm_of(&m);
+        assert!(
+            !c.is_resolving(),
+            "no decision may leave a card the human cannot read"
+        );
+        assert!(
+            c.pin_len().is_none(),
+            "the PIN prompt must not open over a mutilated card"
+        );
+        // Default-deny survives at any size (AGENTS.md #5).
+        assert!(matches!(
+            m.update(Msg::Reject),
+            Some(transport::Request::Deny(id)) if id == "a"
+        ));
+    }
+
+    #[test]
+    fn a_taller_terminal_re_arms_approve() {
+        let mut m = confirming_tall("a");
+        m.update(Msg::Resize {
+            width: 80,
+            height: 14,
+        });
+        assert!(m.update(Msg::Approve).is_none());
+        assert!(confirm_of(&m).pin_len().is_none());
+
+        m.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        // High-risk: `y` now opens the PIN prompt again.
+        assert!(m.update(Msg::Approve).is_none());
+        assert!(confirm_of(&m).pin_len().is_some());
+    }
+
+    #[test]
+    fn pin_submit_is_dead_while_the_prompt_is_off_screen() {
+        let mut m = confirming_tall("a");
+        m.update(Msg::Approve); // 80×24: opens the PIN prompt
+        assert!(confirm_of(&m).pin_len().is_some());
+        type_pin(&mut m, "42");
+
+        // The terminal shrinks mid-prompt: the submit must die with the view.
+        m.update(Msg::Resize {
+            width: 80,
+            height: 14,
+        });
+        assert!(
+            m.update(Msg::PinSubmit).is_none(),
+            "a PIN typed into an unreadable card must not sign"
+        );
+        assert!(!confirm_of(&m).is_resolving());
+        // Esc still rejects (AGENTS.md #5).
+        assert!(matches!(
+            m.update(Msg::Reject),
+            Some(transport::Request::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_terminal_size_fails_closed_for_approve_only() {
+        // No Msg::Resize ever arrived (terminal.size() failed at startup).
+        let mut m = Model::new();
+        m.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        m.update(Msg::PinDigit('1'));
+        m.update(Msg::PinSubmit);
+        m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        m.update(Msg::Tick);
+        m.update(Msg::Reply(Reply::List(vec![summary("a")])));
+        m.update(Msg::Open);
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("a")))));
+
+        assert!(m.update(Msg::Approve).is_none());
+        assert!(!confirm_of(&m).is_resolving());
+        assert!(matches!(
+            m.update(Msg::Reject),
+            Some(transport::Request::Deny(_))
+        ));
     }
 
     // ── watch behaviour ──
