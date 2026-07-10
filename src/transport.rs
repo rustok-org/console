@@ -24,8 +24,8 @@ use std::thread::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    self, AuthOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, Summary, encode_request,
-    parse_auth, parse_get, parse_hello, parse_list,
+    self, AuthOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, ResolveOutcome, Summary,
+    encode_request, parse_approve, parse_auth, parse_deny, parse_get, parse_hello, parse_list,
 };
 
 /// Informational client id sent in `hello` (the server does not validate it).
@@ -44,6 +44,13 @@ pub enum Request {
     List,
     /// Ask for one item's card by id.
     Get(String),
+    /// Approve a normal (non-high-risk) item by id — no PIN.
+    Approve(String),
+    /// Approve a high-risk item: a pre-serialized `approve` line with the PIN
+    /// inside a [`Zeroizing`] buffer (built in the MVU layer, zeroized after send).
+    ApprovePin(Zeroizing<String>),
+    /// Deny an item by id.
+    Deny(String),
 }
 
 /// A message from the worker to the MVU layer.
@@ -60,6 +67,8 @@ pub enum Reply {
     List(Vec<Summary>),
     /// Result of a `get`.
     Get(GetOutcome),
+    /// Result of an `approve` or `deny`.
+    Resolve(ResolveOutcome),
     /// The connection is finished and unusable — the worker has exited.
     Fatal(TransportError),
 }
@@ -255,11 +264,24 @@ fn serve_one(
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
             exchange(writer, reader, &line)?
         }
+        Request::Approve(id) => {
+            let line = encode_request(&protocol::Request::Approve { id })
+                .map_err(|e| TransportError::Protocol(e.to_string()))?;
+            exchange(writer, reader, &line)?
+        }
+        Request::ApprovePin(line) => exchange(writer, reader, line)?,
+        Request::Deny(id) => {
+            let line = encode_request(&protocol::Request::Deny { id })
+                .map_err(|e| TransportError::Protocol(e.to_string()))?;
+            exchange(writer, reader, &line)?
+        }
     };
     let parsed = match req {
         Request::Auth(_) => parse_auth(&resp).map(Reply::Auth),
         Request::List => parse_list(&resp).map(Reply::List),
         Request::Get(_) => parse_get(&resp).map(Reply::Get),
+        Request::Approve(_) | Request::ApprovePin(_) => parse_approve(&resp).map(Reply::Resolve),
+        Request::Deny(_) => parse_deny(&resp).map(Reply::Resolve),
     };
     parsed.map_err(|e| TransportError::Protocol(e.to_string()))
 }
@@ -425,6 +447,60 @@ mod tests {
             t.recv(),
             Some(Reply::Auth(AuthOutcome::BadPin { attempts_left: 2 }))
         );
+    }
+
+    const HELLO_OK: &str = r#"{"ok":true,"proto":1,"server":"core-server/0.1.0"}"#;
+
+    #[test]
+    fn approve_normal_returns_the_resolve_outcome() {
+        let server = FakeServer::start(
+            "approve",
+            vec![
+                Some(HELLO_OK),
+                Some(r#"{"ok":true,"state":"executed","tx_hash":"0xdead"}"#),
+            ],
+        );
+        let t = Transport::connect(&server.path);
+        assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
+        assert!(t.send(Request::Approve("a1".to_owned())));
+        assert_eq!(
+            t.recv(),
+            Some(Reply::Resolve(ResolveOutcome::Executed {
+                tx_hash: "0xdead".to_owned()
+            }))
+        );
+    }
+
+    #[test]
+    fn approve_pin_line_is_sent_for_a_high_risk_item() {
+        let server = FakeServer::start(
+            "approvepin",
+            vec![
+                Some(HELLO_OK),
+                Some(r#"{"ok":false,"error":"bad_pin","attempts_left":1}"#),
+            ],
+        );
+        let t = Transport::connect(&server.path);
+        assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
+        // The MVU layer builds this Zeroizing line (PIN inside).
+        let line = Zeroizing::new(r#"{"op":"approve","id":"a1","pin":"000000"}"#.to_owned());
+        assert!(t.send(Request::ApprovePin(line)));
+        assert_eq!(
+            t.recv(),
+            Some(Reply::Resolve(ResolveOutcome::BadPin { attempts_left: 1 }))
+        );
+    }
+
+    #[test]
+    fn deny_returns_denied() {
+        let server = FakeServer::start(
+            "deny",
+            vec![Some(HELLO_OK), Some(r#"{"ok":true,"state":"denied"}"#)],
+        );
+        let t = Transport::connect(&server.path);
+        assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
+        assert!(t.send(Request::Deny("a1".to_owned())));
+        assert_eq!(t.recv(), Some(Reply::Resolve(ResolveOutcome::Denied)));
     }
 
     #[test]

@@ -42,6 +42,19 @@ pub enum Request<'a> {
         /// The item's preview-uuid, as received in a summary.
         id: &'a str,
     },
+    /// Approve an item — the core signs and broadcasts. This is the normal path;
+    /// a **high-risk** item needs a per-request PIN, which is built separately in
+    /// the transport layer so the PIN stays in a `Zeroizing` buffer (never through
+    /// this general `Serialize` path).
+    Approve {
+        /// The item's preview-uuid.
+        id: &'a str,
+    },
+    /// Deny an item — cheap, no PIN beyond the session `auth`.
+    Deny {
+        /// The item's preview-uuid.
+        id: &'a str,
+    },
 }
 
 /// Serialize a request to a single JSON line (no trailing `\n`; the transport adds
@@ -200,6 +213,67 @@ pub enum GetOutcome {
     UnknownId,
 }
 
+/// The terminal state carried by an `already_resolved` reply (protocol §3.5).
+/// Includes `Pending` (I4): another connection is executing this id right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    /// Signed and broadcast.
+    Executed,
+    /// Rejected by the human.
+    Denied,
+    /// Expired before a decision.
+    Expired,
+    /// Approved, but signing/broadcast failed.
+    Failed,
+    /// Another connection is executing this id right now (retry / wait).
+    Pending,
+}
+
+/// Outcome of `approve` or `deny`. Note there is **no** `expired` error code:
+/// an item that expired resolves to `AlreadyResolved { Expired }` (or `UnknownId`
+/// after retention), never a top-level `expired`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    /// Approved: signed and broadcast; carries the tx hash.
+    Executed {
+        /// `0x`-hex transaction hash.
+        tx_hash: String,
+    },
+    /// Approved, but signing/broadcast failed (still resolved — not retryable).
+    Failed {
+        /// Operator-masked failure reason.
+        reason: String,
+    },
+    /// Denied.
+    Denied,
+    /// Already terminal (or in-flight) — carries the state.
+    AlreadyResolved {
+        /// The existing terminal/in-flight state.
+        state: TerminalState,
+    },
+    /// No successful `auth` on this connection.
+    Unauthorized,
+    /// A high-risk item was approved without a `pin`.
+    PinRequired,
+    /// Wrong PIN; `attempts_left == 0` means the lockout is now armed.
+    BadPin {
+        /// Attempts before the lockout trips.
+        attempts_left: u32,
+    },
+    /// Lockout active; retry after this many seconds.
+    Locked {
+        /// Seconds until the channel accepts a PIN again.
+        retry_after_s: u64,
+    },
+    /// The wallet has no PIN record.
+    PinNotSet,
+    /// Transient Argon2 backend failure.
+    PinUnavailable,
+    /// The id is not a live item.
+    UnknownId,
+}
+
 /// A parse or encode failure in the protocol layer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -339,6 +413,109 @@ pub fn parse_get(line: &str) -> Result<GetOutcome, ProtocolError> {
             raw.error
                 .unwrap_or_else(|| "get without ok or error".to_owned()),
         ))
+    }
+}
+
+/// The fields an `approve` / `deny` reply may carry. `state` means the outcome
+/// (`executed`/`failed`/`denied`) on an `ok` reply, or the `already_resolved`
+/// state on an error reply.
+#[derive(Deserialize)]
+struct ResolveRaw {
+    ok: bool,
+    state: Option<String>,
+    tx_hash: Option<String>,
+    reason: Option<String>,
+    error: Option<String>,
+    attempts_left: Option<u32>,
+    retry_after_s: Option<u64>,
+}
+
+/// Map an error reply (shared by `approve` and `deny`) to a [`ResolveOutcome`].
+fn resolve_error(raw: &ResolveRaw) -> Result<ResolveOutcome, ProtocolError> {
+    match raw.error.as_deref() {
+        Some("unauthorized") => Ok(ResolveOutcome::Unauthorized),
+        Some("pin_required") => Ok(ResolveOutcome::PinRequired),
+        Some("bad_pin") => Ok(ResolveOutcome::BadPin {
+            attempts_left: raw.attempts_left.unwrap_or(0),
+        }),
+        Some("locked") => Ok(ResolveOutcome::Locked {
+            retry_after_s: raw.retry_after_s.unwrap_or(0),
+        }),
+        Some("pin_not_set") => Ok(ResolveOutcome::PinNotSet),
+        Some("pin_unavailable") => Ok(ResolveOutcome::PinUnavailable),
+        Some("unknown_id") => Ok(ResolveOutcome::UnknownId),
+        Some("already_resolved") => Ok(ResolveOutcome::AlreadyResolved {
+            state: parse_terminal_state(raw.state.as_deref())?,
+        }),
+        other => Err(ProtocolError::Unexpected(
+            other.unwrap_or("resolve without ok or error").to_owned(),
+        )),
+    }
+}
+
+fn parse_terminal_state(s: Option<&str>) -> Result<TerminalState, ProtocolError> {
+    match s {
+        Some("executed") => Ok(TerminalState::Executed),
+        Some("denied") => Ok(TerminalState::Denied),
+        Some("expired") => Ok(TerminalState::Expired),
+        Some("pending") => Ok(TerminalState::Pending),
+        Some("failed") => Ok(TerminalState::Failed),
+        other => Err(ProtocolError::Unexpected(format!(
+            "already_resolved with unknown state {other:?}"
+        ))),
+    }
+}
+
+/// Parse a response to `approve`.
+///
+/// # Errors
+/// [`ProtocolError::Malformed`] on non-JSON; [`ProtocolError::Unexpected`] on an
+/// `ok` reply with an unexpected `state`, or an unmodeled error code.
+pub fn parse_approve(line: &str) -> Result<ResolveOutcome, ProtocolError> {
+    let raw: ResolveRaw = parse_line(line)?;
+    if raw.ok {
+        match raw.state.as_deref() {
+            Some("executed") => Ok(ResolveOutcome::Executed {
+                tx_hash: raw.tx_hash.unwrap_or_default(),
+            }),
+            Some("failed") => Ok(ResolveOutcome::Failed {
+                reason: raw.reason.unwrap_or_default(),
+            }),
+            other => Err(ProtocolError::Unexpected(format!(
+                "approve ok with unexpected state {other:?}"
+            ))),
+        }
+    } else {
+        resolve_error(&raw)
+    }
+}
+
+/// Parse a response to `deny`.
+///
+/// # Errors
+/// [`ProtocolError::Malformed`] on non-JSON; [`ProtocolError::Unexpected`] on an
+/// `ok` reply that is not `denied`, or any error outside `deny`'s documented
+/// surface (§3.6): `unauthorized` / `unknown_id` / `already_resolved`. The PIN
+/// family in particular is refused — "deny never requires a PIN beyond session
+/// auth" — because accepted, it would open the PIN prompt over a rejection and
+/// the prompt can only build an approve line.
+pub fn parse_deny(line: &str) -> Result<ResolveOutcome, ProtocolError> {
+    let raw: ResolveRaw = parse_line(line)?;
+    if raw.ok {
+        match raw.state.as_deref() {
+            Some("denied") => Ok(ResolveOutcome::Denied),
+            other => Err(ProtocolError::Unexpected(format!(
+                "deny ok with unexpected state {other:?}"
+            ))),
+        }
+    } else {
+        match raw.error.as_deref() {
+            Some("unauthorized" | "unknown_id" | "already_resolved") => resolve_error(&raw),
+            other => Err(ProtocolError::Unexpected(format!(
+                "deny answered with error {other:?} — its only errors are \
+                 unauthorized/unknown_id/already_resolved (§3.6)"
+            ))),
+        }
     }
 }
 
@@ -551,5 +728,138 @@ mod tests {
             parse_get(r#"{"ok":true,"card":{"id":"#),
             Err(ProtocolError::Malformed(_))
         ));
+    }
+
+    // ── approve / deny requests ──
+
+    #[test]
+    fn encode_approve_and_deny_carry_the_id() {
+        assert_eq!(
+            encode_request(&Request::Approve { id: "a1" }).unwrap(),
+            r#"{"op":"approve","id":"a1"}"#
+        );
+        assert_eq!(
+            encode_request(&Request::Deny { id: "a1" }).unwrap(),
+            r#"{"op":"deny","id":"a1"}"#
+        );
+    }
+
+    // ── approve outcomes ──
+
+    #[test]
+    fn parse_approve_executed_carries_the_tx_hash() {
+        assert_eq!(
+            parse_approve(r#"{"ok":true,"state":"executed","tx_hash":"0xabc"}"#).unwrap(),
+            ResolveOutcome::Executed {
+                tx_hash: "0xabc".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_approve_failed_carries_the_reason() {
+        assert_eq!(
+            parse_approve(r#"{"ok":true,"state":"failed","reason":"broadcast error"}"#).unwrap(),
+            ResolveOutcome::Failed {
+                reason: "broadcast error".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_approve_error_codes() {
+        assert_eq!(
+            parse_approve(r#"{"ok":false,"error":"pin_required"}"#).unwrap(),
+            ResolveOutcome::PinRequired
+        );
+        assert_eq!(
+            parse_approve(r#"{"ok":false,"error":"bad_pin","attempts_left":1}"#).unwrap(),
+            ResolveOutcome::BadPin { attempts_left: 1 }
+        );
+        assert_eq!(
+            parse_approve(r#"{"ok":false,"error":"locked","retry_after_s":300}"#).unwrap(),
+            ResolveOutcome::Locked { retry_after_s: 300 }
+        );
+        assert_eq!(
+            parse_approve(r#"{"ok":false,"error":"unauthorized"}"#).unwrap(),
+            ResolveOutcome::Unauthorized
+        );
+        assert_eq!(
+            parse_approve(r#"{"ok":false,"error":"unknown_id"}"#).unwrap(),
+            ResolveOutcome::UnknownId
+        );
+    }
+
+    #[test]
+    fn parse_approve_already_resolved_accepts_every_state_including_pending() {
+        for (word, state) in [
+            ("executed", TerminalState::Executed),
+            ("denied", TerminalState::Denied),
+            ("expired", TerminalState::Expired),
+            ("failed", TerminalState::Failed),
+            ("pending", TerminalState::Pending), // I4 — must not panic
+        ] {
+            let line = format!(r#"{{"ok":false,"error":"already_resolved","state":"{word}"}}"#);
+            assert_eq!(
+                parse_approve(&line).unwrap(),
+                ResolveOutcome::AlreadyResolved { state }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_approve_rejects_an_unknown_already_resolved_state() {
+        assert!(matches!(
+            parse_approve(r#"{"ok":false,"error":"already_resolved","state":"weird"}"#),
+            Err(ProtocolError::Unexpected(_))
+        ));
+    }
+
+    // ── deny outcomes ──
+
+    #[test]
+    fn parse_deny_denied() {
+        assert_eq!(
+            parse_deny(r#"{"ok":true,"state":"denied"}"#).unwrap(),
+            ResolveOutcome::Denied
+        );
+    }
+
+    #[test]
+    fn parse_deny_accepts_exactly_its_documented_errors() {
+        // §3.6: unauthorized / unknown_id / already_resolved — and nothing else.
+        assert_eq!(
+            parse_deny(r#"{"ok":false,"error":"unauthorized"}"#).unwrap(),
+            ResolveOutcome::Unauthorized
+        );
+        assert_eq!(
+            parse_deny(r#"{"ok":false,"error":"unknown_id"}"#).unwrap(),
+            ResolveOutcome::UnknownId
+        );
+        assert_eq!(
+            parse_deny(r#"{"ok":false,"error":"already_resolved","state":"executed"}"#).unwrap(),
+            ResolveOutcome::AlreadyResolved {
+                state: TerminalState::Executed
+            }
+        );
+    }
+
+    #[test]
+    fn parse_deny_refuses_the_whole_pin_family() {
+        // §3.6: "deny never requires a PIN beyond session auth". A PIN-family
+        // answer to a deny would flow into the PIN prompt and turn the human's
+        // "no" into an approve line — it must kill the channel instead.
+        for line in [
+            r#"{"ok":false,"error":"pin_required"}"#,
+            r#"{"ok":false,"error":"bad_pin","attempts_left":2}"#,
+            r#"{"ok":false,"error":"locked","retry_after_s":30}"#,
+            r#"{"ok":false,"error":"pin_not_set"}"#,
+            r#"{"ok":false,"error":"pin_unavailable"}"#,
+        ] {
+            assert!(
+                matches!(parse_deny(line), Err(ProtocolError::Unexpected(_))),
+                "deny must never accept: {line}"
+            );
+        }
     }
 }
