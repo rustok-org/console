@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "rustok-console"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ratatui",
  "serde",
