@@ -155,11 +155,21 @@ pub struct Confirm {
     pin: Option<Pin>,
     /// The last non-terminal failure to show.
     error: Option<ResolveError>,
-    /// A decision is on the wire — further key presses are ignored so a second
-    /// press cannot become a second decision.
-    resolving: bool,
+    /// The decision on the wire, while one is — further key presses are ignored
+    /// so a second press cannot become a second decision. *Which* decision it
+    /// was matters too: a PIN-family answer is only ever legal for an approve
+    /// (§3.6), and `apply_resolve` refuses the channel when it arrives for
+    /// anything else — a "no" must never grow a PIN prompt.
+    sent: Option<SentDecision>,
     /// The `deny` was sent by the expiry deadline, not by the human.
     timed_out: bool,
+}
+
+/// The decision the console put on the wire for the open card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentDecision {
+    Approve,
+    Deny,
 }
 
 impl Confirm {
@@ -168,7 +178,7 @@ impl Confirm {
             card,
             pin: None,
             error: None,
-            resolving: false,
+            sent: None,
             timed_out: false,
         }
     }
@@ -194,7 +204,7 @@ impl Confirm {
     /// Whether a decision is currently on the wire.
     #[must_use]
     pub fn is_resolving(&self) -> bool {
-        self.resolving
+        self.sent.is_some()
     }
 }
 
@@ -397,7 +407,7 @@ impl Model {
             Phase::Authing { pin, .. } => Some(pin),
             Phase::Watching {
                 confirm: Some(c), ..
-            } if !c.resolving => c.pin.as_mut(),
+            } if c.sent.is_none() => c.pin.as_mut(),
             _ => None,
         }
     }
@@ -441,7 +451,7 @@ impl Model {
         else {
             return None;
         };
-        if c.resolving {
+        if c.sent.is_some() {
             return None;
         }
         let Some(pin) = &c.pin else {
@@ -457,7 +467,7 @@ impl Model {
             ));
             return None;
         };
-        c.resolving = true;
+        c.sent = Some(SentDecision::Approve);
         c.error = None;
         self.dispatch_pin_approve(line)
     }
@@ -471,7 +481,7 @@ impl Model {
         else {
             return None;
         };
-        if c.resolving || c.pin.is_some() {
+        if c.sent.is_some() || c.pin.is_some() {
             return None; // decided already, or the PIN prompt owns Enter
         }
         if c.card.high_risk {
@@ -479,7 +489,7 @@ impl Model {
             c.error = None;
             return None;
         }
-        c.resolving = true;
+        c.sent = Some(SentDecision::Approve);
         c.error = None;
         let id = c.card.id.clone();
         self.dispatch_user(PendingIntent::Approve(id.clone()), || {
@@ -496,10 +506,10 @@ impl Model {
         else {
             return None;
         };
-        if c.resolving {
+        if c.sent.is_some() {
             return None; // a decision is already on the wire; the server decides
         }
-        c.resolving = true;
+        c.sent = Some(SentDecision::Deny);
         c.timed_out = by_timeout;
         c.error = None;
         let id = c.card.id.clone();
@@ -669,13 +679,10 @@ impl Model {
     /// matching [`ExitOutcome`]; the rest leave the item live and the human in
     /// charge (`pin_required` opens the PIN prompt, `bad_pin` clears it, and so on).
     fn apply_resolve(&mut self, outcome: ResolveOutcome) {
-        let timed_out = match &mut self.phase {
+        let (sent, timed_out) = match &mut self.phase {
             Phase::Watching {
                 confirm: Some(c), ..
-            } => {
-                c.resolving = false;
-                c.timed_out
-            }
+            } => (c.sent.take(), c.timed_out),
             // No confirmation is open — an answer to a decision we never made.
             _ => return,
         };
@@ -691,6 +698,27 @@ impl Model {
             // think it is. Fail closed rather than retry a money action.
             self.phase = Phase::Fatal(TransportError::Protocol(
                 "server refused an authenticated session (unauthorized)".to_owned(),
+            ));
+            return;
+        }
+
+        let pin_flavoured = matches!(
+            outcome,
+            ResolveOutcome::PinRequired
+                | ResolveOutcome::BadPin { .. }
+                | ResolveOutcome::Locked { .. }
+                | ResolveOutcome::PinNotSet
+                | ResolveOutcome::PinUnavailable
+        );
+        if pin_flavoured && sent != Some(SentDecision::Approve) {
+            // A PIN-family answer exists only for `approve` (§3.6: "deny never
+            // requires a PIN beyond session auth"). Arriving for a deny — or for
+            // nothing we sent — it would open the PIN prompt over a rejection,
+            // and the prompt can only build an approve line: the human's "no"
+            // would come back as a signature. Same fail-closed as Unauthorized;
+            // `parse_deny` already refuses this at the wire, this is depth.
+            self.phase = Phase::Fatal(TransportError::Protocol(
+                "server asked for a PIN outside an approve (§3.6)".to_owned(),
             ));
             return;
         }
@@ -1084,6 +1112,37 @@ mod tests {
             c.is_resolving(),
             "the resolve answer must still find the confirmation it belongs to"
         );
+    }
+
+    #[test]
+    fn a_pin_answer_to_a_deny_can_never_turn_the_no_into_a_signature() {
+        // The incident: the human said no, a skewed/hostile core answered the
+        // deny with a PIN-family error — the console must refuse the channel,
+        // never open the PIN prompt over a rejection. Every family member.
+        for outcome in [
+            ResolveOutcome::PinRequired,
+            ResolveOutcome::BadPin { attempts_left: 2 },
+            ResolveOutcome::Locked { retry_after_s: 30 },
+            ResolveOutcome::PinNotSet,
+            ResolveOutcome::PinUnavailable,
+        ] {
+            let mut m = confirming("a", false);
+            assert!(matches!(
+                m.update(Msg::Reject),
+                Some(transport::Request::Deny(id)) if id == "a"
+            ));
+            assert!(m.update(Msg::Reply(Reply::Resolve(outcome))).is_none());
+            assert!(
+                matches!(m.phase(), Phase::Fatal(_)),
+                "a PIN ask on a deny is not the channel we think it is (§3.6)"
+            );
+            // The rest of the incident's key presses must be dead ends.
+            type_pin(&mut m, "42");
+            assert!(
+                m.update(Msg::PinSubmit).is_none(),
+                "no approve line may ever follow a rejection"
+            );
+        }
     }
 
     #[test]

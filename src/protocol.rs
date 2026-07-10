@@ -494,7 +494,11 @@ pub fn parse_approve(line: &str) -> Result<ResolveOutcome, ProtocolError> {
 ///
 /// # Errors
 /// [`ProtocolError::Malformed`] on non-JSON; [`ProtocolError::Unexpected`] on an
-/// `ok` reply that is not `denied`, or an unmodeled error code.
+/// `ok` reply that is not `denied`, or any error outside `deny`'s documented
+/// surface (§3.6): `unauthorized` / `unknown_id` / `already_resolved`. The PIN
+/// family in particular is refused — "deny never requires a PIN beyond session
+/// auth" — because accepted, it would open the PIN prompt over a rejection and
+/// the prompt can only build an approve line.
 pub fn parse_deny(line: &str) -> Result<ResolveOutcome, ProtocolError> {
     let raw: ResolveRaw = parse_line(line)?;
     if raw.ok {
@@ -505,7 +509,13 @@ pub fn parse_deny(line: &str) -> Result<ResolveOutcome, ProtocolError> {
             ))),
         }
     } else {
-        resolve_error(&raw)
+        match raw.error.as_deref() {
+            Some("unauthorized" | "unknown_id" | "already_resolved") => resolve_error(&raw),
+            other => Err(ProtocolError::Unexpected(format!(
+                "deny answered with error {other:?} — its only errors are \
+                 unauthorized/unknown_id/already_resolved (§3.6)"
+            ))),
+        }
     }
 }
 
@@ -816,10 +826,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_deny_shares_the_error_codes() {
+    fn parse_deny_accepts_exactly_its_documented_errors() {
+        // §3.6: unauthorized / unknown_id / already_resolved — and nothing else.
         assert_eq!(
             parse_deny(r#"{"ok":false,"error":"unauthorized"}"#).unwrap(),
             ResolveOutcome::Unauthorized
+        );
+        assert_eq!(
+            parse_deny(r#"{"ok":false,"error":"unknown_id"}"#).unwrap(),
+            ResolveOutcome::UnknownId
         );
         assert_eq!(
             parse_deny(r#"{"ok":false,"error":"already_resolved","state":"executed"}"#).unwrap(),
@@ -827,5 +842,24 @@ mod tests {
                 state: TerminalState::Executed
             }
         );
+    }
+
+    #[test]
+    fn parse_deny_refuses_the_whole_pin_family() {
+        // §3.6: "deny never requires a PIN beyond session auth". A PIN-family
+        // answer to a deny would flow into the PIN prompt and turn the human's
+        // "no" into an approve line — it must kill the channel instead.
+        for line in [
+            r#"{"ok":false,"error":"pin_required"}"#,
+            r#"{"ok":false,"error":"bad_pin","attempts_left":2}"#,
+            r#"{"ok":false,"error":"locked","retry_after_s":30}"#,
+            r#"{"ok":false,"error":"pin_not_set"}"#,
+            r#"{"ok":false,"error":"pin_unavailable"}"#,
+        ] {
+            assert!(
+                matches!(parse_deny(line), Err(ProtocolError::Unexpected(_))),
+                "deny must never accept: {line}"
+            );
+        }
     }
 }
