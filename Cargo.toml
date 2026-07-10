@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # PIN hygiene: the PIN and its serialized auth request live in Zeroizing buffers.
 zeroize = "1"
+# Display-cell arithmetic for the card's height budget (ui::render_detail) —
+# the same crate ratatui measures with, so our row math matches its renderer.
+unicode-width = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

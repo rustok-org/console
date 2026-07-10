@@ -103,10 +103,21 @@ fn render_watch(
 ) {
     // The note's row is claimed only when there is a note. An always-reserved row
     // would take its space from the card, and the card is the one thing on this
-    // screen that must never be silently clipped (`AGENTS.md` #1).
+    // screen whose priority fields must never leave the screen (`AGENTS.md` #1).
+    //
+    // While a confirmation is open the card is the decision surface: the queue
+    // collapses to a single-item strip (the List keeps the selection in view)
+    // and the card takes every remaining row. Splitting the height evenly would
+    // starve the card of the rows its risk warnings and PIN prompt need on a
+    // 24-row terminal.
+    let queue_rows = if confirm.is_some() {
+        Constraint::Length(3) // borders + the selected row
+    } else {
+        Constraint::Min(3)
+    };
     let mut constraints = vec![
         Constraint::Length(1), // header
-        Constraint::Min(3),    // queue
+        queue_rows,            // queue
         Constraint::Min(6),    // card / hint
         Constraint::Length(1), // decision row / navigation hint
     ];
@@ -231,8 +242,17 @@ fn kind_word(s: &Summary) -> &'static str {
     }
 }
 
-/// Render the open confirmation's card **verbatim** — the core's fields as
-/// received, no re-derivation. `None` shows a hint to open one.
+/// Render the open confirmation's card — the core's fields **verbatim**, no
+/// re-derivation. `None` shows a hint to open one.
+///
+/// Priority fields (everything except `raw_data`) render first, and
+/// `raw_data` — the only elastic element — gets exactly the rows that remain,
+/// truncated with an explicit marker when it cannot fit. A long calldata can
+/// therefore never push a risk warning or the PIN prompt off the screen. That
+/// guarantee is against `raw_data`: priority fields that alone overflow the
+/// card (pathological server data) still clip at the bottom until scrolling
+/// lands. Every line is pre-wrapped to the card's inner width so one logical
+/// line is one visual row and the height budget is exact, not an estimate.
 fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
     let block = Block::bordered().title(" Card ");
     let Some(confirm) = confirm else {
@@ -243,60 +263,184 @@ fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::la
     };
     let card: &Card = confirm.card();
 
-    let mut lines = vec![
-        kv("to", &card.to),
-        kv("amount_wei", &card.amount_wei),
-        kv("chain_id", &card.chain_id.to_string()),
-        kv("raw_data", &card.raw_data),
-    ];
+    let inner = block.inner(area);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    push_wrapped(&mut lines, width, format!("to: {}", card.to), Style::new());
+    push_wrapped(
+        &mut lines,
+        width,
+        format!("amount_wei: {}", card.amount_wei),
+        Style::new(),
+    );
+    push_wrapped(
+        &mut lines,
+        width,
+        format!("chain_id: {}", card.chain_id),
+        Style::new(),
+    );
     if card.high_risk {
-        lines.push(Line::from(Span::styled(
+        push_wrapped(
+            &mut lines,
+            width,
             format!("HIGH RISK: {}", card.high_risk_reasons.join(", ")),
-            Style::new().add_modifier(Modifier::BOLD),
-        )));
+            bold,
+        );
     }
     match &card.decoded_call {
         None => lines.push(Line::from("decoded_call: (none)")),
         Some(dc) => {
-            lines.push(Line::from(format!("decoded_call.method: {}", dc.method)));
-            push_opt(&mut lines, "spender", dc.spender.as_deref());
-            push_opt(&mut lines, "operator", dc.operator.as_deref());
-            push_opt(&mut lines, "from", dc.from.as_deref());
-            push_opt(&mut lines, "to", dc.to.as_deref());
-            push_opt(&mut lines, "token", dc.token.as_deref());
-            push_opt(&mut lines, "amount", dc.amount.as_deref());
-            push_opt(&mut lines, "deadline", dc.deadline.as_deref());
+            push_wrapped(
+                &mut lines,
+                width,
+                format!("decoded_call.method: {}", dc.method),
+                Style::new(),
+            );
+            push_opt(&mut lines, width, "spender", dc.spender.as_deref());
+            push_opt(&mut lines, width, "operator", dc.operator.as_deref());
+            push_opt(&mut lines, width, "from", dc.from.as_deref());
+            push_opt(&mut lines, width, "to", dc.to.as_deref());
+            push_opt(&mut lines, width, "token", dc.token.as_deref());
+            push_opt(&mut lines, width, "amount", dc.amount.as_deref());
+            push_opt(&mut lines, width, "deadline", dc.deadline.as_deref());
             if dc.is_unlimited == Some(true) {
-                lines.push(Line::from(Span::styled(
-                    "amount: UNLIMITED",
-                    Style::new().add_modifier(Modifier::BOLD),
-                )));
+                push_wrapped(&mut lines, width, "amount: UNLIMITED".to_owned(), bold);
             }
         }
     }
     if let Some(pin_len) = confirm.pin_len() {
         lines.push(Line::from(""));
-        lines.push(Line::from("High-risk approval — enter your PIN:"));
+        push_wrapped(
+            &mut lines,
+            width,
+            "High-risk approval — enter your PIN:".to_owned(),
+            Style::new(),
+        );
         // Only the count is shown — never the digits.
-        lines.push(Line::from(Span::styled(
-            "●".repeat(pin_len),
-            Style::new().add_modifier(Modifier::BOLD),
-        )));
+        push_wrapped(&mut lines, width, "●".repeat(pin_len), bold);
     }
     if let Some(err) = confirm.error() {
         lines.push(Line::from(""));
-        lines.push(Line::from(resolve_error_text(err)));
+        push_wrapped(&mut lines, width, resolve_error_text(err), Style::new());
     }
 
-    // Wrap (never truncate): a clear-signing card must show the whole value —
-    // a silently clipped raw_data or address would be the one lie this screen
-    // exists to prevent. trim: false keeps the exact bytes, including leading space.
+    // raw_data comes LAST and absorbs whatever rows the priority fields above
+    // left over. Never truncate priority fields; a truncated raw_data says so
+    // out loud — a silent clip would be the one lie this screen exists to
+    // prevent. Wrap stays on as a backstop only (every line already fits the
+    // width); trim: false keeps the exact bytes, including leading space.
+    let budget = height.saturating_sub(lines.len());
+    push_raw_data(&mut lines, width, budget, &card.raw_data);
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Push `raw_data` into exactly `budget` visual rows. It fits → shown whole.
+/// It does not → truncated with a marker naming how much is hidden; the marker
+/// lives inside the same budget, so it can never spill onto the priority
+/// fields. A zero budget (priority fields alone fill the card — an anomalously
+/// long decoded_call) degrades to a marker-only line, clipped by ratatui if
+/// even that row has no room; it never panics.
+fn push_raw_data(lines: &mut Vec<Line<'static>>, width: usize, budget: usize, raw: &str) {
+    use unicode_width::UnicodeWidthStr;
+
+    let total = raw.chars().count();
+    if budget == 0 {
+        push_wrapped(
+            lines,
+            width,
+            format!("raw_data: (hidden — card too small for {total} chars)"),
+            Style::new(),
+        );
+        return;
+    }
+    let full_rows = chunk_display_width(&format!("raw_data: {raw}"), width);
+    if full_rows.len() <= budget {
+        lines.extend(full_rows.into_iter().map(Line::from));
+        return;
+    }
+
+    // Size the shown prefix by display cells, reserving room for the marker at
+    // its widest (both counters as wide as `total`). The digit widths change
+    // with `shown`, so verify by chunking and shrink a row's worth at a time —
+    // strictly downward, stopping at zero, where the marker alone is pushed.
+    let cells = budget.saturating_mul(width.max(1));
+    let overhead = truncated_raw_line("", total, total).width();
+    let mut shown = prefix_chars_for_cells(raw, cells.saturating_sub(overhead));
+    loop {
+        let prefix: String = raw.chars().take(shown).collect();
+        let candidate = truncated_raw_line(&prefix, shown, total);
+        if chunk_display_width(&candidate, width).len() <= budget || shown == 0 {
+            push_wrapped(lines, width, candidate, Style::new());
+            return;
+        }
+        shown = shown.saturating_sub(width.max(1));
+    }
+}
+
+/// The truncated `raw_data` line: head of the value plus an explicit marker.
+fn truncated_raw_line(prefix: &str, shown: usize, total: usize) -> String {
+    let hidden = total.saturating_sub(shown);
+    format!(
+        "raw_data: {prefix}… ({total} chars total, {shown} shown, {hidden} not shown — scroll not yet supported)"
+    )
+}
+
+/// How many leading `chars` of `s` fit within `cells` display cells.
+fn prefix_chars_for_cells(s: &str, cells: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut used = 0;
+    let mut count = 0;
+    for ch in s.chars() {
+        used += ch.width().unwrap_or(0);
+        if used > cells {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Push `text` as one or more lines, each at most `width` display cells — the
+/// pre-wrapping that keeps `render_detail`'s row arithmetic exact.
+fn push_wrapped(lines: &mut Vec<Line<'static>>, width: usize, text: String, style: Style) {
+    for chunk in chunk_display_width(&text, width) {
+        lines.push(Line::from(Span::styled(chunk, style)));
+    }
+}
+
+/// Split `s` into chunks of at most `width` display cells, never inside a
+/// `char`. Measured with the same unicode-width ratatui renders with, so a
+/// chunk always fits one terminal row.
+fn chunk_display_width(s: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(ch);
+        used += w;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn resolve_error_text(err: &ResolveError) -> String {
@@ -310,13 +454,14 @@ fn resolve_error_text(err: &ResolveError) -> String {
     }
 }
 
-fn kv(key: &str, value: &str) -> Line<'static> {
-    Line::from(format!("{key}: {value}"))
-}
-
-fn push_opt(lines: &mut Vec<Line<'static>>, key: &str, value: Option<&str>) {
+fn push_opt(lines: &mut Vec<Line<'static>>, width: usize, key: &str, value: Option<&str>) {
     if let Some(v) = value {
-        lines.push(Line::from(format!("decoded_call.{key}: {v}")));
+        push_wrapped(
+            lines,
+            width,
+            format!("decoded_call.{key}: {v}"),
+            Style::new(),
+        );
     }
 }
 
@@ -617,6 +762,173 @@ mod tests {
         assert!(
             !screen.contains("Approve"),
             "with a decision on the wire there is no button left to press twice"
+        );
+    }
+
+    /// The Stage-1 repro card: high-risk unlimited `approve` whose calldata used
+    /// to push every warning off an 80×24 screen.
+    fn risk_card(id: &str, raw_data: String) -> Box<Card> {
+        Box::new(Card {
+            id: id.to_owned(),
+            chain_id: 1,
+            to: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_owned(),
+            amount_wei: "0".to_owned(),
+            decoded_call: Some(DecodedCall {
+                method: "approve".to_owned(),
+                spender: Some("0xdeadbeef".to_owned()),
+                operator: None,
+                from: None,
+                to: None,
+                token: None,
+                amount: Some("0xffffffffffffffff".to_owned()),
+                deadline: None,
+                approved: None,
+                is_unlimited: Some(true),
+            }),
+            high_risk: true,
+            high_risk_reasons: vec!["unlimited_approval".to_owned()],
+            raw_data,
+            not_after_unix: NOW + 27,
+        })
+    }
+
+    /// Drive the model to an open confirmation on `risk_card`.
+    fn open_risk_card(model: &mut Model, raw_data: String) {
+        to_watching(model, vec![summary("a1", "0xabc", "0", true)]);
+        model.update(Msg::Open);
+        model.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
+            risk_card("a1", raw_data),
+        ))));
+    }
+
+    /// The first row index containing `needle` — for order checks.
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
+    }
+
+    /// 328-char calldata, as measured in the Stage-1 repro.
+    fn stage1_raw_data() -> String {
+        let raw = format!("0x{}", "ab".repeat(163));
+        assert_eq!(raw.chars().count(), 328);
+        raw
+    }
+
+    #[test]
+    fn chunking_respects_display_width_and_never_splits_a_char() {
+        // Exact multiples: no empty trailing chunk.
+        assert_eq!(chunk_display_width("abcdef", 3), vec!["abc", "def"]);
+        // A 2-cell char that does not fit the remaining cell starts a new chunk.
+        assert_eq!(chunk_display_width("ab漢", 3), vec!["ab", "漢"]);
+        // Empty input still claims one (blank) row.
+        assert_eq!(chunk_display_width("", 5), vec![""]);
+    }
+
+    #[test]
+    fn every_warning_and_the_pin_prompt_stay_on_screen_with_a_long_raw_data() {
+        let mut m = Model::new();
+        open_risk_card(&mut m, stage1_raw_data());
+        m.update(Msg::Approve); // high risk: opens the PIN prompt
+        m.update(Msg::PinDigit('7'));
+
+        let rows = draw_rows(&m, 80, 24);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("HIGH RISK"),
+            "the risk warning must never leave the screen"
+        );
+        assert!(
+            screen.contains("UNLIMITED"),
+            "the unlimited-amount warning must never leave the screen"
+        );
+        assert!(
+            screen.contains("enter your PIN"),
+            "the PIN prompt must never leave the screen"
+        );
+        assert!(
+            screen.contains("●"),
+            "the PIN dots must be visible — a blind PIN entry is not an entry"
+        );
+        // raw_data is the one elastic element, so it renders BELOW every warning.
+        assert!(
+            row_of(&rows, "HIGH RISK") < row_of(&rows, "raw_data"),
+            "raw_data must render below the risk warning, never above it"
+        );
+    }
+
+    #[test]
+    fn high_risk_and_unlimited_stay_on_screen_with_a_long_raw_data_without_pin() {
+        let mut m = Model::new();
+        open_risk_card(&mut m, stage1_raw_data());
+
+        let screen = draw(&m, 80, 24);
+
+        assert!(screen.contains("HIGH RISK"));
+        assert!(screen.contains("UNLIMITED"));
+    }
+
+    #[test]
+    fn a_short_raw_data_still_renders_whole_with_no_truncation_marker() {
+        let mut m = Model::new();
+        open_risk_card(&mut m, "0x095ea7b3deadbeef".to_owned());
+
+        let rows = draw_rows(&m, 80, 24);
+
+        assert!(
+            has_line_with(&rows, &["raw_data: 0x095ea7b3deadbeef"]),
+            "a raw_data that fits renders whole, exactly as received"
+        );
+        assert!(
+            !rows.join("\n").contains("not shown"),
+            "no truncation marker when nothing was truncated"
+        );
+    }
+
+    #[test]
+    fn an_overlong_raw_data_is_truncated_with_an_explicit_marker_not_silently() {
+        let mut m = Model::new();
+        open_risk_card(&mut m, format!("0x{}", "ab".repeat(1000)));
+
+        let rows = draw_rows(&m, 80, 24);
+        let screen = rows.join("\n");
+
+        assert!(
+            has_line_with(&rows, &["raw_data: 0xabab"]),
+            "the head of raw_data is still shown"
+        );
+        assert!(
+            screen.contains("not shown"),
+            "a clipped raw_data must say so out loud, never trail off silently"
+        );
+
+        // The marker's numbers are the honesty of this screen: they must name
+        // the real payload and account for every char of it.
+        let marker_row = rows
+            .iter()
+            .find(|r| r.contains("not shown"))
+            .expect("the truncation marker renders");
+        let nums: Vec<usize> = marker_row
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(
+            nums.len(),
+            3,
+            "total, shown and not-shown counters: {marker_row}"
+        );
+        assert_eq!(nums[0], 2002, "the total names the real payload size");
+        assert_eq!(
+            nums[1] + nums[2],
+            nums[0],
+            "shown + not shown must account for every char: {marker_row}"
+        );
+        assert!(
+            nums[1] < nums[2],
+            "a 2002-char payload on 24 rows is mostly hidden — the shown and \
+             not-shown counters look swapped: {marker_row}"
         );
     }
 
