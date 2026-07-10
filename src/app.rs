@@ -281,6 +281,10 @@ pub struct Model {
     phase: Phase,
     in_flight: bool,
     pending: Option<PendingIntent>,
+    /// A `get` has been **sent** and its answer is still pending. While set,
+    /// [`Self::on_open`] refuses new card requests: two card requests racing is
+    /// how a confirmation could be rebound to a card the human never opened.
+    awaiting_card: bool,
     quit: bool,
 }
 
@@ -316,6 +320,7 @@ impl Default for Model {
             phase: Phase::Connecting,
             in_flight: false,
             pending: None,
+            awaiting_card: false,
             quit: false,
         }
     }
@@ -516,12 +521,22 @@ impl Model {
         if confirm.is_some() {
             return None; // already deciding one
         }
+        if self.awaiting_card {
+            // A card request is already on the wire. Refused, NOT parked: with
+            // two gets racing, the late answer would land after the first card
+            // opened — and a confirmation must never be rebound (`apply_get`).
+            return None;
+        }
         let Some(id) = items.get(*selected).map(|s| s.id.clone()) else {
             return None; // empty queue
         };
-        self.dispatch_user(PendingIntent::Get(id.clone()), || {
+        let request = self.dispatch_user(PendingIntent::Get(id.clone()), || {
             transport::Request::Get(id)
-        })
+        });
+        // Parked gets are covered too: `flush_pending` raises the flag when the
+        // park is sent, and latest-wins can only swap one park for another.
+        self.awaiting_card = request.is_some();
+        request
     }
 
     /// Send a user intent now if idle, else park it (latest-wins) so it is not lost.
@@ -559,6 +574,9 @@ impl Model {
                     pin: Pin::default(),
                     error: None,
                 };
+                // A handshake resets the protocol: an outstanding get will never
+                // be answered, and a stuck flag would refuse every future open.
+                self.awaiting_card = false;
             }
             Reply::Auth(outcome) => self.apply_auth(outcome),
             Reply::List(items) => self.apply_list(items),
@@ -620,7 +638,18 @@ impl Model {
     }
 
     fn apply_get(&mut self, outcome: GetOutcome) {
+        // Whatever this outcome says, it answers the one get that was allowed
+        // on the wire — the console may ask for a card again.
+        self.awaiting_card = false;
         if let Phase::Watching { confirm, note, .. } = &mut self.phase {
+            if confirm.is_some() {
+                // An open card *is* the confirmation (`AGENTS.md` #5): no reply
+                // may replace it — least of all mid-resolve, where a swap would
+                // re-aim the human's decision at a card they never opened. No
+                // get is ever solicited while a card is open (`on_open`), so
+                // this outcome is stale or unsolicited: dropped, fail closed.
+                return;
+            }
             match outcome {
                 GetOutcome::Card(c) => {
                     // An open card *is* the confirmation (AGENTS.md #5).
@@ -628,9 +657,8 @@ impl Model {
                     *note = None;
                 }
                 GetOutcome::UnknownId => {
-                    // The selected item vanished between list and get — drop any
-                    // stale card and show a transient note instead of a dead card.
-                    *confirm = None;
+                    // The selected item vanished between list and get — show a
+                    // transient note instead of a dead card.
                     *note = Some("that request is no longer available".to_owned());
                 }
             }
@@ -713,6 +741,7 @@ impl Model {
         match self.pending.take() {
             Some(PendingIntent::Get(id)) => {
                 self.in_flight = true;
+                self.awaiting_card = true;
                 Some(transport::Request::Get(id))
             }
             Some(PendingIntent::Approve(id)) => {
@@ -977,6 +1006,123 @@ mod tests {
         m.update(Msg::Open); // replaces with get("b") — latest wins
         let flushed = m.update(Msg::Reply(Reply::List(vec![summary("a"), summary("b")])));
         assert!(matches!(flushed, Some(transport::Request::Get(id)) if id == "b"));
+    }
+
+    // ── one decision, one card: a confirmation can never be rebound ──
+
+    #[test]
+    fn a_decision_can_never_be_rebound_to_a_card_the_human_did_not_open() {
+        // The incident, key press by key press — no timing involved.
+        let mut m = watching(vec![summary("a"), summary("b")]);
+        // Open(a): the get flies at once.
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(id)) if id == "a"
+        ));
+        // Open(b) while that get is on the wire: refused outright, NOT parked —
+        // two card requests racing is how a decision gets rebound.
+        m.update(Msg::MoveDown);
+        assert!(m.update(Msg::Open).is_none());
+        // Card a lands and binds the confirmation; nothing parked may chase it.
+        let flushed = m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("a")))));
+        assert!(
+            flushed.is_none(),
+            "a second get must never chase an open card"
+        );
+        // `y` — the approve goes out for a, the card on the screen.
+        assert!(matches!(
+            m.update(Msg::Approve),
+            Some(transport::Request::Approve(id)) if id == "a"
+        ));
+        // A stale card b arrives while the decision is on the wire.
+        assert!(
+            m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("b")))))
+                .is_none()
+        );
+        let c = confirm_of(&m);
+        assert_eq!(
+            c.card().id,
+            "a",
+            "the confirmation stays bound to the card the human saw"
+        );
+        assert!(
+            c.is_resolving(),
+            "the in-flight decision survives a stale card reply"
+        );
+        // A second `y` cannot become a second decision.
+        assert!(
+            m.update(Msg::Approve).is_none(),
+            "one session, one decision"
+        );
+    }
+
+    #[test]
+    fn an_unsolicited_card_reply_never_replaces_an_open_confirmation() {
+        let mut m = confirming("a", false);
+        assert!(
+            m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("b")))))
+                .is_none()
+        );
+        assert_eq!(
+            confirm_of(&m).card().id,
+            "a",
+            "an open card IS the confirmation — no reply may swap it out"
+        );
+    }
+
+    #[test]
+    fn an_unsolicited_unknown_id_never_clears_an_open_confirmation() {
+        let mut m = confirming("a", false);
+        m.update(Msg::Approve); // the decision goes on the wire
+        assert!(
+            m.update(Msg::Reply(Reply::Get(GetOutcome::UnknownId)))
+                .is_none()
+        );
+        let c = confirm_of(&m);
+        assert_eq!(c.card().id, "a");
+        assert!(
+            c.is_resolving(),
+            "the resolve answer must still find the confirmation it belongs to"
+        );
+    }
+
+    #[test]
+    fn a_get_sent_from_the_park_also_locks_out_further_opens() {
+        let mut m = watching(vec![summary("a"), summary("b")]);
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        m.update(Msg::Open); // parked behind the poll
+        let flushed = m.update(Msg::Reply(Reply::List(vec![summary("a"), summary("b")])));
+        assert!(matches!(flushed, Some(transport::Request::Get(id)) if id == "a"));
+        // The parked get is on the wire now — a second open is refused…
+        m.update(Msg::MoveDown);
+        assert!(m.update(Msg::Open).is_none());
+        // …and nothing chases the card when it lands.
+        assert!(
+            m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("a")))))
+                .is_none()
+        );
+        assert_eq!(confirm_of(&m).card().id, "a");
+    }
+
+    #[test]
+    fn a_vanished_card_frees_the_console_to_open_another() {
+        let mut m = watching(vec![summary("a"), summary("b")]);
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(id)) if id == "a"
+        ));
+        m.update(Msg::Reply(Reply::Get(GetOutcome::UnknownId)));
+        m.update(Msg::MoveDown);
+        assert!(
+            matches!(
+                m.update(Msg::Open),
+                Some(transport::Request::Get(id)) if id == "b"
+            ),
+            "once the get is answered the console can open the next card"
+        );
     }
 
     // ── watch behaviour ──
