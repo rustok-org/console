@@ -75,14 +75,19 @@ fn main() -> ExitCode {
 
     let transport = Transport::connect(&path);
     let (code, decision) = run(terminal, &transport);
-    let _ = restore();
-
-    // The decision lands on stdout only after the alternate screen is gone, so no
-    // escape sequence can ever reach a caller parsing it (invariant #7).
-    if let Some(decision) = decision {
-        println!("{decision}");
-    }
+    restore_then_announce(|| drop(restore()), decision.as_deref(), &mut io::stdout());
     ExitCode::from(code)
+}
+
+/// Leave the terminal, THEN speak on stdout — in that order and no other: the
+/// decision line must never share stdout's airtime with alternate-screen escape
+/// sequences a caller could capture (invariant #7). The order lives in this one
+/// function so a test can pin it.
+fn restore_then_announce(restore: impl FnOnce(), decision: Option<&str>, out: &mut impl io::Write) {
+    restore();
+    if let Some(decision) = decision {
+        let _ = writeln!(out, "{decision}");
+    }
 }
 
 /// Set up the terminal on **stderr** (raw mode + alternate screen) and install a
@@ -486,10 +491,67 @@ mod tests {
         assert_eq!(exit_code(ExitOutcome::Rejected), EXIT_REJECTED);
         assert_eq!(exit_code(ExitOutcome::Expired), EXIT_EXPIRED);
         assert_eq!(exit_code(ExitOutcome::Failed), EXIT_FATAL);
-        // aborted and no-tty are distinct from approved (invariant #7)
-        for code in [EXIT_ABORTED, EXIT_NO_TTY] {
-            assert_ne!(code, EXIT_APPROVED);
+        // Every process outcome a caller can see must be pairwise distinct
+        // (invariant #7) — reusing a code would let one outcome impersonate
+        // another, `approved` worst of all.
+        let codes = [
+            EXIT_APPROVED,
+            EXIT_FATAL,
+            EXIT_UPGRADE,
+            EXIT_NO_TTY,
+            EXIT_REJECTED,
+            EXIT_EXPIRED,
+            EXIT_ABORTED,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "exit codes must never collide");
+            }
         }
+    }
+
+    #[test]
+    fn the_decision_speaks_only_after_the_terminal_is_restored() {
+        use std::cell::Cell;
+
+        struct OrderProbe<'a> {
+            restored: &'a Cell<bool>,
+            buf: Vec<u8>,
+        }
+        impl io::Write for OrderProbe<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(
+                    self.restored.get(),
+                    "the decision line must never race the alternate-screen \
+                     escapes (invariant #7)"
+                );
+                self.buf.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let restored = Cell::new(false);
+        let mut probe = OrderProbe {
+            restored: &restored,
+            buf: Vec::new(),
+        };
+        restore_then_announce(
+            || restored.set(true),
+            Some(r#"{"decision":"approved"}"#),
+            &mut probe,
+        );
+        assert_eq!(probe.buf, b"{\"decision\":\"approved\"}\n");
+
+        // And nothing is written at all when there is no decision.
+        let mut probe = OrderProbe {
+            restored: &restored,
+            buf: Vec::new(),
+        };
+        restore_then_announce(|| restored.set(true), None, &mut probe);
+        assert!(probe.buf.is_empty());
     }
 
     #[test]

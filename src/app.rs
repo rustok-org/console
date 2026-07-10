@@ -22,8 +22,22 @@ use crate::ui;
 /// **redacted in `Debug`** so it never lands in a log line, a panic message, or a
 /// derived `Debug` of the `Model`. Only ASCII digits are accepted, which also keeps
 /// the hand-built auth JSON injection-free.
-#[derive(Default, Clone)]
+/// Hard cap on typed PIN digits — far beyond any real PIN. The buffer is
+/// pre-reserved to exactly this length so it can never reallocate: a realloc
+/// frees the old allocation (with the digits in it) **without** zeroizing.
+const MAX_PIN_DIGITS: usize = 64;
+
+// No `Clone`: a `String::clone` allocates `capacity == len`, so a cloned PIN
+// would silently lose the reallocation-proof reserve below — the first push on
+// it would free the digits un-zeroized. Nobody clones a PIN; nobody gets to.
 pub struct Pin(Zeroizing<String>);
+
+impl Default for Pin {
+    fn default() -> Self {
+        // Reserved to the cap up front — `push` never grows the buffer.
+        Self(Zeroizing::new(String::with_capacity(MAX_PIN_DIGITS)))
+    }
+}
 
 impl std::fmt::Debug for Pin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,9 +47,11 @@ impl std::fmt::Debug for Pin {
 }
 
 impl Pin {
-    /// Append a digit; non-digits are ignored (keeps the auth JSON injection-free).
+    /// Append a digit; non-digits are ignored (keeps the auth JSON injection-free),
+    /// and so is anything past [`MAX_PIN_DIGITS`] — the pre-reserved buffer must
+    /// never reallocate (a realloc frees the digits un-zeroized).
     pub fn push(&mut self, c: char) {
-        if c.is_ascii_digit() {
+        if c.is_ascii_digit() && self.0.len() < MAX_PIN_DIGITS {
             self.0.push(c);
         }
     }
@@ -57,9 +73,11 @@ impl Pin {
         self.0.is_empty()
     }
 
-    /// Clear the PIN, zeroizing the current buffer (the old `Zeroizing` is dropped).
+    /// Clear the PIN, zeroizing the current buffer (the old `Zeroizing` is
+    /// dropped). The fresh buffer is reserved to the cap again, like
+    /// [`Self::default`] — cleared-and-retyped digits must not reallocate either.
     pub fn clear(&mut self) {
-        self.0 = Zeroizing::new(String::new());
+        self.0 = Zeroizing::new(String::with_capacity(MAX_PIN_DIGITS));
     }
 
     /// Build the `auth` request line into a `Zeroizing` buffer. Assembled by hand
@@ -615,8 +633,11 @@ impl Model {
                     error: None,
                 };
                 // A handshake resets the protocol: an outstanding get will never
-                // be answered, and a stuck flag would refuse every future open.
+                // be answered (a stuck flag would refuse every future open), and
+                // a parked intent — an approve first of all — belongs to the
+                // session that parked it, not to the one being born.
                 self.awaiting_card = false;
+                self.pending = None;
             }
             Reply::Auth(outcome) => self.apply_auth(outcome),
             Reply::List(items) => self.apply_list(items),
@@ -966,6 +987,102 @@ mod tests {
     }
 
     // ── PIN hygiene ──
+
+    #[test]
+    fn the_pin_buffer_never_reallocates_however_much_is_typed() {
+        // A realloc frees the old buffer — with the digits in it — WITHOUT
+        // zeroizing. The buffer is pre-reserved and capped, so it never moves.
+        let mut pin = Pin::default();
+        let capacity = pin.0.capacity();
+        for _ in 0..100 {
+            pin.push('7');
+        }
+        assert_eq!(pin.len(), MAX_PIN_DIGITS, "input is capped, not grown into");
+        assert_eq!(
+            pin.0.capacity(),
+            capacity,
+            "the PIN buffer must never reallocate"
+        );
+
+        // clear() hands out a fresh buffer — it must be just as realloc-proof.
+        pin.clear();
+        let capacity = pin.0.capacity();
+        for _ in 0..100 {
+            pin.push('7');
+        }
+        assert_eq!(pin.0.capacity(), capacity, "the cleared buffer too");
+    }
+
+    #[test]
+    fn a_handshake_reset_drops_any_parked_intent() {
+        // A parked money intent belongs to the session that parked it. If the
+        // server ever restarts the handshake, flushing that intent afterwards
+        // would fire an approve into a phase that cannot even show the card.
+        let mut m = confirming("a", false);
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        m.update(Msg::Approve); // parked behind the poll
+        assert!(
+            m.update(Msg::Reply(Reply::Hello {
+                server: "s".to_owned(),
+            }))
+            .is_none(),
+            "a parked approve must die with the session, not follow the reset"
+        );
+    }
+
+    #[test]
+    fn auth_failures_map_each_code_to_its_own_message() {
+        // A swapped arm here would tell a locked-out human to set a PIN — the
+        // mappings must bite, not merely compile (несёт и retry-данные).
+        for (outcome, expected) in [
+            (
+                AuthOutcome::BadPin { attempts_left: 2 },
+                AuthError::BadPin(2),
+            ),
+            (
+                AuthOutcome::Locked { retry_after_s: 30 },
+                AuthError::Locked(30),
+            ),
+            (AuthOutcome::PinNotSet, AuthError::NotSet),
+            (AuthOutcome::PinUnavailable, AuthError::Unavailable),
+        ] {
+            let mut m = Model::new();
+            m.update(Msg::Reply(Reply::Hello {
+                server: "s".to_owned(),
+            }));
+            m.update(Msg::PinDigit('1'));
+            m.update(Msg::PinSubmit);
+            m.update(Msg::Reply(Reply::Auth(outcome)));
+            let Phase::Authing { error, .. } = m.phase() else {
+                panic!("an auth failure keeps the unlock screen");
+            };
+            assert_eq!(error.as_ref(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn resolve_failures_map_each_code_to_its_own_error() {
+        for (outcome, expected) in [
+            (
+                ResolveOutcome::BadPin { attempts_left: 1 },
+                ResolveError::BadPin(1),
+            ),
+            (
+                ResolveOutcome::Locked { retry_after_s: 60 },
+                ResolveError::Locked(60),
+            ),
+            (ResolveOutcome::PinNotSet, ResolveError::NotSet),
+            (ResolveOutcome::PinUnavailable, ResolveError::Unavailable),
+        ] {
+            let mut m = confirming("a", false);
+            m.update(Msg::Approve);
+            m.update(Msg::Reply(Reply::Resolve(outcome)));
+            assert_eq!(confirm_of(&m).error(), Some(&expected));
+        }
+    }
 
     #[test]
     fn pin_debug_never_shows_the_digits() {
