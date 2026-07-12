@@ -1,6 +1,6 @@
 {
-  "state": "idle",
-  "task": "Console v2 Фаза 1 ЗАКРЫТА (PR #8 смержен): брендированная approver-консоль — палитра сайта, framed-панели, человеческие суммы, declutter, адреса verbatim, NO_COLOR. Прод-модель не тронута. NEXT: Фаза 2 (резидентный дашборд + socket read-ops → баланс/позиции/история + адрес отправителя для From→To). Бэклог: авто-открытие (issue#7), swap-декод (core), сокр.адреса (дашборд), чекбокс unlimited (issue#6).",
+  "state": "coding",
+  "task": "Console v2 Фаза 2, Этап 1 (PR 1/3, репо core): protocol read-op `context` за auth-гейтом, proto 1→2 с обратной совместимостью. Гейт-1 пройден (Ревьюер «го» 2026-07-12T21:50 + МИНОР защитного fallback). Код пишется в репо core (см. core/.claude/workflow-state.json и core/.claude/specs/2026-07-12-console-v2-phase2-p1-context-op.md) — этот файл (console) держит только протокол-док (docs/APPROVER-PROTOCOL.md) и общую историю ратификации Фазы 2. Дальше: PR2 positions, PR3 activity, затем console-сторона (резидентность+From→To, Receive, дашборд, Activity).",
   "fast": false,
   "history": [
     {
@@ -62,7 +62,31 @@
       "to": "idle",
       "at": "2026-07-12T20:50:00+05:00",
       "gate": "круг закрыт: Капитан смержил PR #8; ветка удалена; на main theme.rs/format.rs + тематизированный ui.rs. NEXT = Фаза 2 (дашборд + read-ops)."
+    },
+    {
+      "from": "idle",
+      "to": "idle",
+      "at": "2026-07-12T21:30:00+05:00",
+      "gate": "check: 7 findings (5 important — blast-radius \"~30 тестов\" измерен для авто-открытия, не для \"не выходим после решения\" (замерить отдельно); activity-op требует новый метод перечисления в PendingStore (approval.rs), не бесплатная обёртка; бандл context+positions+activity в один PR core противоречит явной просьбе Капитана дробить на PR — разбить на 3 PR под одним proto=2; резидентный дашборд не описывает экран PIN-lockout (retry_after_s + queue fail-closed denied); positions/activity — живое on-chain чтение через gateway/core, может заблокировать то же соединение, где approve на high-risk с тикающим deadline (протокол — no pipelining) → нужна стратегия timeout/второе соединение; 1 suggestion — протокол-док явно противопоставить pre-auth list/get vs auth-gated context/positions/activity; 1 important — сегодняшние ратификации не были нигде зафиксированы до этой записи) — открыт на исправление перед спекой Этапа 1"
+    },
+    {
+      "from": "idle",
+      "to": "idle",
+      "at": "2026-07-12T21:35:00+05:00",
+      "gate": "Ратификация Капитана (Гейт-1 верхнего уровня, §9 CONSOLE-V2-SPEC.md): (1) баланс/позиции/активность — ТОЛЬКО после auth (консоль и так открывается по PIN, единый гейт входа; смена/задание PIN — существующий set-pin, не новая фича); (2) Фаза 2 дробится на этапы, этапы — на отдельные PR (не один большой), порядок: core-протокол → console-резидентность+From→To → console-дашборд(баланс/позиции) → console-Receive → console-Activity; core-протокол сам дробится на 3 PR (context, затем positions, затем activity) под одним proto=2 — разное по весу (activity нужен новый store-метод), не бандлить; (3) ручной Send — ПОЛНОСТЬЮ отложен, /crucible+ADR не открываем даже параллельно (эволюция модели human-approved→initiator, крупная развилка, не блокирует read-слой; Receive без крукса остаётся в Фазе 2). NEXT: спека Гейта-1 для core PR 1 (proto 1→2 + context op), с учётом findings /check (lockout-экран, timeout/2-е соединение для positions, точная формулировка pre-auth vs auth-gated в протокол-доке, отдельный замер blast radius для \"не выходим после решения\")."
+    },
+    {
+      "from": "idle",
+      "to": "idle",
+      "at": "2026-07-12T21:50:00+05:00",
+      "gate": "Ревьюер (через Капитана): независимо перепроверил все 7 находок /check дословно (Req-enum verbatim, DEFAULT_RETENTION_TTL, list_live() фильтрует Resolved=>None approval.rs:335 — подтверждён вес activity-PR, issues #6/#7). НИТ: CONSOLE-V2-SPEC.md:62 цитирует wallet_context как gateway/lib.rs:97, реально :230 — поправить при следующей правке файла, не отдельным PR. Решение-1 (auth-гейт) подтверждено глубже: Phase::Watching (app.rs:147) уже требует Authed — «единый гейт входа» это факт архитектуры, не новый паттерн; побочная находка — APPROVER-PROTOCOL.md §2 обосновывает pre-auth list/get несуществующим «watch-before-unlock flow», поправить формулировку при proto+1 правке, не блокирует. Направление по socket-контеншну (finding /check про positions/blocking): НЕ второе соединение (auth per-connection, второй PIN — нет механизма расшаривания сессии) — вместо этого клиентская политика: фоновый poll positions/activity не уходит в сокет, пока открыта карточка (confirm.is_some()), тем же приёмом, каким `on_tick` уже гейтит `list`-поллинг через `in_flight: bool` (app.rs:319,453) — переиспользовать примитив, протокол не трогать. Дёшево, проверено сегодняшним кодом. Вердикт: ГО на раскладку. Единственный пункт на рассмотрение (не блокер): порядок Receive vs Дашборд — оба сорта одинаково зависят от context.address, дашборду ещё нужен positions; технической причины ждать Дашборд не увидел, спросил осознан ли порядок."
+    },
+    {
+      "from": "idle",
+      "to": "planning",
+      "at": "2026-07-12T21:55:00+05:00",
+      "gate": "Инженер: пересортировка принята — Receive становится Этапом 3 (сразу после резидентности, тот же core PR1/context, никакого нового core не ждёт), Дашборд (positions) сдвигается на Этап 4. Причина не инерция макета: Receive техническому зависит не только от context.address, но и от nav-shell (многовидовая резидентность), которую строит Этап 2 — поэтому раньше Этапа 2 он в принципе не может встать; а вот Дашборда ждать не должен, т.к. Дашборду нужен ещё и core PR2 (positions), которого у Receive в зависимостях нет. §8 всё равно релизит Фазу 2 одним пакетом, так что порядок PR не двигает time-to-value пользователю — но двигает порядок ревью/риска, поэтому дробим maximally-safe-first. Итоговый порядок: [core PR1 context] → [console: резидентность+nav-shell+From→To] → [console: Receive] → [core PR2 positions] → [console: Дашборд] → [core PR3 activity] → [console: Activity]. Начинаю спеку Гейта-1 для core PR1 (proto 1→2 + context-op), путь core/.claude/specs/2026-07-12-console-v2-phase2-p1-context-op.md."
     }
   ],
-  "updated": "2026-07-12T20:50:00+05:00"
+  "updated": "2026-07-12T21:55:00+05:00"
 }

@@ -12,6 +12,11 @@
 > emits — not an aspiration. Where the shipped behaviour has a known rough edge, it
 > is documented as-is and cross-referenced to a tracked follow-up rather than
 > silently "corrected" here.
+>
+> **proto 2 — DRAFT** (Console v2 Фаза 2, Этап 1) — additive over proto 1: the
+> read-op `context` (§3.7), gated behind `auth` unlike `list`/`get` (§2), plus the
+> `wallet_locked` error code (§3.9). A `proto: 1` session negotiated by an
+> already-shipped `console v0.1.0` continues to work unchanged — see §3.1 and §6.
 
 ## 1. Transport
 
@@ -37,7 +42,7 @@
 ## 2. Session
 
 ```
-connect → hello → { list | get }* → auth → { list | get | approve | deny }* → disconnect
+connect → hello → { list | get }* → auth → { list | get | approve | deny | context }* → disconnect
 ```
 
 - A **session is one connection**. `auth` authorizes that connection only;
@@ -48,8 +53,16 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
   clear-signing card are deliberately *not* privileged: the card carries only the
   agent's own proposal (nothing secret), and the perimeter is already the socket
   fs (§1). Only `approve` / `deny` require `auth`; before it they → `unauthorized`.
-  A future reviewer must not "fix" this into an auth-gate — it would defend nothing
-  and break the console's watch-before-unlock flow.
+  A future reviewer must not "fix" this into an auth-gate — it would defend
+  nothing against a same-uid local process (§1), and it would gate data that
+  isn't secret in the first place.
+- **`context` (proto 2+, §3.7) is auth-gated — deliberately NOT the same
+  pre-auth treatment as `list`/`get`.** Unlike the queue card, `context`
+  answers with the wallet's own address and balances: the human's private
+  financial data, not the agent's proposal. Before `auth` it → `unauthorized`,
+  the same code `approve`/`deny` already use. Future read-ops in this family
+  (`positions`, `activity`) follow the same default — auth-gated unless a
+  specific op's data is, like the queue, inherently not secret.
 - **Default-deny**: a malformed line, unknown `op`, a missing or mistyped field, or
   an oversized message (> 64 KiB, code `oversize`) yields a single `error` response
   and **no state change**. The server never executes anything as a result of an
@@ -65,7 +78,7 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
 
 ## 3. Messages
 
-Field wire-formats are normative and listed in **§3.7** — the console's serde types
+Field wire-formats are normative and listed in **§3.8** — the console's serde types
 must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 `decoded_call.amount` is a `0x`-hex string; they are **not** interchangeable).
 
@@ -74,7 +87,9 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 ```json
 → {"op":"hello","proto":1,"client":"rustok-console/0.1.0"}
 ← {"ok":true,"proto":1,"server":"core-server/0.1.0"}
-← {"ok":false,"error":"unsupported_proto","supported":[1]}   // then server closes
+→ {"op":"hello","proto":2,"client":"rustok-console/0.2.0"}
+← {"ok":true,"proto":2,"server":"core-server/0.2.0"}
+← {"ok":false,"error":"unsupported_proto","supported":[1,2]}   // then server closes
 ```
 
 - `client` is **informational**: the server does not read or validate it (the
@@ -85,6 +100,12 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   `0.1.0`). **The client gates compatibility on `proto` alone** — never by parsing
   the `server` string. A major `proto` mismatch is fatal: the server replies
   `unsupported_proto` and closes; the client prints an upgrade hint and exits.
+- **The server accepts `proto ∈ {1, 2}` and echoes back exactly the value the
+  client declared** — never the highest it supports. This is what keeps an
+  already-shipped `console v0.1.0` (which always sends `proto:1`) working
+  unchanged against a `core` that has since gained proto 2's `context` op: the
+  old client never asks for it, and a session negotiated at `proto:1` cannot
+  reach it even if it tried (§3.7).
 
 ### 3.2 `auth` — unlock this session with the wallet PIN
 
@@ -216,14 +237,50 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   `already_resolved` + `state:"pending"` (the human cannot interrupt a signature
   already in flight) — this is the everyday origin of the `"pending"` state (§3.5).
 
-### 3.7 Field wire-formats (normative — the console's serde types mirror these)
+### 3.7 `context` (proto 2+) — the wallet's own address, balances, allowed chains
+
+```json
+→ {"op":"context"}
+← {"ok":true,"address":"0x…full-EIP55…",
+   "balances":[{"chain_id":1,"symbol":"ETH","balance":"…decimal…"}],
+   "allowed_chains":[1,8453]}
+← {"ok":false,"error":"unauthorized"}     // no auth on this connection
+← {"ok":false,"error":"protocol_error"}   // session negotiated proto:1 (§3.1)
+← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.9
+```
+
+- **Auth-gated, unlike `list`/`get`** (§2): before `auth` → `unauthorized`, same
+  code `approve`/`deny` use.
+- **Proto-gated at 2**: a session that negotiated `proto:1` in `hello` gets
+  `protocol_error` if it sends `context` — the version field is load-bearing, not
+  decorative. The shipped `console v0.1.0` never sends this op, so this path is
+  defensive rather than an everyday client interaction.
+- `address` is the same **Address via Display → EIP-55 mixed-case** convention as
+  the top-level `to` (§3.8) — a console rendering a From→To block can place both
+  side by side without re-casing either.
+- `balances` mirrors `list`'s `amount_wei` convention: **U256 via Display →
+  decimal string**, at most one entry per chain in `allowed_chains`. A chain with
+  no configured provider, or whose provider call fails, is **omitted** — not
+  zeroed or errored — the response still answers `ok:true` with whatever
+  balances were reachable (best-effort, mirrors the gRPC `WalletContext` RPC
+  this op reuses).
+- `allowed_chains` is the server's configured chain allow-list, in order — the
+  same list `list`/`get` implicitly operate within.
+- **`wallet_locked`** (§3.9) answers if the core's own keyring isn't unlocked —
+  a state distinct from PIN `auth` above: this socket's `auth` gates *deciding*
+  (§1), the core-level lock gates *having a signing key at all*. Today nothing
+  in the shipped server re-locks an already-unlocked core at runtime, so this is
+  a defensive path, not an observed production state — the client must still
+  handle it (fail closed), not assume it cannot arrive.
+
+### 3.8 Field wire-formats (normative — the console's serde types mirror these)
 
 | Field | Where | Wire form | Example |
 |---|---|---|---|
 | `ok` | every response | bool | `true` |
-| `error` | error responses | string (see §3.8) | `"bad_pin"` |
+| `error` | error responses | string (see §3.9) | `"bad_pin"` |
 | `proto` | `hello` | number | `1` |
-| `supported` | `unsupported_proto` | array of number | `[1]` |
+| `supported` | `unsupported_proto` | array of number | `[1,2]` |
 | `server` | `hello` | string, informational | `"core-server/0.1.0"` |
 | `id` | list/card | UUID string, hyphenated lowercase | `"a1b2…-…"` |
 | `kind` | list | string enum | `"send"` \| `"call"` |
@@ -257,14 +314,14 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 > bignum-safe type (not `u64`/`usize`): a truncated unlimited-approval would defeat
 > the very reason the console exists.
 
-### 3.8 Error-code vocabulary (every code the server emits)
+### 3.9 Error-code vocabulary (every code the server emits)
 
 | Code | Op(s) | Meaning |
 |---|---|---|
-| `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello` |
+| `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello`, or `context` on a `proto:1` session (§3.7) |
 | `oversize` | any | request line > 64 KiB; the connection is then closed (§2) |
 | `unsupported_proto` | hello | major `proto` mismatch; server then closes |
-| `unauthorized` | approve, deny | no successful `auth` on this connection |
+| `unauthorized` | approve, deny, context | no successful `auth` on this connection |
 | `bad_pin` | auth, approve | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
 | `locked` | auth, approve | lockout active; carries `retry_after_s` |
 | `pin_not_set` | auth, approve | wallet has no PIN record; run `set-pin` |
@@ -273,6 +330,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | `unknown_id` | get, approve, deny | id is not a live item (never parked, resolved+swept, or bad UUID) |
 | `already_resolved` | approve, deny | id already terminal (or in-flight); carries `state` |
 | `internal` | approve | unreachable post-execute inconsistency (defensive) |
+| `wallet_locked` | context | the core's own keyring isn't unlocked — distinct from PIN `auth` (§3.7) |
 
 ## 4. PIN & lockout semantics (server-side, normative)
 
@@ -313,6 +371,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | proto | core (server) | console (client) |
 |-------|---------------|------------------|
 | 1     | shipped as `0.1.0`; freezes at `v0.2.0` | ≥ `v0.1.0` |
+| 2     | DRAFT — adds `context` (§3.7) + `wallet_locked` (§3.9); freezes alongside its own console/core release pair (TBD) | a `proto:1` client is unaffected — it never sends `context` and the server still answers its `hello` with `proto:1` (§3.1) |
 
 - **`proto` is the only compatibility gate.** The `server` version string is
   informational (§3.1) — a client must never gate on it. The shipped server reports
@@ -322,10 +381,17 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 - Additive fields are allowed within a major version (clients must ignore unknown
   fields). Anything that changes the meaning of an existing field, an error code, or
   the auth/lockout semantics bumps the major and this table.
+- **proto 2 is additive over proto 1, not a breaking bump**: the server accepts
+  both in `hello` (§3.1) and echoes back whatever the client declared. It is
+  listed as a separate major row (rather than folded into proto 1 as an
+  additive field) because `context`'s auth-gating is a new *kind* of rule — the
+  first read-op that is NOT pre-`auth` like `list`/`get` — and the compatibility
+  table's job is to make that visible, not just wire-format additions.
 
 ## 7. Non-goals
 
-- No server push — the client polls (`list`). Push may come as a proto-2 extension.
+- No server push — the client polls (`list`). Push may come as a future proto
+  extension (not proto 2 — see §6, which adds `context`, not push).
 - No approval tokens leaving the core, no re-entry of `execute` with a token: the
   core executes on approve; the agent learns the outcome via its own status RPC.
 - This socket is not an agent surface. The MCP layer must have **no code path** to
