@@ -44,7 +44,13 @@
       "to": "reviewing",
       "at": "2026-07-12T20:00:00+05:00",
       "gate": "Ревьюер: БЛОКЕРов нет, 1 МИНОР (нет style-ассертов на цвет) — закрыт: +2 теста (an_unselected_high_risk_queue_row_is_amber, the_decision_row_colors_approve_and_reject) читают .style().fg буфера; подмена high_risk()→accent() теперь краснеет. НИТ (стейл task) подчищен. cargo test 123+15+1, clippy/fmt/deny ok. Дальше: smoke-скрин (DoD), потом «чисто»→push."
+    },
+    {
+      "from": "reviewing",
+      "to": "reviewing",
+      "at": "2026-07-12T20:20:00+05:00",
+      "gate": "DoD smoke заскринен: реальный бинарь target/debug/rustok-console в pty против Python-стаба approver-протокола → карточка рендерит «amount 0.01 ETH» (человечески), полный адрес verbatim, declutter, framed-панели, [y Approve]/[n Reject]; truecolor-escape'ы в сыром потоке подтверждены: teal #16E0C3, violet #9D5CFF, frame #2A1C4D — все present:True. Тест-контейнеры прибраны. Фаза 1 код-готова, МИНОР+НИТы закрыты. Ждём финальное «чисто»+«добро» → push+PR."
     }
   ],
-  "updated": "2026-07-12T20:00:00+05:00"
+  "updated": "2026-07-12T20:20:00+05:00"
 }
