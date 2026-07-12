@@ -632,6 +632,29 @@ mod tests {
         draw_rows_at(model, w, h, NOW)
     }
 
+    /// Foreground colors on the first rendered row containing `needle`. Lets a test
+    /// assert that COLOR — not just text — carries the meaning: a high-risk row is
+    /// amber, Approve teal, Reject red. Without this, a swap of `high_risk()` for
+    /// `accent()` would render fine and no text-only test would notice.
+    fn row_fgs_containing(
+        model: &Model,
+        w: u16,
+        h: u16,
+        needle: &str,
+    ) -> Vec<ratatui::style::Color> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains(needle) {
+                return (0..w).filter_map(|x| buffer[(x, y)].style().fg).collect();
+            }
+        }
+        Vec::new()
+    }
+
     /// Flatten to one String for checks that do not care about layout.
     fn draw(model: &Model, w: u16, h: u16) -> String {
         draw_rows(model, w, h).join("\n")
@@ -873,6 +896,34 @@ mod tests {
             has_line_with(&draw_rows(&m, 100, 24), &["to", "0xabc"]),
             "the recipient is still shown, in full"
         );
+    }
+
+    #[test]
+    fn an_unselected_high_risk_queue_row_is_amber() {
+        let mut m = Model::new();
+        // Two items: the low-risk one is selected (index 0), the high-risk one is
+        // not — so its amber is its own, not the selection highlight.
+        to_watching(
+            &mut m,
+            vec![
+                summary("a1", "0xabc", "0", false),
+                summary("a2", "0xdef", "0", true),
+            ],
+        );
+        let fgs = row_fgs_containing(&m, 80, 24, "0xdef");
+        assert!(
+            fgs.contains(&theme::high_risk()),
+            "danger must read as amber before the card is even opened"
+        );
+    }
+
+    #[test]
+    fn the_decision_row_colors_approve_and_reject() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false); // low-risk send, approve armed
+        let fgs = row_fgs_containing(&m, 80, 24, "Approve");
+        assert!(fgs.contains(&theme::approve()), "Approve is teal");
+        assert!(fgs.contains(&theme::reject()), "Reject is red");
     }
 
     #[test]
