@@ -1,6 +1,6 @@
 {
-  "state": "coding",
-  "task": "Console v2 Фаза 2, Этап 1 (PR 1/3, репо core): protocol read-op `context` за auth-гейтом, proto 1→2 с обратной совместимостью. Гейт-1 пройден (Ревьюер «го» 2026-07-12T21:50 + МИНОР защитного fallback). Код пишется в репо core (см. core/.claude/workflow-state.json и core/.claude/specs/2026-07-12-console-v2-phase2-p1-context-op.md) — этот файл (console) держит только протокол-док (docs/APPROVER-PROTOCOL.md) и общую историю ратификации Фазы 2. Дальше: PR2 positions, PR3 activity, затем console-сторона (резидентность+From→To, Receive, дашборд, Activity).",
+  "state": "idle",
+  "task": "Console v2 Фаза 2, Этап 1 ЗАКРЫТ (core#91 → 6fea4e2, console#9 → ba61909, смержены Капитаном 2026-07-12): approver-протокол proto 2 + read-op `context` (адрес/балансы/allowed_chains за auth-гейтом, обратная совместимость с console v0.1.0 подтверждена тестами). NEXT по ратифицированному порядку: Этап 2 — console-резидентность + nav-shell + двух-блочный From→To (нужен свой Гейт-1: замер blast radius «не выходим после решения», экран PIN-lockout, клиентская политика «не поллить read-ops при открытой карточке»). Затем: Receive → core PR2 positions → Дашборд → core PR3 activity → Activity.",
   "fast": false,
   "history": [
     {
@@ -86,7 +86,19 @@
       "to": "planning",
       "at": "2026-07-12T21:55:00+05:00",
       "gate": "Инженер: пересортировка принята — Receive становится Этапом 3 (сразу после резидентности, тот же core PR1/context, никакого нового core не ждёт), Дашборд (positions) сдвигается на Этап 4. Причина не инерция макета: Receive техническому зависит не только от context.address, но и от nav-shell (многовидовая резидентность), которую строит Этап 2 — поэтому раньше Этапа 2 он в принципе не может встать; а вот Дашборда ждать не должен, т.к. Дашборду нужен ещё и core PR2 (positions), которого у Receive в зависимостях нет. §8 всё равно релизит Фазу 2 одним пакетом, так что порядок PR не двигает time-to-value пользователю — но двигает порядок ревью/риска, поэтому дробим maximally-safe-first. Итоговый порядок: [core PR1 context] → [console: резидентность+nav-shell+From→To] → [console: Receive] → [core PR2 positions] → [console: Дашборд] → [core PR3 activity] → [console: Activity]. Начинаю спеку Гейта-1 для core PR1 (proto 1→2 + context-op), путь core/.claude/specs/2026-07-12-console-v2-phase2-p1-context-op.md."
+    },
+    {
+      "from": "idle",
+      "to": "shipped",
+      "at": "2026-07-12T22:45:00+05:00",
+      "gate": "Гейт-2 «чисто»: Ревьюер независимо перепроверил гейты + оба диффа целиком (approver.rs/server.rs в core, APPROVER-PROTOCOL.md здесь), ратифицировал отклонение от буквального Гейта-1 (wallet_context_data() вместо прямого trait-вызова — сильнее одобренного: shared-функция технически не может разойтись, comparative-тест стал бы избыточен), отклонил perf-тикет на параллелизацию balance-лупа (не заранее под гипотетику). Сам нашёл 1 МИНОР: §3.9 словарь ошибок всё ещё числил internal за context — хвост pre-рефакторного дизайна (был tonic::Status, стал Option, разбегаться неоткуда). Поправлено (2cbcbd2), ре-ревью не требуется. Push+PR: console#9 (2d521bc докс + 2cbcbd2 фикс), companion core#91 (84ccf71). Ждёт мержа Капитаном."
+    },
+    {
+      "from": "shipped",
+      "to": "idle",
+      "at": "2026-07-12T23:00:00+05:00",
+      "gate": "Круг закрыт: Капитан смержил оба PR (core#91 → main 6fea4e2, console#9 → main ba61909); ветки удалены локально и на remote; протокол-док proto 2 §3.7 context — канон на main. NEXT = Этап 2 (console: резидентность + nav-shell + From→To), свой круг со своим Гейтом-1."
     }
   ],
-  "updated": "2026-07-12T21:55:00+05:00"
+  "updated": "2026-07-12T23:00:00+05:00"
 }
