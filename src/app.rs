@@ -14,7 +14,10 @@
 
 use zeroize::Zeroizing;
 
-use crate::protocol::{AuthOutcome, Card, GetOutcome, ResolveOutcome, Summary, TerminalState};
+use crate::protocol::{
+    AuthOutcome, Card, ContextOutcome, GetOutcome, ResolveOutcome, Summary, TerminalState,
+    WalletContext,
+};
 use crate::transport::{self, Reply, TransportError};
 use crate::ui;
 
@@ -151,18 +154,70 @@ pub enum Phase {
         selected: usize,
         /// The opened card and its confirmation state, if one is being decided.
         confirm: Option<Box<Confirm>>,
-        /// A transient note (e.g. the selected item vanished).
-        note: Option<String>,
-    },
-    /// The item reached a terminal state — render it, then exit with [`ExitOutcome`].
-    Resolved {
-        /// The server's terminal answer, rendered as received.
-        outcome: ResolveOutcome,
-        /// What the process exits with.
-        exit: ExitOutcome,
+        /// The transient notice line (decision outcome, PIN lockout, or an
+        /// informational note) — one slot, latest event wins.
+        notice: Option<Notice>,
     },
     /// The connection is finished — render the reason and exit.
     Fatal(TransportError),
+}
+
+/// The one transient notice slot of the watch screen. A resident console keeps
+/// living after a decision — the notice is how the human sees what just
+/// happened without the process ending. Latest event wins the slot; the
+/// informational [`Self::Note`] never overwrites a decision or a lockout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// The PIN lockout tripped ([protocol §4]: every *pending* item was denied
+    /// fail-closed; an item already executing is untouched). `retry_after_s`
+    /// is the server's answer when it said `locked`; the arming `bad_pin
+    /// {attempts_left: 0}` response does not carry one. Advisory: the ladder
+    /// is server-side — a later `locked` answer re-arms this notice.
+    Locked {
+        /// Seconds until the server accepts a PIN again, when known.
+        retry_after_s: Option<u64>,
+    },
+    /// A decision reached its terminal state (the resident replacement for the
+    /// old exit-with-outcome).
+    Outcome {
+        /// What happened to the money.
+        kind: DecisionKind,
+        /// The tx hash (executed) or failure reason (failed), when carried.
+        detail: Option<String>,
+    },
+    /// An informational note (e.g. the selected item vanished).
+    Note(String),
+}
+
+/// What happened to the money — the classification behind the outcome notice
+/// and the machine decision line. It reports the item's fate, not which key
+/// the human pressed: an item another connection executed while we were
+/// denying it is still [`Self::Approved`]; a `deny` sent by the expiry
+/// deadline reports [`Self::Expired`], not [`Self::Rejected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionKind {
+    /// Signed and broadcast.
+    Approved,
+    /// A human said no.
+    Rejected,
+    /// The deadline passed before a decision.
+    Expired,
+    /// Approved, but signing/broadcast failed — no money moved.
+    Failed,
+}
+
+/// One terminal decision, recorded for the machine decision line (one JSON
+/// line per decision on a non-TTY stdout — AGENTS.md #7, ADR
+/// `2026-07-12-invariant-7-decision-stream`). Drained by the run loop via
+/// [`Model::take_decision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    /// What happened to the money.
+    pub kind: DecisionKind,
+    /// The executed transaction's hash, when it was ours to report.
+    pub tx_hash: Option<String>,
+    /// The failure reason, on a failed execution.
+    pub reason: Option<String>,
 }
 
 /// An open card **is** the confirmation dialog (`AGENTS.md` #5): it is left by
@@ -227,33 +282,16 @@ impl Confirm {
     }
 }
 
-/// What the console exits with once an item is terminal. It reports **what happened
-/// to the money**, not which key the human pressed: an item another connection
-/// executed while we were denying it is still [`Self::Approved`]. A `deny` sent by
-/// the expiry deadline reports [`Self::Expired`], not [`Self::Rejected`] — the
-/// deadline, not a human, said no.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitOutcome {
-    /// Signed and broadcast.
-    Approved,
-    /// A human said no.
-    Rejected,
-    /// The deadline passed before a decision.
-    Expired,
-    /// Approved, but signing/broadcast failed — no money moved.
-    Failed,
-}
-
 /// A **non-terminal** failure of `approve`/`deny`: the item is still live and the
-/// human can act again. Terminal answers become [`Phase::Resolved`] instead.
+/// human can act again. Terminal answers close the card and raise a
+/// [`Notice::Outcome`] instead — the resident console keeps running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     /// The item is high-risk; a per-request PIN is needed (the entry is untouched).
     PinRequired,
-    /// Wrong PIN; attempts before lockout.
+    /// Wrong PIN; attempts before lockout. An armed `attempts_left: 0` never
+    /// lands here — the lockout closes the card and raises [`Notice::Locked`].
     BadPin(u32),
-    /// Locked out; seconds to wait.
-    Locked(u64),
     /// The wallet has no PIN set.
     NotSet,
     /// Transient verifier failure.
@@ -326,6 +364,15 @@ pub struct Model {
     /// the size is known, nothing fits and approval is refused (fail closed).
     viewport: (u16, u16),
     quit: bool,
+    /// The wallet's own context (`context`, proto 2), fetched once right after
+    /// a successful `auth`. `None` until it lands — or for the whole session
+    /// when the op degrades (`wallet_locked`): the card then falls back to its
+    /// To-only layout, and approve is never gated on it (the From block is
+    /// display-only; the signing-critical surface does not depend on it).
+    wallet: Option<WalletContext>,
+    /// The last terminal decision, waiting for the run loop to drain it into
+    /// the machine decision line ([`Self::take_decision`]).
+    decision: Option<Decision>,
 }
 
 /// A parked user intent (no `List` — the poll is suppressed, not queued).
@@ -363,6 +410,8 @@ impl Default for Model {
             awaiting_card: false,
             viewport: (0, 0),
             quit: false,
+            wallet: None,
+            decision: None,
         }
     }
 }
@@ -384,6 +433,20 @@ impl Model {
     #[must_use]
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    /// The wallet's own address (EIP-55, verbatim from `context`), when the
+    /// read-op has landed — feeds the card's From block. `None` degrades the
+    /// card to its To-only layout, never gating approve.
+    #[must_use]
+    pub fn wallet_address(&self) -> Option<&str> {
+        self.wallet.as_ref().map(|w| w.address.as_str())
+    }
+
+    /// Drain the last terminal decision (for the machine decision line — one
+    /// JSON line per decision on a non-TTY stdout, AGENTS.md #7).
+    pub fn take_decision(&mut self) -> Option<Decision> {
+        self.decision.take()
     }
 
     /// Fold one message into the model, returning at most one request to send.
@@ -489,7 +552,12 @@ impl Model {
         if c.sent.is_some() {
             return None;
         }
-        if !ui::priority_fields_fit(c, self.viewport.0, self.viewport.1) {
+        if !ui::priority_fields_fit(
+            c,
+            self.wallet.as_ref().map(|w| w.address.as_str()),
+            self.viewport.0,
+            self.viewport.1,
+        ) {
             // The prompt (or a warning above it) is off-screen: a PIN typed
             // into a card the human cannot read must not sign (the card shows
             // the TOO SMALL banner). Esc still rejects.
@@ -525,7 +593,12 @@ impl Model {
         if c.sent.is_some() || c.pin.is_some() {
             return None; // decided already, or the PIN prompt owns Enter
         }
-        if !ui::priority_fields_fit(c, self.viewport.0, self.viewport.1) {
+        if !ui::priority_fields_fit(
+            c,
+            self.wallet.as_ref().map(|w| w.address.as_str()),
+            self.viewport.0,
+            self.viewport.1,
+        ) {
             // A "yes" to a card the human could not read is not a decision:
             // while the priority fields do not fit the terminal, `y` is dead —
             // it neither approves nor opens the PIN prompt. The card shows the
@@ -639,7 +712,19 @@ impl Model {
                 self.awaiting_card = false;
                 self.pending = None;
             }
-            Reply::Auth(outcome) => self.apply_auth(outcome),
+            Reply::Auth(outcome) => {
+                let unlocked = matches!(outcome, AuthOutcome::Ok);
+                self.apply_auth(outcome);
+                if unlocked && self.wallet.is_none() {
+                    // Fetch the wallet's own context exactly once, right after
+                    // auth — before the first poll, while no card can be open
+                    // (the read-op policy: display reads never contend with an
+                    // open confirmation for the single in-flight slot).
+                    self.in_flight = true;
+                    return Some(transport::Request::Context);
+                }
+            }
+            Reply::Context(outcome) => self.apply_context(outcome),
             Reply::List(items) => self.apply_list(items),
             Reply::Get(outcome) => self.apply_get(outcome),
             Reply::Resolve(outcome) => self.apply_resolve(outcome),
@@ -649,8 +734,8 @@ impl Model {
                 return None;
             }
         }
-        // A terminal answer ends the session: nothing parked may still be sent.
-        if matches!(self.phase, Phase::Resolved { .. } | Phase::Fatal(_)) {
+        // A dead connection ends the session: nothing parked may still be sent.
+        if matches!(self.phase, Phase::Fatal(_)) {
             self.pending = None;
             return None;
         }
@@ -664,7 +749,7 @@ impl Model {
                     items: Vec::new(),
                     selected: 0,
                     confirm: None,
-                    note: None,
+                    notice: None,
                 };
             }
             other => {
@@ -698,11 +783,32 @@ impl Model {
         }
     }
 
+    /// Fold the once-per-session `context` answer. Both failure shapes only
+    /// degrade the display (To-only card) — approve is never gated on them.
+    fn apply_context(&mut self, outcome: ContextOutcome) {
+        match outcome {
+            ContextOutcome::Ok(ctx) => self.wallet = Some(*ctx),
+            ContextOutcome::WalletLocked => {
+                if let Phase::Watching { notice, .. } = &mut self.phase
+                    && notice.is_none()
+                {
+                    // Informational only — never overwrite a decision/lockout.
+                    *notice = Some(Notice::Note(
+                        "wallet context unavailable — cards show the recipient only".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
     fn apply_get(&mut self, outcome: GetOutcome) {
         // Whatever this outcome says, it answers the one get that was allowed
         // on the wire — the console may ask for a card again.
         self.awaiting_card = false;
-        if let Phase::Watching { confirm, note, .. } = &mut self.phase {
+        if let Phase::Watching {
+            confirm, notice, ..
+        } = &mut self.phase
+        {
             if confirm.is_some() {
                 // An open card *is* the confirmation (`AGENTS.md` #5): no reply
                 // may replace it — least of all mid-resolve, where a swap would
@@ -715,20 +821,24 @@ impl Model {
                 GetOutcome::Card(c) => {
                     // An open card *is* the confirmation (AGENTS.md #5).
                     *confirm = Some(Box::new(Confirm::new(*c)));
-                    *note = None;
+                    *notice = None;
                 }
                 GetOutcome::UnknownId => {
                     // The selected item vanished between list and get — show a
                     // transient note instead of a dead card.
-                    *note = Some("that request is no longer available".to_owned());
+                    *notice = Some(Notice::Note(
+                        "that request is no longer available".to_owned(),
+                    ));
                 }
             }
         }
     }
 
-    /// Fold an `approve`/`deny` answer. Terminal answers end the session with the
-    /// matching [`ExitOutcome`]; the rest leave the item live and the human in
-    /// charge (`pin_required` opens the PIN prompt, `bad_pin` clears it, and so on).
+    /// Fold an `approve`/`deny` answer. A terminal answer closes the card,
+    /// raises the outcome notice and records the machine decision line — the
+    /// resident console returns to the queue instead of exiting. The rest
+    /// leave the item live and the human in charge (`pin_required` opens the
+    /// PIN prompt, `bad_pin` clears it, and so on).
     fn apply_resolve(&mut self, outcome: ResolveOutcome) {
         let (sent, timed_out) = match &mut self.phase {
             Phase::Watching {
@@ -738,8 +848,25 @@ impl Model {
             _ => return,
         };
 
-        if let Some(exit) = terminal_exit(&outcome, timed_out) {
-            self.phase = Phase::Resolved { outcome, exit };
+        if let Some(kind) = decision_kind(&outcome, timed_out) {
+            let (tx_hash, reason) = match &outcome {
+                ResolveOutcome::Executed { tx_hash } => (Some(tx_hash.clone()), None),
+                ResolveOutcome::Failed { reason } => (None, Some(reason.clone())),
+                _ => (None, None),
+            };
+            let detail = tx_hash.clone().or_else(|| reason.clone());
+            self.decision = Some(Decision {
+                kind,
+                tx_hash,
+                reason,
+            });
+            if let Phase::Watching {
+                confirm, notice, ..
+            } = &mut self.phase
+            {
+                *confirm = None;
+                *notice = Some(Notice::Outcome { kind, detail });
+            }
             return;
         }
 
@@ -774,12 +901,41 @@ impl Model {
             return;
         }
 
-        let Phase::Watching { confirm, note, .. } = &mut self.phase else {
+        let Phase::Watching {
+            confirm, notice, ..
+        } = &mut self.phase
+        else {
             return;
         };
         if matches!(outcome, ResolveOutcome::UnknownId) {
             *confirm = None;
-            *note = Some("that request is no longer available".to_owned());
+            *notice = Some(Notice::Note(
+                "that request is no longer available".to_owned(),
+            ));
+            return;
+        }
+        // The lockout tripped (an armed `bad_pin {attempts_left: 0}`) or was
+        // already active (`locked`). The server has failed the queue closed —
+        // every pending item is now denied (protocol §4) — so keeping this
+        // card open as "still approvable" would be a lie: close it and raise
+        // the lockout notice. NOT client-gated beyond that: a locked session
+        // may still deny anything and approve non-high-risk items (the ladder
+        // guards PIN paths only), so submits stay live and a repeat `locked`
+        // answer simply re-arms this notice with a fresh countdown.
+        let lockout = match outcome {
+            ResolveOutcome::BadPin { attempts_left: 0 } => {
+                Some(Notice::Locked {
+                    retry_after_s: None, // the arming response carries no delay
+                })
+            }
+            ResolveOutcome::Locked { retry_after_s } => Some(Notice::Locked {
+                retry_after_s: Some(retry_after_s),
+            }),
+            _ => None,
+        };
+        if let Some(locked) = lockout {
+            *confirm = None;
+            *notice = Some(locked);
             return;
         }
         let Some(c) = confirm else {
@@ -795,20 +951,15 @@ impl Model {
                 c.pin.get_or_insert_with(Pin::default).clear();
                 ResolveError::BadPin(attempts_left)
             }
-            ResolveOutcome::Locked { retry_after_s } => {
-                if let Some(pin) = &mut c.pin {
-                    pin.clear();
-                }
-                ResolveError::Locked(retry_after_s)
-            }
             ResolveOutcome::PinNotSet => ResolveError::NotSet,
             ResolveOutcome::PinUnavailable => ResolveError::Unavailable,
             // Only `already_resolved:pending` is non-terminal; the rest were taken
-            // by `terminal_exit` above.
+            // by `decision_kind` above.
             ResolveOutcome::AlreadyResolved { .. } => ResolveError::Busy,
             ResolveOutcome::Executed { .. }
             | ResolveOutcome::Failed { .. }
             | ResolveOutcome::Denied
+            | ResolveOutcome::Locked { .. }
             | ResolveOutcome::Unauthorized
             | ResolveOutcome::UnknownId => return,
         };
@@ -853,33 +1004,34 @@ impl Model {
     }
 }
 
-/// Is this answer the item's last word, and if so what do we exit with?
+/// Is this answer the item's last word, and if so what happened to the money?
 ///
-/// The exit reports **what happened to the money**, not which key was pressed: an
-/// `already_resolved:executed` answer to our `deny` means another connection got
-/// there first and the transaction went out — that is [`ExitOutcome::Approved`].
-/// `timed_out` is the one place the cause matters: a `deny` the deadline sent
-/// reports `expired`, so a caller can tell "the human said no" from "nobody did".
+/// The kind reports **what happened to the money**, not which key was pressed:
+/// an `already_resolved:executed` answer to our `deny` means another connection
+/// got there first and the transaction went out — that is
+/// [`DecisionKind::Approved`]. `timed_out` is the one place the cause matters:
+/// a `deny` the deadline sent reports `expired`, so a caller can tell "the
+/// human said no" from "nobody did".
 ///
 /// `already_resolved:pending` is **not** terminal — another connection is executing
 /// this id right now (protocol §3.5); the human may retry.
-fn terminal_exit(outcome: &ResolveOutcome, timed_out: bool) -> Option<ExitOutcome> {
+fn decision_kind(outcome: &ResolveOutcome, timed_out: bool) -> Option<DecisionKind> {
     // Only *our own* deny can have been sent by the deadline. An `already_resolved`
     // deny was somebody else's decision, so it stays a rejection.
     let our_deny = if timed_out {
-        ExitOutcome::Expired
+        DecisionKind::Expired
     } else {
-        ExitOutcome::Rejected
+        DecisionKind::Rejected
     };
     match outcome {
-        ResolveOutcome::Executed { .. } => Some(ExitOutcome::Approved),
-        ResolveOutcome::Failed { .. } => Some(ExitOutcome::Failed),
+        ResolveOutcome::Executed { .. } => Some(DecisionKind::Approved),
+        ResolveOutcome::Failed { .. } => Some(DecisionKind::Failed),
         ResolveOutcome::Denied => Some(our_deny),
         ResolveOutcome::AlreadyResolved { state } => match state {
-            TerminalState::Executed => Some(ExitOutcome::Approved),
-            TerminalState::Failed => Some(ExitOutcome::Failed),
-            TerminalState::Denied => Some(ExitOutcome::Rejected),
-            TerminalState::Expired => Some(ExitOutcome::Expired),
+            TerminalState::Executed => Some(DecisionKind::Approved),
+            TerminalState::Failed => Some(DecisionKind::Failed),
+            TerminalState::Denied => Some(DecisionKind::Rejected),
+            TerminalState::Expired => Some(DecisionKind::Expired),
             TerminalState::Pending => None,
         },
         ResolveOutcome::Unauthorized
@@ -958,6 +1110,10 @@ mod tests {
     }
 
     /// Drive a model to the watch phase with the given items.
+    /// The wallet's own address in tests — full-length, so the From block
+    /// exercises real wrapping (never a shortened stand-in).
+    const WALLET: &str = "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb";
+
     fn watching(items: Vec<Summary>) -> Model {
         let mut m = Model::new();
         // The size report main sends at startup — a standard 80×24 terminal.
@@ -976,7 +1132,18 @@ mod tests {
         let _ = m.update(Msg::PinDigit('1'));
         let req = m.update(Msg::PinSubmit);
         assert!(matches!(req, Some(transport::Request::Auth(_))));
-        assert!(m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok))).is_none());
+        // The everyday session fetches the wallet context right after auth.
+        assert!(matches!(
+            m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok))),
+            Some(transport::Request::Context)
+        ));
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+            },
+        )))));
         // deliver the first list
         assert!(matches!(
             m.update(Msg::Tick),
@@ -1070,10 +1237,6 @@ mod tests {
                 ResolveOutcome::BadPin { attempts_left: 1 },
                 ResolveError::BadPin(1),
             ),
-            (
-                ResolveOutcome::Locked { retry_after_s: 60 },
-                ResolveError::Locked(60),
-            ),
             (ResolveOutcome::PinNotSet, ResolveError::NotSet),
             (ResolveOutcome::PinUnavailable, ResolveError::Unavailable),
         ] {
@@ -1082,6 +1245,57 @@ mod tests {
             m.update(Msg::Reply(Reply::Resolve(outcome)));
             assert_eq!(confirm_of(&m).error(), Some(&expected));
         }
+    }
+
+    #[test]
+    fn a_locked_answer_closes_the_card_and_raises_the_lockout_notice() {
+        // The lockout has failed the queue closed server-side (protocol §4):
+        // every pending item is already denied, so a card left open as "still
+        // approvable" would be a lie. The notice carries the server's delay.
+        let mut m = confirming("a", false);
+        m.update(Msg::Approve);
+        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Locked {
+            retry_after_s: 60,
+        })));
+        let Phase::Watching {
+            confirm, notice, ..
+        } = m.phase()
+        else {
+            panic!("a lockout keeps the resident console on the queue");
+        };
+        assert!(confirm.is_none(), "the dead card must close");
+        assert_eq!(
+            notice.as_ref(),
+            Some(&Notice::Locked {
+                retry_after_s: Some(60)
+            })
+        );
+    }
+
+    #[test]
+    fn an_arming_bad_pin_closes_the_card_and_raises_the_lockout_notice() {
+        // `bad_pin {attempts_left: 0}` IS the lockout arming (protocol §3.2):
+        // the queue is dropped on that very answer; it carries no delay.
+        let mut m = confirming("a", true);
+        m.update(Msg::Approve); // opens the PIN prompt
+        m.update(Msg::PinDigit('1'));
+        m.update(Msg::PinSubmit);
+        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::BadPin {
+            attempts_left: 0,
+        })));
+        let Phase::Watching {
+            confirm, notice, ..
+        } = m.phase()
+        else {
+            panic!("the arming response keeps the resident console on the queue");
+        };
+        assert!(confirm.is_none(), "the dead card must close");
+        assert_eq!(
+            notice.as_ref(),
+            Some(&Notice::Locked {
+                retry_after_s: None
+            })
+        );
     }
 
     #[test]
@@ -1516,11 +1730,14 @@ mod tests {
         ));
         // the item vanished between list and get
         m.update(Msg::Reply(Reply::Get(GetOutcome::UnknownId)));
-        let Phase::Watching { confirm, note, .. } = m.phase() else {
+        let Phase::Watching {
+            confirm, notice, ..
+        } = m.phase()
+        else {
             panic!("watching");
         };
         assert!(confirm.is_none());
-        assert!(note.is_some());
+        assert!(matches!(notice, Some(Notice::Note(_))));
     }
 
     // ── auth failure ──
@@ -1767,48 +1984,86 @@ mod tests {
         assert_eq!(confirm_of(&m).pin_len(), Some(4), "the sent PIN is frozen");
     }
 
-    // ── confirmation: terminal answers ──
+    // ── confirmation: terminal answers (the resident console stays) ──
+
+    /// The residency red-mutation guard (ТЗ §5): a terminal answer must leave
+    /// the model WATCHING — card closed, outcome notice up, polling alive. If
+    /// `apply_resolve` ever ends the session again, this fails first.
+    fn assert_resident_outcome(m: &mut Model, kind: DecisionKind, detail: Option<&str>) {
+        let Phase::Watching {
+            confirm, notice, ..
+        } = m.phase()
+        else {
+            panic!("a terminal answer must keep the resident console watching");
+        };
+        assert!(confirm.is_none(), "the decided card must close");
+        assert_eq!(
+            notice.as_ref(),
+            Some(&Notice::Outcome {
+                kind,
+                detail: detail.map(str::to_owned)
+            })
+        );
+        // The queue keeps living: the very next tick polls `list` again.
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+    }
 
     #[test]
-    fn an_executed_answer_exits_approved_and_keeps_the_tx_hash() {
+    fn an_executed_answer_stays_resident_and_reports_approved_with_the_tx_hash() {
         let mut m = confirming("a", false);
         m.update(Msg::Approve);
         m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Executed {
             tx_hash: "0xfeed".to_owned(),
         })));
-        let Phase::Resolved { outcome, exit } = m.phase() else {
-            panic!("resolved");
-        };
-        assert_eq!(*exit, ExitOutcome::Approved);
-        assert!(matches!(outcome, ResolveOutcome::Executed { tx_hash } if tx_hash == "0xfeed"));
+        assert_resident_outcome(&mut m, DecisionKind::Approved, Some("0xfeed"));
+        assert_eq!(
+            m.take_decision(),
+            Some(Decision {
+                kind: DecisionKind::Approved,
+                tx_hash: Some("0xfeed".to_owned()),
+                reason: None,
+            })
+        );
+        assert_eq!(
+            m.take_decision(),
+            None,
+            "a decision is drained exactly once"
+        );
     }
 
     #[test]
-    fn a_failed_broadcast_exits_failed_not_approved() {
+    fn a_failed_broadcast_reports_failed_not_approved() {
         let mut m = confirming("a", false);
         m.update(Msg::Approve);
         m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Failed {
             reason: "nonce too low".to_owned(),
         })));
-        let Phase::Resolved { exit, .. } = m.phase() else {
-            panic!("resolved");
-        };
-        assert_eq!(*exit, ExitOutcome::Failed, "no money moved");
+        assert_resident_outcome(&mut m, DecisionKind::Failed, Some("nonce too low"));
+        let d = m
+            .take_decision()
+            .expect("a terminal answer records a decision");
+        assert_eq!(d.kind, DecisionKind::Failed, "no money moved");
+        assert_eq!(d.reason.as_deref(), Some("nonce too low"));
+        assert_eq!(d.tx_hash, None);
     }
 
     #[test]
-    fn a_human_deny_exits_rejected() {
+    fn a_human_deny_reports_rejected() {
         let mut m = confirming("a", false);
         m.update(Msg::Reject);
         m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Denied)));
-        let Phase::Resolved { exit, .. } = m.phase() else {
-            panic!("resolved");
-        };
-        assert_eq!(*exit, ExitOutcome::Rejected);
+        assert_resident_outcome(&mut m, DecisionKind::Rejected, None);
+        assert_eq!(
+            m.take_decision().expect("recorded").kind,
+            DecisionKind::Rejected
+        );
     }
 
     #[test]
-    fn the_deadline_denies_fail_closed_and_exits_expired_not_rejected() {
+    fn the_deadline_denies_fail_closed_and_reports_expired_not_rejected() {
         let mut m = confirming("a", false);
         let req = m.update(Msg::Expire);
         assert!(
@@ -1817,19 +2072,18 @@ mod tests {
         );
         // The server has not observed the expiry yet and simply denies it.
         m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Denied)));
-        let Phase::Resolved { exit, .. } = m.phase() else {
-            panic!("resolved");
-        };
+        assert_resident_outcome(&mut m, DecisionKind::Expired, None);
         assert_eq!(
-            *exit,
-            ExitOutcome::Expired,
+            m.take_decision().expect("recorded").kind,
+            DecisionKind::Expired,
             "the deadline said no, not the human"
         );
     }
 
     #[test]
-    fn an_item_executed_by_another_connection_exits_approved_even_if_we_denied() {
-        // The exit reports what happened to the money, not which key was pressed.
+    fn an_item_executed_by_another_connection_reports_approved_even_if_we_denied() {
+        // The kind reports what happened to the money, not which key was
+        // pressed — and the hash was never ours to report.
         let mut m = confirming("a", false);
         m.update(Msg::Reject);
         m.update(Msg::Reply(Reply::Resolve(
@@ -1837,14 +2091,14 @@ mod tests {
                 state: TerminalState::Executed,
             },
         )));
-        let Phase::Resolved { exit, .. } = m.phase() else {
-            panic!("resolved");
-        };
-        assert_eq!(*exit, ExitOutcome::Approved);
+        assert_resident_outcome(&mut m, DecisionKind::Approved, None);
+        let d = m.take_decision().expect("recorded");
+        assert_eq!(d.kind, DecisionKind::Approved);
+        assert_eq!(d.tx_hash, None, "the hash was never ours to report");
     }
 
     #[test]
-    fn an_already_expired_item_exits_expired() {
+    fn an_already_expired_item_reports_expired() {
         let mut m = confirming("a", false);
         m.update(Msg::Approve);
         m.update(Msg::Reply(Reply::Resolve(
@@ -1852,82 +2106,106 @@ mod tests {
                 state: TerminalState::Expired,
             },
         )));
-        assert!(matches!(
-            m.phase(),
-            Phase::Resolved {
-                exit: ExitOutcome::Expired,
-                ..
-            }
-        ));
+        assert_resident_outcome(&mut m, DecisionKind::Expired, None);
     }
 
     #[test]
-    fn terminal_exit_maps_every_answer() {
+    fn a_second_item_can_be_decided_after_the_first_resolves() {
+        // The point of residency: the session survives a decision. Decide one
+        // item, receive a fresh queue, open and decide the next — one session.
+        let mut m = confirming("a", false);
+        m.update(Msg::Approve);
+        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Executed {
+            tx_hash: "0x01".to_owned(),
+        })));
+        let _ = m.take_decision();
+        // next poll delivers a new item
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        m.update(Msg::Reply(Reply::List(vec![summary("b")])));
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(_))
+        ));
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("b")))));
+        assert!(m.update(Msg::Reject).is_some());
+        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Denied)));
+        assert_resident_outcome(&mut m, DecisionKind::Rejected, None);
+        assert_eq!(
+            m.take_decision().expect("second decision recorded").kind,
+            DecisionKind::Rejected
+        );
+    }
+
+    #[test]
+    fn decision_kind_maps_every_answer() {
         use ResolveOutcome as R;
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::Executed {
                     tx_hash: String::new()
                 },
                 false
             ),
-            Some(ExitOutcome::Approved)
+            Some(DecisionKind::Approved)
         );
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::Failed {
                     reason: String::new()
                 },
                 true
             ),
-            Some(ExitOutcome::Failed)
+            Some(DecisionKind::Failed)
         );
         assert_eq!(
-            terminal_exit(&R::Denied, false),
-            Some(ExitOutcome::Rejected)
+            decision_kind(&R::Denied, false),
+            Some(DecisionKind::Rejected)
         );
-        assert_eq!(terminal_exit(&R::Denied, true), Some(ExitOutcome::Expired));
+        assert_eq!(decision_kind(&R::Denied, true), Some(DecisionKind::Expired));
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::AlreadyResolved {
                     state: TerminalState::Denied
                 },
                 true
             ),
-            Some(ExitOutcome::Rejected),
+            Some(DecisionKind::Rejected),
             "somebody else's deny is a rejection, never our deadline"
         );
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::AlreadyResolved {
                     state: TerminalState::Failed
                 },
                 false
             ),
-            Some(ExitOutcome::Failed),
+            Some(DecisionKind::Failed),
             "somebody else's approval that failed to broadcast is a failure, not a rejection"
         );
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::AlreadyResolved {
                     state: TerminalState::Executed
                 },
                 true
             ),
-            Some(ExitOutcome::Approved),
+            Some(DecisionKind::Approved),
             "somebody else executed it while our deadline denied — the money moved"
         );
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::AlreadyResolved {
                     state: TerminalState::Expired
                 },
                 false
             ),
-            Some(ExitOutcome::Expired)
+            Some(DecisionKind::Expired)
         );
         assert_eq!(
-            terminal_exit(
+            decision_kind(
                 &R::AlreadyResolved {
                     state: TerminalState::Pending
                 },
@@ -1946,7 +2224,7 @@ mod tests {
             R::Unauthorized,
         ] {
             assert_eq!(
-                terminal_exit(&live, false),
+                decision_kind(&live, false),
                 None,
                 "{live:?} is not terminal"
             );
@@ -2006,7 +2284,10 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_answer_shows_the_lockout_and_clears_the_pin() {
+    fn a_locked_answer_on_the_pin_path_closes_the_card_too() {
+        // The high-risk PIN flow is the everyday origin of a lockout: the card
+        // must close (its item is already denied server-side, protocol §4),
+        // not linger with a cleared prompt.
         let mut m = confirming("a", true);
         m.update(Msg::Approve);
         type_pin(&mut m, "1111");
@@ -2014,9 +2295,19 @@ mod tests {
         m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Locked {
             retry_after_s: 300,
         })));
-        let c = confirm_of(&m);
-        assert_eq!(c.error(), Some(&ResolveError::Locked(300)));
-        assert_eq!(c.pin_len(), Some(0));
+        let Phase::Watching {
+            confirm, notice, ..
+        } = m.phase()
+        else {
+            panic!("resident: back to the queue");
+        };
+        assert!(confirm.is_none());
+        assert_eq!(
+            notice.as_ref(),
+            Some(&Notice::Locked {
+                retry_after_s: Some(300)
+            })
+        );
     }
 
     #[test]
@@ -2024,11 +2315,14 @@ mod tests {
         let mut m = confirming("a", false);
         m.update(Msg::Approve);
         m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::UnknownId)));
-        let Phase::Watching { confirm, note, .. } = m.phase() else {
+        let Phase::Watching {
+            confirm, notice, ..
+        } = m.phase()
+        else {
             panic!("back to watching");
         };
         assert!(confirm.is_none());
-        assert!(note.is_some());
+        assert!(matches!(notice, Some(Notice::Note(_))));
     }
 
     #[test]

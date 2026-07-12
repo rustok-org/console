@@ -1,6 +1,6 @@
 {
-  "state": "idle",
-  "task": "Console v2 Фаза 2, Этап 1 ЗАКРЫТ (core#91 → 6fea4e2, console#9 → ba61909, смержены Капитаном 2026-07-12): approver-протокол proto 2 + read-op `context` (адрес/балансы/allowed_chains за auth-гейтом, обратная совместимость с console v0.1.0 подтверждена тестами). NEXT по ратифицированному порядку: Этап 2 — console-резидентность + nav-shell + двух-блочный From→To (нужен свой Гейт-1: замер blast radius «не выходим после решения», экран PIN-lockout, клиентская политика «не поллить read-ops при открытой карточке»). Затем: Receive → core PR2 positions → Дашборд → core PR3 activity → Activity.",
+  "state": "shipped",
+  "task": "Console v2 Фаза 2, Этап 2: резидентность + From→To + decision stream. Гейт-2 «чисто» (Ревьюер независимо прогнал гейты + все 4 отклонения ратифицированы по коду) → PR console#10 открыт (4671021), CI ожидается. Ждёт мержа Капитаном. Дальше по порядку: Этап 3 — Receive (адрес + QR; введёт View-enum сразу с двумя реальными видами), затем core PR2 positions.",
   "fast": false,
   "history": [
     {
@@ -98,7 +98,31 @@
       "to": "idle",
       "at": "2026-07-12T23:00:00+05:00",
       "gate": "Круг закрыт: Капитан смержил оба PR (core#91 → main 6fea4e2, console#9 → main ba61909); ветки удалены локально и на remote; протокол-док proto 2 §3.7 context — канон на main. NEXT = Этап 2 (console: резидентность + nav-shell + From→To), свой круг со своим Гейтом-1."
+    },
+    {
+      "from": "idle",
+      "to": "planning",
+      "at": "2026-07-12T23:30:00+05:00",
+      "gate": "Этап 2, спека к Гейту-1 (.claude/specs/2026-07-12-console-v2-phase2-s2-residency.md). Замер blast radius ДО спеки: 13 из 137 тестов (7 app.rs Resolved/exit-семейство, 4 main.rs exit-коды/decision-line, ui.rs диспетч :39, protocol.rs hello-фикстуры) — подтверждено, что цифра ~30 авто-открытия сюда не переносится. Найдена коллизия: инвариант AGENTS.md #7 (exit-код=решение) несовместим с резидентностью — вопрос ратификации №1 (рекомендация: decision line per-decision на stdout ТОЛЬКО когда stdout не TTY — /check-finding: в docker exec -it stdout=тот же TTY, что alternate-screen, mid-session запись порвала бы кадр, ровно от этого сегодняшний restore_then_announce; exit-коды остаются только сессионные aborted/no-tty/fatal/upgrade). /check: 6 находок (1 important — tty-условие stream'а; lockout-текст не хоронит Executing (§4); отсчёт advisory — locked после истечения ре-армит; приоритет нот locked>outcome>note; реконнект явно в «не входит» (Фаза 3); счётчики подтверждены) — все вшиты. 4 вопроса ратификации: #7-эволюция, без fallback на proto 1, lockout закрывает карточку, nav-shell без заглушек. Распоряжение Капитана: флот-5 и /security-review проводит РЕВЬЮЕР, Инженер — только дешёвые гейты + прочтение дифа (нарушение Этапа 1 не повторять; память team-review-token-split обновлена). Кода нет до «go»."
+    },
+    {
+      "from": "planning",
+      "to": "coding",
+      "at": "2026-07-13T00:05:00+05:00",
+      "gate": "Гейт-1 ПРОЙДЕН: Ревьюер перепроверил все факты спеки по коду (13 тестов blast radius дословно, restore_then_announce, IsTerminal, mcp e2e console.py:107 — единственный потребитель exit-кодов в организации, пин CONSOLE_IMAGE=v0.1.0), ратифицировал все 4 вопроса (§7-эволюция + предложение отдельного ADR — принято, .claude/decisions/2026-07-12-invariant-7-decision-stream.md; без fallback proto 1; lockout закрывает карточку; nav-shell без заглушек), 1 МИНОР (в финальную формулировку §7 вписать все 4 сохраняемых кода включая upgrade — вшито в спеку и ADR). Го на кодинг."
+    },
+    {
+      "from": "coding",
+      "to": "reviewing",
+      "at": "2026-07-13T00:45:00+05:00",
+      "gate": "Этап 2 код-готов (ветка feat/console-v2-phase2-s2-residency, НЕ запушено): резидентность (Phase::Resolved/ExitOutcome удалены → Notice/DecisionKind/Decision, apply_resolve возвращает в очередь), decision stream per-decision на не-TTY stdout (IsTerminal), exit-коды сессии пиннят v0.1-значения (fatal=1/upgrade=2/no-tty=3/aborted=6), lockout закрывает карточку + амберный баннер (§4-честный текст), PROTO_VERSION=2 + Request::Context (один раз после auth), WalletContext в Model, From→To вертикальным стеком ВНУТРИ priority_lines (гейт считает), деградация wallet_locked → To-only + нота, AGENTS.md #7 переписан + ADR. Дешёвые гейты (мои): cargo test 137+15+1 зелёно, clippy -D warnings чисто, fmt чисто, deny ok. Red-мутации: «сессия снова завершается» → 8 тестов упали; «From-блок выключен» → 1 упал; обе откачены → зелёно. DoD-смоук pty против Python-стаба proto 2: 2 кейса (интерактив/пайп) — 23/23 PASS, включая «процесс жив после решения», «поллинг продолжился», «ровно одна JSON-строка в пайпе», «нет JSON в интерактивном stdout». Отчёт: .claude/reports/2026-07-12-console-v2-phase2-s2-residency.md — 4 отклонения (3 ждут подтверждения: nav-shell отложен в Этап 3 по правилу №5; клиентская блокировка при lockout НЕ реализована — запретила бы разрешённые сервером действия, ошибка спеки; статический ~Ns вместо тикающего отсчёта — у чистой модели нет часов). ⛔ Глубокое ревью (флот-5, /rust-review, /security-review) — Ревьюеру; push/PR ждут «чисто»."
+    },
+    {
+      "from": "reviewing",
+      "to": "shipped",
+      "at": "2026-07-13T01:00:00+05:00",
+      "gate": "Гейт-2 «чисто»: Ревьюер независимо прогнал гейты (137+15+1, clippy/fmt/deny — совпало) и проверил все 3 спорных отклонения ПО КОДУ: (2) без клиентской блокировки при lockout — подтверждено протоколом §4 дословно («refuses auth / high-risk approve»), блокировать разрешённое = строить лишний забор (правило №6 наоборот); (3) статический ~Ns — копнул глубже: дело не в «нет часов вообще», а в том, что Notice::Locked кладётся в apply_resolve (чистый метод), а часы есть только в render; баннер информационный, ничего не гейтит — цена тикающих часов не оправдана (Msg::Reply — 56 вызовов, проверил точное число); (4) internal-фатал — консистентность с существующей политикой approve/deny (Unauthorized уже фаталит «fail closed rather than retry a money action»), не спец-исключение; (1) nav-shell отложен — согласен изначально. Residency-тест прочитан отдельно — настоящий guard, не декорация. БЛОКЕРов/МИНОРов нет → push + PR console#10."
     }
   ],
-  "updated": "2026-07-12T23:00:00+05:00"
+  "updated": "2026-07-13T01:00:00+05:00"
 }

@@ -24,8 +24,9 @@ use std::thread::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    self, AuthOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, ResolveOutcome, Summary,
-    encode_request, parse_approve, parse_auth, parse_deny, parse_get, parse_hello, parse_list,
+    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, ResolveOutcome,
+    Summary, encode_request, parse_approve, parse_auth, parse_context, parse_deny, parse_get,
+    parse_hello, parse_list,
 };
 
 /// Informational client id sent in `hello` (the server does not validate it).
@@ -51,6 +52,8 @@ pub enum Request {
     ApprovePin(Zeroizing<String>),
     /// Deny an item by id.
     Deny(String),
+    /// Ask for the wallet's own context (proto 2+, auth-gated).
+    Context,
 }
 
 /// A message from the worker to the MVU layer.
@@ -69,6 +72,8 @@ pub enum Reply {
     Get(GetOutcome),
     /// Result of an `approve` or `deny`.
     Resolve(ResolveOutcome),
+    /// Result of a `context` (proto 2+).
+    Context(ContextOutcome),
     /// The connection is finished and unusable — the worker has exited.
     Fatal(TransportError),
 }
@@ -275,6 +280,11 @@ fn serve_one(
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
             exchange(writer, reader, &line)?
         }
+        Request::Context => {
+            let line = encode_request(&protocol::Request::Context)
+                .map_err(|e| TransportError::Protocol(e.to_string()))?;
+            exchange(writer, reader, &line)?
+        }
     };
     let parsed = match req {
         Request::Auth(_) => parse_auth(&resp).map(Reply::Auth),
@@ -282,6 +292,7 @@ fn serve_one(
         Request::Get(_) => parse_get(&resp).map(Reply::Get),
         Request::Approve(_) | Request::ApprovePin(_) => parse_approve(&resp).map(Reply::Resolve),
         Request::Deny(_) => parse_deny(&resp).map(Reply::Resolve),
+        Request::Context => parse_context(&resp).map(Reply::Context),
     };
     parsed.map_err(|e| TransportError::Protocol(e.to_string()))
 }
@@ -501,6 +512,47 @@ mod tests {
         assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
         assert!(t.send(Request::Deny("a1".to_owned())));
         assert_eq!(t.recv(), Some(Reply::Resolve(ResolveOutcome::Denied)));
+    }
+
+    #[test]
+    fn context_round_trips_address_and_balances() {
+        let server = FakeServer::start(
+            "context",
+            vec![
+                Some(HELLO_OK),
+                Some(
+                    r#"{"ok":true,"address":"0xAbC","balances":[{"chain_id":1,"symbol":"ETH","balance":"7"}],"allowed_chains":[1]}"#,
+                ),
+            ],
+        );
+        let t = Transport::connect(&server.path);
+        assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
+        assert!(t.send(Request::Context));
+        let Some(Reply::Context(ContextOutcome::Ok(ctx))) = t.recv() else {
+            panic!("a context reply must parse as Reply::Context");
+        };
+        assert_eq!(ctx.address, "0xAbC");
+        assert_eq!(ctx.balances.len(), 1);
+        assert_eq!(ctx.allowed_chains, vec![1]);
+    }
+
+    #[test]
+    fn context_wallet_locked_degrades_not_fatal() {
+        let server = FakeServer::start(
+            "ctx_locked",
+            vec![
+                Some(HELLO_OK),
+                Some(r#"{"ok":false,"error":"wallet_locked"}"#),
+            ],
+        );
+        let t = Transport::connect(&server.path);
+        assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
+        assert!(t.send(Request::Context));
+        assert_eq!(
+            t.recv(),
+            Some(Reply::Context(ContextOutcome::WalletLocked)),
+            "wallet_locked is a modeled outcome, not a worker-ending error"
+        );
     }
 
     #[test]
