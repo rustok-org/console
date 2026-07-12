@@ -1,6 +1,6 @@
 {
-  "state": "reviewing",
-  "task": "Console v2 Фаза 1 (ТОЛЬКО визуал): палитра сайта, framed-панели, человеческие суммы (finding-2), declutter карточки, адреса verbatim, NO_COLOR. БЕЗ анимации/авто-открытия/два-блочного From→To/сокр.адресов — все вынесены (Фаза 2 / свои круги). Протокол/модель/main.rs не тронуты.",
+  "state": "idle",
+  "task": "Console v2 Фаза 1 ЗАКРЫТА (PR #8 смержен): брендированная approver-консоль — палитра сайта, framed-панели, человеческие суммы, declutter, адреса verbatim, NO_COLOR. Прод-модель не тронута. NEXT: Фаза 2 (резидентный дашборд + socket read-ops → баланс/позиции/история + адрес отправителя для From→To). Бэклог: авто-открытие (issue#7), swap-декод (core), сокр.адреса (дашборд), чекбокс unlimited (issue#6).",
   "fast": false,
   "history": [
     {
@@ -50,7 +50,19 @@
       "to": "reviewing",
       "at": "2026-07-12T20:20:00+05:00",
       "gate": "DoD smoke заскринен: реальный бинарь target/debug/rustok-console в pty против Python-стаба approver-протокола → карточка рендерит «amount 0.01 ETH» (человечески), полный адрес verbatim, declutter, framed-панели, [y Approve]/[n Reject]; truecolor-escape'ы в сыром потоке подтверждены: teal #16E0C3, violet #9D5CFF, frame #2A1C4D — все present:True. Тест-контейнеры прибраны. Фаза 1 код-готова, МИНОР+НИТы закрыты. Ждём финальное «чисто»+«добро» → push+PR."
+    },
+    {
+      "from": "reviewing",
+      "to": "shipped",
+      "at": "2026-07-12T20:45:00+05:00",
+      "gate": "Гейт-2 «чисто» Ревьюера (воспроизвёл rule#0 мутацией цвета) + «добро» Капитана → push+PR #8; CI 4/4 (Test/Clippy/Format/Advisories)"
+    },
+    {
+      "from": "shipped",
+      "to": "idle",
+      "at": "2026-07-12T20:50:00+05:00",
+      "gate": "круг закрыт: Капитан смержил PR #8; ветка удалена; на main theme.rs/format.rs + тематизированный ui.rs. NEXT = Фаза 2 (дашборд + read-ops)."
     }
   ],
-  "updated": "2026-07-12T20:20:00+05:00"
+  "updated": "2026-07-12T20:50:00+05:00"
 }
