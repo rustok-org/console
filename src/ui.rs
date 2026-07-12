@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AuthError, Confirm, ExitOutcome, Model, Phase, ResolveError};
 use crate::protocol::{Card, ResolveOutcome, Summary};
+use crate::{format, theme};
 
 /// Render the whole screen for the current model.
 ///
@@ -60,9 +61,19 @@ fn resolved_text(outcome: &ResolveOutcome, exit: ExitOutcome) -> String {
     format!("{headline}\n\n{detail}\n\nPress any key to close.")
 }
 
+/// A framed panel in the brand palette: soft border, accent title. One helper so
+/// every screen frames the same way.
+fn themed_block(title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_style(Style::new().fg(theme::frame()))
+        .title(Line::from(Span::styled(
+            title.to_owned(),
+            theme::heading_style(),
+        )))
+}
+
 fn render_centered(frame: &mut Frame, message: &str) {
-    let block = Block::bordered().title(" Rustok Console ");
-    let paragraph = Paragraph::new(message).block(block);
+    let paragraph = Paragraph::new(message).block(themed_block(" Rustok Console "));
     frame.render_widget(paragraph, frame.area());
 }
 
@@ -78,9 +89,12 @@ fn render_auth(frame: &mut Frame, pin_len: usize, error: Option<&AuthError>) {
     ];
     if let Some(err) = error {
         lines.push(Line::from(""));
-        lines.push(Line::from(auth_error_text(err)));
+        lines.push(Line::from(Span::styled(
+            auth_error_text(err),
+            Style::new().fg(theme::reject()),
+        )));
     }
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title(" Unlock "));
+    let paragraph = Paragraph::new(lines).block(themed_block(" Unlock "));
     frame.render_widget(paragraph, frame.area());
 }
 
@@ -201,9 +215,13 @@ fn render_actions(
         "n / esc"
     };
     let left = seconds_left(confirm.card().not_after_unix, now_unix);
+    // Reject is the focused, default-deny button (reversed + bold, tinted red) —
+    // it is what happens if the human does nothing. Approve is the quiet teal
+    // choice that has to be made.
     let reject_button = Span::styled(
         format!("[ {reject_key}  Reject · auto in {left}s ]"),
         Style::new()
+            .fg(theme::reject())
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::REVERSED),
     );
@@ -214,13 +232,19 @@ fn render_actions(
     let row = if approve_ok {
         Line::from(vec![
             Span::raw("  "),
-            Span::raw(format!("[ {approve_key}  Approve ]")),
+            Span::styled(
+                format!("[ {approve_key}  Approve ]"),
+                Style::new().fg(theme::approve()),
+            ),
             Span::raw("    "),
             reject_button,
         ])
     } else {
         Line::from(vec![
-            Span::raw("  approve disabled — terminal too small    "),
+            Span::styled(
+                "  approve disabled — terminal too small    ",
+                Style::new().fg(theme::high_risk()),
+            ),
             reject_button,
         ])
     };
@@ -233,7 +257,7 @@ fn render_queue(
     selected: usize,
     area: ratatui::layout::Rect,
 ) {
-    let block = Block::bordered().title(" Queue ");
+    let block = themed_block(" Queue ");
     if items.is_empty() {
         let empty = Paragraph::new("Queue is empty — waiting for approval requests…").block(block);
         frame.render_widget(empty, area);
@@ -243,12 +267,19 @@ fn render_queue(
         .iter()
         .map(|s| {
             let flag = if s.high_risk { "⚠ " } else { "  " };
-            ListItem::new(format!(
+            let text = format!(
                 "{flag}{kind:5} {to}  {amount} wei",
                 kind = kind_word(s),
                 to = s.to,
                 amount = s.amount_wei
-            ))
+            );
+            // A high-risk item is amber even in the list, so danger reads before
+            // the card is opened.
+            if s.high_risk {
+                ListItem::new(Span::styled(text, Style::new().fg(theme::high_risk())))
+            } else {
+                ListItem::new(text)
+            }
         })
         .collect();
     let mut state = ListState::default();
@@ -256,7 +287,11 @@ fn render_queue(
     let list = List::new(rows)
         .block(block)
         .highlight_symbol("▶ ")
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .highlight_style(
+            Style::new()
+                .fg(theme::accent())
+                .add_modifier(Modifier::REVERSED),
+        );
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -274,49 +309,70 @@ fn kind_word(s: &Summary) -> &'static str {
 /// actually drawn.
 fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
     let card: &Card = confirm.card();
-    let bold = Style::new().add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    push_wrapped(&mut lines, width, format!("to: {}", card.to), Style::new());
+
+    // Native value, human-first: `10000000000000000` reads as `0.01 ETH`. A token
+    // op sends `0` native wei with the real amount in `decoded_call` (below), so a
+    // zero native value is NOT headlined as "0 ETH" — the decoded call carries the
+    // movement (e.g. an unlimited approval must not look like it moves nothing).
+    if !format::is_zero_wei(&card.amount_wei) {
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("amount  {}", format::wei_to_eth(&card.amount_wei)),
+            theme::heading_style(),
+        );
+    }
+    // Addresses are shown in FULL, verbatim — never shortened. A clear-signing
+    // card is where the human verifies exactly WHO receives funds; a `0x1234…abcd`
+    // ellipsis would hide an address-poisoning look-alike (`AGENTS.md` #1).
     push_wrapped(
         &mut lines,
         width,
-        format!("amount_wei: {}", card.amount_wei),
-        Style::new(),
+        format!("to  {}", card.to),
+        Style::new().fg(theme::accent_bright()),
     );
     push_wrapped(
         &mut lines,
         width,
-        format!("chain_id: {}", card.chain_id),
-        Style::new(),
+        format!("chain  {}", card.chain_id),
+        theme::label_style(),
     );
     if card.high_risk {
         push_wrapped(
             &mut lines,
             width,
-            format!("HIGH RISK: {}", card.high_risk_reasons.join(", ")),
-            bold,
+            format!("⚠ HIGH RISK  {}", card.high_risk_reasons.join(", ")),
+            theme::high_risk_style(),
         );
     }
-    match &card.decoded_call {
-        None => lines.push(Line::from("decoded_call: (none)")),
-        Some(dc) => {
+    // A plain send has nothing to decode — the old "decoded_call: (none)" line was
+    // noise, so it is dropped. A contract call keeps every decoded field: WHO is
+    // authorized (spender/operator/from/to/token) is the point of the card.
+    if let Some(dc) = &card.decoded_call {
+        // Label convention matches `push_opt` (`decoded_call.<field>`) so the method
+        // reads as one of the decoded fields, just emphasized.
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("decoded_call.method: {}", dc.method),
+            theme::heading_style(),
+        );
+        push_opt(&mut lines, width, "spender", dc.spender.as_deref());
+        push_opt(&mut lines, width, "operator", dc.operator.as_deref());
+        push_opt(&mut lines, width, "from", dc.from.as_deref());
+        push_opt(&mut lines, width, "to", dc.to.as_deref());
+        push_opt(&mut lines, width, "token", dc.token.as_deref());
+        push_opt(&mut lines, width, "amount", dc.amount.as_deref());
+        push_opt(&mut lines, width, "deadline", dc.deadline.as_deref());
+        if dc.is_unlimited == Some(true) {
             push_wrapped(
                 &mut lines,
                 width,
-                format!("decoded_call.method: {}", dc.method),
-                Style::new(),
+                "amount  UNLIMITED".to_owned(),
+                theme::high_risk_style(),
             );
-            push_opt(&mut lines, width, "spender", dc.spender.as_deref());
-            push_opt(&mut lines, width, "operator", dc.operator.as_deref());
-            push_opt(&mut lines, width, "from", dc.from.as_deref());
-            push_opt(&mut lines, width, "to", dc.to.as_deref());
-            push_opt(&mut lines, width, "token", dc.token.as_deref());
-            push_opt(&mut lines, width, "amount", dc.amount.as_deref());
-            push_opt(&mut lines, width, "deadline", dc.deadline.as_deref());
-            if dc.is_unlimited == Some(true) {
-                push_wrapped(&mut lines, width, "amount: UNLIMITED".to_owned(), bold);
-            }
         }
     }
     if let Some(pin_len) = confirm.pin_len() {
@@ -325,14 +381,24 @@ fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
             &mut lines,
             width,
             "High-risk approval — enter your PIN:".to_owned(),
-            Style::new(),
+            theme::value_style(),
         );
         // Only the count is shown — never the digits.
-        push_wrapped(&mut lines, width, "●".repeat(pin_len), bold);
+        push_wrapped(
+            &mut lines,
+            width,
+            "●".repeat(pin_len),
+            theme::high_risk_style(),
+        );
     }
     if let Some(err) = confirm.error() {
         lines.push(Line::from(""));
-        push_wrapped(&mut lines, width, resolve_error_text(err), Style::new());
+        push_wrapped(
+            &mut lines,
+            width,
+            resolve_error_text(err),
+            Style::new().fg(theme::reject()),
+        );
     }
     lines
 }
@@ -370,7 +436,7 @@ pub fn priority_fields_fit(confirm: &Confirm, width: u16, height: u16) -> bool {
 /// pathological server data), the card says so with a banner and the approve
 /// path is gated off ([`priority_fields_fit`]) until the terminal grows.
 fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
-    let block = Block::bordered().title(" Card ");
+    let block = themed_block(" Card ");
     let Some(confirm) = confirm else {
         let hint =
             Paragraph::new("Select a request and press enter to see the full card.").block(block);
@@ -564,6 +630,29 @@ mod tests {
 
     fn draw_rows(model: &Model, w: u16, h: u16) -> Vec<String> {
         draw_rows_at(model, w, h, NOW)
+    }
+
+    /// Foreground colors on the first rendered row containing `needle`. Lets a test
+    /// assert that COLOR — not just text — carries the meaning: a high-risk row is
+    /// amber, Approve teal, Reject red. Without this, a swap of `high_risk()` for
+    /// `accent()` would render fine and no text-only test would notice.
+    fn row_fgs_containing(
+        model: &Model,
+        w: u16,
+        h: u16,
+        needle: &str,
+    ) -> Vec<ratatui::style::Color> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains(needle) {
+                return (0..w).filter_map(|x| buffer[(x, y)].style().fg).collect();
+            }
+        }
+        Vec::new()
     }
 
     /// Flatten to one String for checks that do not care about layout.
@@ -764,6 +853,77 @@ mod tests {
         model.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
             card(id, not_after_unix, high_risk),
         ))));
+    }
+
+    #[test]
+    fn a_native_send_card_leads_with_a_human_amount() {
+        let mut m = Model::new();
+        to_watching(
+            &mut m,
+            vec![summary("a1", "0xabc", "10000000000000000", false)],
+        );
+        m.update(Msg::Open);
+        m.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
+            Box::new(Card {
+                id: "a1".to_owned(),
+                chain_id: 1,
+                to: "0xabc".to_owned(),
+                amount_wei: "10000000000000000".to_owned(),
+                decoded_call: None,
+                high_risk: false,
+                high_risk_reasons: vec![],
+                raw_data: "0x".to_owned(),
+                not_after_unix: NOW + 27,
+            }),
+        ))));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["amount", "0.01 ETH"]),
+            "the card leads with a human amount, not raw wei"
+        );
+    }
+
+    #[test]
+    fn a_plain_send_drops_the_decoded_call_noise() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false); // send, decoded_call: None
+        let screen = draw(&m, 100, 24);
+        assert!(
+            !screen.contains("decoded_call: (none)"),
+            "a plain send has nothing to decode — the noise line is gone"
+        );
+        assert!(
+            has_line_with(&draw_rows(&m, 100, 24), &["to", "0xabc"]),
+            "the recipient is still shown, in full"
+        );
+    }
+
+    #[test]
+    fn an_unselected_high_risk_queue_row_is_amber() {
+        let mut m = Model::new();
+        // Two items: the low-risk one is selected (index 0), the high-risk one is
+        // not — so its amber is its own, not the selection highlight.
+        to_watching(
+            &mut m,
+            vec![
+                summary("a1", "0xabc", "0", false),
+                summary("a2", "0xdef", "0", true),
+            ],
+        );
+        let fgs = row_fgs_containing(&m, 80, 24, "0xdef");
+        assert!(
+            fgs.contains(&theme::high_risk()),
+            "danger must read as amber before the card is even opened"
+        );
+    }
+
+    #[test]
+    fn the_decision_row_colors_approve_and_reject() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false); // low-risk send, approve armed
+        let fgs = row_fgs_containing(&m, 80, 24, "Approve");
+        assert!(fgs.contains(&theme::approve()), "Approve is teal");
+        assert!(fgs.contains(&theme::reject()), "Reject is red");
     }
 
     #[test]
@@ -1014,8 +1174,10 @@ mod tests {
         let mut m = Model::new();
         open_risk_card(&mut m, stage1_raw_data());
 
-        // 80×14: the stage-1 card's priority fields cannot all fit (B4).
-        let rows = draw_rows(&m, 80, 14);
+        // 80×13: the stage-1 card's priority fields cannot all fit (B4). The card
+        // is one row shorter since v2 (a zero native value is no longer headlined),
+        // so the too-small boundary moved down by one row.
+        let rows = draw_rows(&m, 80, 13);
         let screen = rows.join("\n");
 
         assert!(

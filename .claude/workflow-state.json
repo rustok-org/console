@@ -1,0 +1,56 @@
+{
+  "state": "reviewing",
+  "task": "Console v2 Фаза 1 (ТОЛЬКО визуал): палитра сайта, framed-панели, человеческие суммы (finding-2), declutter карточки, адреса verbatim, NO_COLOR. БЕЗ анимации/авто-открытия/два-блочного From→To/сокр.адресов — все вынесены (Фаза 2 / свои круги). Протокол/модель/main.rs не тронуты.",
+  "fast": false,
+  "history": [
+    {
+      "from": "idle",
+      "to": "planning",
+      "at": "2026-07-12T17:00:00+05:00",
+      "gate": "Капитан «Го» на Фазу 1 (после дизайн-макета + плана meta/docs/CONSOLE-V2-PLAN.md); команда Инженер+Ревьюер; пишу спеку → /check → Гейт-1"
+    },
+    {
+      "from": "planning",
+      "to": "planning",
+      "at": "2026-07-12T17:20:00+05:00",
+      "gate": "check: 5 findings (2 important — анимация не поедет на now_unix(секунды)/Tick(2500ms), нужен счётчик кадров + смена сигнатуры render; человеческая сумма скроет token-движение как «0 ETH», лид карточки=decoded для token-операций; 3 nit/sug — truecolor-деградация, main.rs-противоречие, свап scope-guard) — все вшиты"
+    },
+    {
+      "from": "planning",
+      "to": "planning",
+      "at": "2026-07-12T17:40:00+05:00",
+      "gate": "Ревьюер ратифицировал видение (вопросы 1/3/4 без возражений) + МИНОР (анимация внутри priority_lines + граничный тест). Капитан: «если анимация приносит сложности — убрать». Анимация УБРАНА из Фазы 1 → ушли счётчик кадров, смена сигнатуры render, МИНОР Ревьюера; main.rs не трогаем. Осталась статичная From→To раскладка."
+    },
+    {
+      "from": "planning",
+      "to": "coding",
+      "at": "2026-07-12T18:00:00+05:00",
+      "gate": "Гейт-1 ПРОЙДЕН: Ревьюер «БЛОКЕРов нет, Го на кодинг» (МИНОР закрыт тип-сигнатурой Vec<Line>, 2 НИТа вшиты — Цель/lib.rs); Капитан ратифицировал. Порядок: theme.rs → format.rs+суммы → авто-открытие → статичная From→To, каждый кусок снапшот red→green. Флот само-ревью = Sonnet 5. Перед коммитом: /rust-review + /codex + /testing. Ветка feat/console-v2-phase1-visual"
+    },
+    {
+      "from": "coding",
+      "to": "coding",
+      "at": "2026-07-12T18:40:00+05:00",
+      "gate": "фундамент готов: theme.rs (палитра+NO_COLOR OnceLock) + format.rs (wei_to_eth/is_zero_wei/short_addr, 6 тестов red-проверены); суита 120 зелёная. Авто-открытие УБРАНО из Фазы 1 (замерил blast radius: 30+ тестов на watching()-хелпере — это behavior, не вид; откат по rule #13; Капитан+Ревьюер ратифицировали удаление) → бэклог issue #7 п.2, свой круг+Гейт-1. app.rs НЕ трогаем. Дальше: тема в ui.rs, суммы, From→To, свёртка дев-полей."
+    },
+    {
+      "from": "coding",
+      "to": "reviewing",
+      "at": "2026-07-12T19:40:00+05:00",
+      "gate": "Фаза 1 код-готова (коммиты 7d4bfd1, 5214e0a): theme.rs+format.rs, все экраны тематизированы, человеческие суммы (finding-2 лид), declutter, адреса verbatim (регрессия address-poisoning отбита), NO_COLOR seam+тест. Гейты (мои, дешёвые): cargo test 121+15+1, clippy --all-targets -D warnings clean, fmt clean, deny ok. Правки Ревьюера вшиты: frame()=#2A1C4D канон, bignum-тест=U256::MAX, спека синхронизирована (анимация/сокр.адреса/два-блочный From→To — расхождения закрыты). Разрыв: два-блочный From→To честно в Фазе 2 (нет адреса отправителя). ⛔ Глубокое ревью (/rust-review) — Ревьюеру; push/PR ждут «чисто»."
+    },
+    {
+      "from": "reviewing",
+      "to": "reviewing",
+      "at": "2026-07-12T20:00:00+05:00",
+      "gate": "Ревьюер: БЛОКЕРов нет, 1 МИНОР (нет style-ассертов на цвет) — закрыт: +2 теста (an_unselected_high_risk_queue_row_is_amber, the_decision_row_colors_approve_and_reject) читают .style().fg буфера; подмена high_risk()→accent() теперь краснеет. НИТ (стейл task) подчищен. cargo test 123+15+1, clippy/fmt/deny ok. Дальше: smoke-скрин (DoD), потом «чисто»→push."
+    },
+    {
+      "from": "reviewing",
+      "to": "reviewing",
+      "at": "2026-07-12T20:20:00+05:00",
+      "gate": "DoD smoke заскринен: реальный бинарь target/debug/rustok-console в pty против Python-стаба approver-протокола → карточка рендерит «amount 0.01 ETH» (человечески), полный адрес verbatim, declutter, framed-панели, [y Approve]/[n Reject]; truecolor-escape'ы в сыром потоке подтверждены: teal #16E0C3, violet #9D5CFF, frame #2A1C4D — все present:True. Тест-контейнеры прибраны. Фаза 1 код-готова, МИНОР+НИТы закрыты. Ждём финальное «чисто»+«добро» → push+PR."
+    }
+  ],
+  "updated": "2026-07-12T20:20:00+05:00"
+}
