@@ -329,7 +329,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | `pin_required` | approve | high-risk item approved without a `pin` |
 | `unknown_id` | get, approve, deny | id is not a live item (never parked, resolved+swept, or bad UUID) |
 | `already_resolved` | approve, deny | id already terminal (or in-flight); carries `state` |
-| `internal` | approve, context | unreachable/unmapped defensive fallback — approve: post-execute inconsistency; context: a `wallet_context` failure this socket doesn't recognise (§3.7) |
+| `internal` | approve | unreachable post-execute inconsistency (defensive) |
 | `wallet_locked` | context | the core's own keyring isn't unlocked — distinct from PIN `auth` (§3.7) |
 
 ## 4. PIN & lockout semantics (server-side, normative)
