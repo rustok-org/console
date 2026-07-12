@@ -20,13 +20,18 @@ fn color_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NO_COLOR").is_none())
 }
 
-/// A brand color, or the terminal default under `NO_COLOR`.
-fn role(r: u8, g: u8, b: u8) -> Color {
-    if color_enabled() {
+/// A brand color, or the terminal default under `NO_COLOR`. Split from the env
+/// read so the degradation itself is a pure, testable function.
+fn resolve(enabled: bool, r: u8, g: u8, b: u8) -> Color {
+    if enabled {
         Color::Rgb(r, g, b)
     } else {
         Color::Reset
     }
+}
+
+fn role(r: u8, g: u8, b: u8) -> Color {
+    resolve(color_enabled(), r, g, b)
 }
 
 // --- roles ---------------------------------------------------------------
@@ -46,9 +51,10 @@ pub fn faint() -> Color {
     role(0x5E, 0x4F, 0x86)
 }
 
-/// Panel borders / frames.
+/// Panel borders / frames — the soft border canon (`#2A1C4D`). The bright accent
+/// (`accent`, `#9D5CFF`) is reserved for an emphasized / focused frame.
 pub fn frame() -> Color {
-    role(0x7A, 0x45, 0xCC)
+    role(0x2A, 0x1C, 0x4D)
 }
 
 /// Brand accent — headings, emphasis.
@@ -96,4 +102,20 @@ pub fn heading_style() -> Style {
 /// A high-risk line — amber, bold, so it cannot be skimmed past.
 pub fn high_risk_style() -> Style {
     Style::new().fg(high_risk()).add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_degrades_every_role_to_the_terminal_default() {
+        // Colored: the exact brand RGB. Uncolored (NO_COLOR): the terminal default,
+        // so the layout and text are untouched — only the color is dropped.
+        assert_eq!(
+            resolve(true, 0x16, 0xE0, 0xC3),
+            Color::Rgb(0x16, 0xE0, 0xC3)
+        );
+        assert_eq!(resolve(false, 0x16, 0xE0, 0xC3), Color::Reset);
+    }
 }

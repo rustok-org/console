@@ -61,9 +61,19 @@ fn resolved_text(outcome: &ResolveOutcome, exit: ExitOutcome) -> String {
     format!("{headline}\n\n{detail}\n\nPress any key to close.")
 }
 
+/// A framed panel in the brand palette: soft border, accent title. One helper so
+/// every screen frames the same way.
+fn themed_block(title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_style(Style::new().fg(theme::frame()))
+        .title(Line::from(Span::styled(
+            title.to_owned(),
+            theme::heading_style(),
+        )))
+}
+
 fn render_centered(frame: &mut Frame, message: &str) {
-    let block = Block::bordered().title(" Rustok Console ");
-    let paragraph = Paragraph::new(message).block(block);
+    let paragraph = Paragraph::new(message).block(themed_block(" Rustok Console "));
     frame.render_widget(paragraph, frame.area());
 }
 
@@ -79,9 +89,12 @@ fn render_auth(frame: &mut Frame, pin_len: usize, error: Option<&AuthError>) {
     ];
     if let Some(err) = error {
         lines.push(Line::from(""));
-        lines.push(Line::from(auth_error_text(err)));
+        lines.push(Line::from(Span::styled(
+            auth_error_text(err),
+            Style::new().fg(theme::reject()),
+        )));
     }
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title(" Unlock "));
+    let paragraph = Paragraph::new(lines).block(themed_block(" Unlock "));
     frame.render_widget(paragraph, frame.area());
 }
 
@@ -202,9 +215,13 @@ fn render_actions(
         "n / esc"
     };
     let left = seconds_left(confirm.card().not_after_unix, now_unix);
+    // Reject is the focused, default-deny button (reversed + bold, tinted red) —
+    // it is what happens if the human does nothing. Approve is the quiet teal
+    // choice that has to be made.
     let reject_button = Span::styled(
         format!("[ {reject_key}  Reject · auto in {left}s ]"),
         Style::new()
+            .fg(theme::reject())
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::REVERSED),
     );
@@ -215,13 +232,19 @@ fn render_actions(
     let row = if approve_ok {
         Line::from(vec![
             Span::raw("  "),
-            Span::raw(format!("[ {approve_key}  Approve ]")),
+            Span::styled(
+                format!("[ {approve_key}  Approve ]"),
+                Style::new().fg(theme::approve()),
+            ),
             Span::raw("    "),
             reject_button,
         ])
     } else {
         Line::from(vec![
-            Span::raw("  approve disabled — terminal too small    "),
+            Span::styled(
+                "  approve disabled — terminal too small    ",
+                Style::new().fg(theme::high_risk()),
+            ),
             reject_button,
         ])
     };
@@ -234,7 +257,7 @@ fn render_queue(
     selected: usize,
     area: ratatui::layout::Rect,
 ) {
-    let block = Block::bordered().title(" Queue ");
+    let block = themed_block(" Queue ");
     if items.is_empty() {
         let empty = Paragraph::new("Queue is empty — waiting for approval requests…").block(block);
         frame.render_widget(empty, area);
@@ -244,12 +267,19 @@ fn render_queue(
         .iter()
         .map(|s| {
             let flag = if s.high_risk { "⚠ " } else { "  " };
-            ListItem::new(format!(
+            let text = format!(
                 "{flag}{kind:5} {to}  {amount} wei",
                 kind = kind_word(s),
                 to = s.to,
                 amount = s.amount_wei
-            ))
+            );
+            // A high-risk item is amber even in the list, so danger reads before
+            // the card is opened.
+            if s.high_risk {
+                ListItem::new(Span::styled(text, Style::new().fg(theme::high_risk())))
+            } else {
+                ListItem::new(text)
+            }
         })
         .collect();
     let mut state = ListState::default();
@@ -257,7 +287,11 @@ fn render_queue(
     let list = List::new(rows)
         .block(block)
         .highlight_symbol("▶ ")
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .highlight_style(
+            Style::new()
+                .fg(theme::accent())
+                .add_modifier(Modifier::REVERSED),
+        );
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -402,7 +436,7 @@ pub fn priority_fields_fit(confirm: &Confirm, width: u16, height: u16) -> bool {
 /// pathological server data), the card says so with a banner and the approve
 /// path is gated off ([`priority_fields_fit`]) until the terminal grows.
 fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
-    let block = Block::bordered().title(" Card ");
+    let block = themed_block(" Card ");
     let Some(confirm) = confirm else {
         let hint =
             Paragraph::new("Select a request and press enter to see the full card.").block(block);
@@ -796,6 +830,49 @@ mod tests {
         model.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
             card(id, not_after_unix, high_risk),
         ))));
+    }
+
+    #[test]
+    fn a_native_send_card_leads_with_a_human_amount() {
+        let mut m = Model::new();
+        to_watching(
+            &mut m,
+            vec![summary("a1", "0xabc", "10000000000000000", false)],
+        );
+        m.update(Msg::Open);
+        m.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
+            Box::new(Card {
+                id: "a1".to_owned(),
+                chain_id: 1,
+                to: "0xabc".to_owned(),
+                amount_wei: "10000000000000000".to_owned(),
+                decoded_call: None,
+                high_risk: false,
+                high_risk_reasons: vec![],
+                raw_data: "0x".to_owned(),
+                not_after_unix: NOW + 27,
+            }),
+        ))));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["amount", "0.01 ETH"]),
+            "the card leads with a human amount, not raw wei"
+        );
+    }
+
+    #[test]
+    fn a_plain_send_drops_the_decoded_call_noise() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false); // send, decoded_call: None
+        let screen = draw(&m, 100, 24);
+        assert!(
+            !screen.contains("decoded_call: (none)"),
+            "a plain send has nothing to decode — the noise line is gone"
+        );
+        assert!(
+            has_line_with(&draw_rows(&m, 100, 24), &["to", "0xabc"]),
+            "the recipient is still shown, in full"
+        );
     }
 
     #[test]

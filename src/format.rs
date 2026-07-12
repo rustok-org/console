@@ -69,10 +69,14 @@ mod tests {
 
     #[test]
     fn wei_to_eth_is_bignum_safe_past_u128() {
-        // 12.3456789012345678901234567890 ETH — exceeds u128, must not truncate.
+        // U256::MAX (78 digits) — well past u128::MAX (39 digits); the string math
+        // must format it exactly, digit-for-digit, with no truncation.
         assert_eq!(
-            wei_to_eth("123456789012345678901234567890"),
-            "123456789012.34567890123456789 ETH"
+            wei_to_eth(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+            ),
+            "115792089237316195423570985008687907853269984665640564039457.\
+             584007913129639935 ETH"
         );
     }
 
