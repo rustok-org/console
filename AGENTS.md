@@ -35,8 +35,13 @@ the money lives in `core/` (private). Управляющая спека арки
 5. **Default-deny.** Esc / Ctrl-C / timeout / lost TTY / panic → reject. The expiry
    countdown renders on the Reject button, not the Approve one.
 6. **PIN is masked** (`●●●`) and never echoed, logged, or persisted client-side.
-7. **UI → stderr, machine decision → stdout**; exit codes:
-   approved / rejected / expired / aborted / no-tty.
+7. **UI → stderr, machine decisions → stdout** — one JSON line per decision,
+   emitted only when stdout is **not** a TTY (interactively stdout shares the
+   terminal with the alternate screen and must stay silent). Exit codes report
+   the **session end** — aborted / no-tty / fatal / upgrade — keeping their
+   v0.1 values. The one-shot "exit code = decision" contract ended with
+   residency (Фаза 2 Этап 2); rationale:
+   `.claude/decisions/2026-07-12-invariant-7-decision-stream.md`.
 
 ## CI
 

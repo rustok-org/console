@@ -15,8 +15,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire protocol major version this client speaks.
-pub const PROTO_VERSION: u32 = 1;
+/// Wire protocol major version this client speaks. Proto 2 adds the auth-gated
+/// `context` read-op (protocol §3.7) — the source of the wallet's own address
+/// for the card's From→To block. There is deliberately no fallback to proto 1
+/// against an older server: the wallet image ships core and console as a pair,
+/// so a mismatch means a hand-built setup — the honest answer is the upgrade
+/// hint, not a silently poorer card (Gate-1 ratification, 2026-07-12).
+pub const PROTO_VERSION: u32 = 2;
 
 // ─────────────────────────── Requests (client → server) ───────────────────────────
 
@@ -55,6 +60,10 @@ pub enum Request<'a> {
         /// The item's preview-uuid.
         id: &'a str,
     },
+    /// Ask for the wallet's own address / balances / allowed chains
+    /// (proto 2+, auth-gated — protocol §3.7). Sent once after `auth`; the
+    /// address feeds the card's From→To block.
+    Context,
 }
 
 /// Serialize a request to a single JSON line (no trailing `\n`; the transport adds
@@ -211,6 +220,43 @@ pub enum GetOutcome {
     Card(Box<Card>),
     /// The id is not a live item (resolved, expired+swept, or never known).
     UnknownId,
+}
+
+/// One chain's native balance from `context` (protocol §3.7). `balance` is a
+/// **decimal** wei string (same convention as `amount_wei`), kept verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ChainBalance {
+    /// EVM chain id.
+    pub chain_id: u64,
+    /// Native token symbol (`"ETH"` for every chain in the allowed set).
+    pub symbol: String,
+    /// Native balance, decimal wei string.
+    pub balance: String,
+}
+
+/// The wallet's own context from a successful `context` reply (protocol §3.7).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WalletContext {
+    /// The wallet's (signer's) address, EIP-55 checksummed — same convention
+    /// as the card's top-level `to`, so From→To renders both verbatim.
+    pub address: String,
+    /// Per-chain native balances; a chain whose provider was unreachable is
+    /// omitted, not zeroed (best-effort, §3.7).
+    pub balances: Vec<ChainBalance>,
+    /// The server's configured chain allow-list, in order.
+    pub allowed_chains: Vec<u64>,
+}
+
+/// Outcome of `context`. Both non-`Ok` variants degrade the UI (the card falls
+/// back to its To-only layout) — they never gate approve: the From block is
+/// display-only, the signing-critical surface (`to`/amount/decode) does not
+/// depend on it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ContextOutcome {
+    /// The wallet's context.
+    Ok(Box<WalletContext>),
+    /// The core's own keyring isn't unlocked (distinct from PIN auth, §3.9).
+    WalletLocked,
 }
 
 /// The terminal state carried by an `already_resolved` reply (protocol §3.5).
@@ -416,6 +462,42 @@ pub fn parse_get(line: &str) -> Result<GetOutcome, ProtocolError> {
     }
 }
 
+/// Parse a response to `context` (proto 2+, protocol §3.7).
+///
+/// # Errors
+/// [`ProtocolError::Malformed`] on non-JSON / wrong shape / `ok` without the
+/// context fields; [`ProtocolError::Unexpected`] on an error code other than
+/// `wallet_locked` — `unauthorized`/`protocol_error` here mean the channel is
+/// not what we negotiated (we only send `context` post-auth on a proto-2
+/// session), the same fail-closed class as an unexpected resolve code.
+pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ok: bool,
+        address: Option<String>,
+        balances: Option<Vec<ChainBalance>>,
+        allowed_chains: Option<Vec<u64>>,
+        error: Option<String>,
+    }
+    let raw: Raw = parse_line(line)?;
+    if raw.ok {
+        let address = raw
+            .address
+            .ok_or_else(|| ProtocolError::Malformed("ok context without address".to_owned()))?;
+        Ok(ContextOutcome::Ok(Box::new(WalletContext {
+            address,
+            balances: raw.balances.unwrap_or_default(),
+            allowed_chains: raw.allowed_chains.unwrap_or_default(),
+        })))
+    } else if raw.error.as_deref() == Some("wallet_locked") {
+        Ok(ContextOutcome::WalletLocked)
+    } else {
+        Err(ProtocolError::Unexpected(raw.error.unwrap_or_else(|| {
+            "context without ok or error".to_owned()
+        })))
+    }
+}
+
 /// The fields an `approve` / `deny` reply may carry. `state` means the outcome
 /// (`executed`/`failed`/`denied`) on an `ok` reply, or the `already_resolved`
 /// state on an error reply.
@@ -534,13 +616,79 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            r#"{"op":"hello","proto":1,"client":"rustok-console/0.0.1"}"#
+            r#"{"op":"hello","proto":2,"client":"rustok-console/0.0.1"}"#
         );
     }
 
     #[test]
     fn encode_list_is_just_the_op() {
         assert_eq!(encode_request(&Request::List).unwrap(), r#"{"op":"list"}"#);
+    }
+
+    #[test]
+    fn encode_context_is_just_the_op() {
+        assert_eq!(
+            encode_request(&Request::Context).unwrap(),
+            r#"{"op":"context"}"#
+        );
+    }
+
+    #[test]
+    fn parse_context_carries_address_balances_and_chains() {
+        let line = r#"{"ok":true,"address":"0x742d35Cc6634C0532925a3b844Bc9e7595f2bD4e",
+            "balances":[{"chain_id":1,"symbol":"ETH","balance":"1000000000000000000"}],
+            "allowed_chains":[1,8453]}"#
+            .replace('\n', "");
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("ok context");
+        };
+        assert_eq!(ctx.address, "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD4e");
+        assert_eq!(ctx.balances.len(), 1);
+        assert_eq!(ctx.balances[0].chain_id, 1);
+        assert_eq!(ctx.balances[0].symbol, "ETH");
+        // decimal wei string, verbatim — never re-based here
+        assert_eq!(ctx.balances[0].balance, "1000000000000000000");
+        assert_eq!(ctx.allowed_chains, vec![1, 8453]);
+    }
+
+    #[test]
+    fn parse_context_tolerates_empty_balances() {
+        // Every chain's provider was unreachable: balances are omitted, not
+        // zeroed or errored (protocol §3.7) — the answer is still ok.
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[],"allowed_chains":[1]}"#;
+        let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
+            panic!("ok context");
+        };
+        assert!(ctx.balances.is_empty());
+    }
+
+    #[test]
+    fn parse_context_wallet_locked() {
+        let line = r#"{"ok":false,"error":"wallet_locked"}"#;
+        assert_eq!(parse_context(line).unwrap(), ContextOutcome::WalletLocked);
+    }
+
+    #[test]
+    fn parse_context_ok_without_address_is_malformed() {
+        // An `ok` that cannot feed the From block is a protocol violation,
+        // not a silent degradation.
+        let line = r#"{"ok":true,"balances":[],"allowed_chains":[1]}"#;
+        assert!(matches!(
+            parse_context(line),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_context_unauthorized_is_unexpected() {
+        // We only send `context` post-auth on a proto-2 session; the server
+        // disagreeing means the channel is not what we negotiated — the same
+        // fail-closed class as an unexpected resolve code (→ Fatal upstream).
+        let line = r#"{"ok":false,"error":"unauthorized"}"#;
+        assert!(matches!(
+            parse_context(line),
+            Err(ProtocolError::Unexpected(_))
+        ));
     }
 
     #[test]

@@ -1,12 +1,15 @@
-//! Rustok Console — terminal approval screen (the human face of the wallet).
+//! Rustok Console — resident terminal wallet screen (the human face).
 //!
-//! v0.1: connect → hello → PIN → watch the queue → approve or deny. Keys are
-//! mapped to [`Msg`] and folded into the [`Model`]; the socket worker runs on its
-//! own thread so a slow core never freezes the UI. UI goes to stderr (ratatui's
-//! alternate screen), the machine-readable decision goes to stdout, and the exit
-//! code carries the outcome (invariant #7).
+//! v0.2: connect → hello → PIN → live on the queue — approve/deny returns to
+//! the queue (the console no longer exits per decision). Keys are mapped to
+//! [`Msg`] and folded into the [`Model`]; the socket worker runs on its own
+//! thread so a slow core never freezes the UI. UI goes to stderr (ratatui's
+//! alternate screen); machine decisions go to stdout as one JSON line each,
+//! emitted only when stdout is not a TTY (invariant #7, ADR
+//! `2026-07-12-invariant-7-decision-stream`); the exit code reports how the
+//! session ended (aborted / no-tty / fatal / upgrade).
 
-use std::io::{self, IsTerminal, Stderr};
+use std::io::{self, IsTerminal, Stderr, Write as _};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,8 +23,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use rustok_console::app::{ExitOutcome, Model, Msg, Phase};
-use rustok_console::protocol::ResolveOutcome;
+use rustok_console::app::{Decision, DecisionKind, Model, Msg, Phase};
 use rustok_console::transport::{Transport, TransportError};
 use rustok_console::ui;
 
@@ -38,21 +40,17 @@ const POLL: Duration = Duration::from_millis(2500);
 /// must repaint far more often than the `list` poll.
 const FRAME: Duration = Duration::from_millis(250);
 
-// Exit codes (AGENTS.md #7) — each decision outcome is distinguishable.
-/// The transaction was signed and broadcast.
-const EXIT_APPROVED: u8 = 0;
-/// The connection broke, or an approved transaction failed to broadcast — no money
-/// moved and the reason is on the screen.
+// Exit codes (AGENTS.md #7) — the session's end, not a decision: decisions
+// stream to a non-TTY stdout as JSON lines (ADR 2026-07-12).
+/// The connection broke, or the terminal could not be drawn — the reason is on
+/// the screen.
 const EXIT_FATAL: u8 = 1;
 /// The server speaks a protocol major this build does not.
 const EXIT_UPGRADE: u8 = 2;
 /// No interactive terminal: an approval may never come from a pipe (invariant #4).
 const EXIT_NO_TTY: u8 = 3;
-/// A human said no.
-const EXIT_REJECTED: u8 = 4;
-/// The deadline passed before a decision.
-const EXIT_EXPIRED: u8 = 5;
-/// Quit from the queue without deciding anything.
+/// Quit from the queue (the resident session's normal end). Keeps its v0.1
+/// value — the four surviving codes are preserved, not renumbered (Gate-1).
 const EXIT_ABORTED: u8 = 6;
 
 fn main() -> ExitCode {
@@ -74,20 +72,14 @@ fn main() -> ExitCode {
     };
 
     let transport = Transport::connect(&path);
-    let (code, decision) = run(terminal, &transport);
-    restore_then_announce(|| drop(restore()), decision.as_deref(), &mut io::stdout());
+    // Decisions stream to stdout only when it is NOT a TTY: interactively
+    // (docker exec -it) stdout is the same terminal the alternate screen owns,
+    // and a mid-session write would land on top of the TUI frame. A piped
+    // caller gets one JSON line per decision, as the decisions happen.
+    let stream_decisions = !io::stdout().is_terminal();
+    let code = run(terminal, &transport, stream_decisions);
+    let _ = restore();
     ExitCode::from(code)
-}
-
-/// Leave the terminal, THEN speak on stdout — in that order and no other: the
-/// decision line must never share stdout's airtime with alternate-screen escape
-/// sequences a caller could capture (invariant #7). The order lives in this one
-/// function so a test can pin it.
-fn restore_then_announce(restore: impl FnOnce(), decision: Option<&str>, out: &mut impl io::Write) {
-    restore();
-    if let Some(decision) = decision {
-        let _ = writeln!(out, "{decision}");
-    }
 }
 
 /// Set up the terminal on **stderr** (raw mode + alternate screen) and install a
@@ -120,10 +112,11 @@ fn set_panic_hook() {
     }));
 }
 
-/// The event loop: draw, read input, drain worker replies, tick the poll. Returns
-/// the exit code and, once an item is terminal, the machine-readable decision.
+/// The event loop: draw, read input, drain worker replies, tick the poll. The
+/// resident console leaves only on quit or a dead connection; each terminal
+/// decision is streamed to stdout as it happens (when stdout is not a TTY).
 /// A `Fatal` phase is shown until a keypress, then exits.
-fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
+fn run(mut terminal: Tui, transport: &Transport, stream_decisions: bool) -> u8 {
     let mut model = Model::new();
     let mut last_tick = Instant::now();
 
@@ -144,24 +137,13 @@ fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
             .draw(|f| ui::render(f, &model, now_unix()))
             .is_err()
         {
-            return (EXIT_FATAL, None);
+            return EXIT_FATAL;
         }
 
-        match model.phase() {
-            Phase::Fatal(err) => {
-                let code = fatal_code(err);
-                wait_for_key();
-                return (code, None);
-            }
-            // The item is terminal: show the answer, then carry it out in both the
-            // exit code and the decision line.
-            Phase::Resolved { outcome, exit } => {
-                let code = exit_code(*exit);
-                let decision = decision_line(outcome, *exit);
-                wait_for_key();
-                return (code, Some(decision));
-            }
-            _ => {}
+        if let Phase::Fatal(err) = model.phase() {
+            let code = fatal_code(err);
+            wait_for_key();
+            return code;
         }
 
         // The deadline says no on its own (`AGENTS.md` #5). `Msg::Expire` denies the
@@ -194,13 +176,20 @@ fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
                 _ => {}
             },
             Ok(false) => {}
-            Err(_) => return (EXIT_FATAL, None),
+            Err(_) => return EXIT_FATAL,
         }
 
-        // Drain everything the worker has answered since the last pass.
+        // Drain everything the worker has answered since the last pass; stream
+        // each terminal decision the moment its answer lands (invariant #7 —
+        // one JSON line per decision, non-TTY stdout only).
         while let Some(reply) = transport.try_recv() {
             if let Some(req) = model.update(Msg::Reply(reply)) {
                 transport.send(req);
+            }
+            if let Some(decision) = model.take_decision()
+                && stream_decisions
+            {
+                let _ = writeln!(io::stdout(), "{}", decision_line(&decision));
             }
         }
 
@@ -212,7 +201,7 @@ fn run(mut terminal: Tui, transport: &Transport) -> (u8, Option<String>) {
         }
 
         if model.should_quit() {
-            return (EXIT_ABORTED, None);
+            return EXIT_ABORTED;
         }
     }
 }
@@ -233,18 +222,34 @@ fn deadline_passed(phase: &Phase, now_unix: u64) -> bool {
 /// money**, and carries a detail only when we actually know it: an item another
 /// session executed comes back as `approved` with no hash, because the hash was
 /// never ours to report.
-fn decision_line(outcome: &ResolveOutcome, exit: ExitOutcome) -> String {
-    let value = match (exit, outcome) {
-        (ExitOutcome::Approved, ResolveOutcome::Executed { tx_hash }) => {
-            json!({ "decision": "approved", "tx_hash": tx_hash })
-        }
-        (ExitOutcome::Approved, _) => json!({ "decision": "approved" }),
-        (ExitOutcome::Rejected, _) => json!({ "decision": "rejected" }),
-        (ExitOutcome::Expired, _) => json!({ "decision": "expired" }),
-        (ExitOutcome::Failed, ResolveOutcome::Failed { reason }) => {
-            json!({ "decision": "failed", "reason": reason })
-        }
-        (ExitOutcome::Failed, _) => json!({ "decision": "failed" }),
+fn decision_line(decision: &Decision) -> String {
+    let value = match decision {
+        Decision {
+            kind: DecisionKind::Approved,
+            tx_hash: Some(tx_hash),
+            ..
+        } => json!({ "decision": "approved", "tx_hash": tx_hash }),
+        Decision {
+            kind: DecisionKind::Approved,
+            ..
+        } => json!({ "decision": "approved" }),
+        Decision {
+            kind: DecisionKind::Rejected,
+            ..
+        } => json!({ "decision": "rejected" }),
+        Decision {
+            kind: DecisionKind::Expired,
+            ..
+        } => json!({ "decision": "expired" }),
+        Decision {
+            kind: DecisionKind::Failed,
+            reason: Some(reason),
+            ..
+        } => json!({ "decision": "failed", "reason": reason }),
+        Decision {
+            kind: DecisionKind::Failed,
+            ..
+        } => json!({ "decision": "failed" }),
     };
     value.to_string()
 }
@@ -278,17 +283,6 @@ fn fatal_code(err: &TransportError) -> u8 {
     }
 }
 
-/// The decision the process exits with. A `failed` execution is not an approval a
-/// caller can act on — the transaction never made it out — so it exits fatal.
-fn exit_code(exit: ExitOutcome) -> u8 {
-    match exit {
-        ExitOutcome::Approved => EXIT_APPROVED,
-        ExitOutcome::Rejected => EXIT_REJECTED,
-        ExitOutcome::Expired => EXIT_EXPIRED,
-        ExitOutcome::Failed => EXIT_FATAL,
-    }
-}
-
 /// Map a key press to a message, given the current phase. Returns `None` for keys
 /// with no meaning in that phase.
 fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
@@ -306,9 +300,9 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
         });
     }
     match phase {
-        // Waiting for the handshake / showing a terminal screen: no interactive keys
+        // Waiting for the handshake / showing a fatal screen: no interactive keys
         // (both are handled by `wait_for_key`).
-        Phase::Connecting | Phase::Fatal(_) | Phase::Resolved { .. } => None,
+        Phase::Connecting | Phase::Fatal(_) => None,
         Phase::Authing { .. } => match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() => Some(Msg::PinDigit(c)),
             KeyCode::Backspace => Some(Msg::PinBackspace),
@@ -353,7 +347,7 @@ mod tests {
     use super::*;
     use rustok_console::app::Pin;
     use rustok_console::protocol::{
-        AuthOutcome, Card, GetOutcome, Kind, Risk, Summary, TerminalState,
+        AuthOutcome, Card, ContextOutcome, GetOutcome, Kind, Risk, Summary, WalletContext,
     };
     use rustok_console::transport::Reply;
 
@@ -373,7 +367,7 @@ mod tests {
             items: vec![],
             selected: 0,
             confirm: None,
-            note: None,
+            notice: None,
         }
     }
 
@@ -395,7 +389,17 @@ mod tests {
         }));
         m.update(Msg::PinDigit('1'));
         m.update(Msg::PinSubmit);
-        m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        assert!(matches!(
+            m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok))),
+            Some(rustok_console::transport::Request::Context)
+        ));
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb".to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+            },
+        )))));
         m.update(Msg::Tick);
         m.update(Msg::Reply(Reply::List(vec![Summary {
             id: "a".to_owned(),
@@ -486,23 +490,14 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_distinguishes_every_decision() {
-        assert_eq!(exit_code(ExitOutcome::Approved), EXIT_APPROVED);
-        assert_eq!(exit_code(ExitOutcome::Rejected), EXIT_REJECTED);
-        assert_eq!(exit_code(ExitOutcome::Expired), EXIT_EXPIRED);
-        assert_eq!(exit_code(ExitOutcome::Failed), EXIT_FATAL);
-        // Every process outcome a caller can see must be pairwise distinct
-        // (invariant #7) — reusing a code would let one outcome impersonate
-        // another, `approved` worst of all.
-        let codes = [
-            EXIT_APPROVED,
-            EXIT_FATAL,
-            EXIT_UPGRADE,
-            EXIT_NO_TTY,
-            EXIT_REJECTED,
-            EXIT_EXPIRED,
-            EXIT_ABORTED,
-        ];
+    fn session_exit_codes_stay_distinct_and_keep_their_v01_values() {
+        // The four surviving codes are preserved, not renumbered (Gate-1):
+        // a caller of v0.1 that only handled session ends keeps working.
+        assert_eq!(EXIT_FATAL, 1);
+        assert_eq!(EXIT_UPGRADE, 2);
+        assert_eq!(EXIT_NO_TTY, 3);
+        assert_eq!(EXIT_ABORTED, 6);
+        let codes = [EXIT_FATAL, EXIT_UPGRADE, EXIT_NO_TTY, EXIT_ABORTED];
         for (i, a) in codes.iter().enumerate() {
             for b in &codes[i + 1..] {
                 assert_ne!(a, b, "exit codes must never collide");
@@ -511,47 +506,26 @@ mod tests {
     }
 
     #[test]
-    fn the_decision_speaks_only_after_the_terminal_is_restored() {
-        use std::cell::Cell;
-
-        struct OrderProbe<'a> {
-            restored: &'a Cell<bool>,
-            buf: Vec<u8>,
-        }
-        impl io::Write for OrderProbe<'_> {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                assert!(
-                    self.restored.get(),
-                    "the decision line must never race the alternate-screen \
-                     escapes (invariant #7)"
-                );
-                self.buf.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let restored = Cell::new(false);
-        let mut probe = OrderProbe {
-            restored: &restored,
-            buf: Vec::new(),
-        };
-        restore_then_announce(
-            || restored.set(true),
-            Some(r#"{"decision":"approved"}"#),
-            &mut probe,
+    fn a_decision_is_drained_from_the_model_exactly_once() {
+        // The run loop drains `take_decision` after every reply and streams
+        // one JSON line per decision (non-TTY stdout only). The drain contract
+        // lives on the model: exactly one Decision per terminal answer.
+        let mut m = confirming(false);
+        m.update(Msg::Approve);
+        m.update(Msg::Reply(Reply::Resolve(
+            rustok_console::protocol::ResolveOutcome::Executed {
+                tx_hash: "0xabc".to_owned(),
+            },
+        )));
+        let d = m.take_decision().expect("one decision per terminal answer");
+        assert_eq!(
+            decision_line(&d),
+            r#"{"decision":"approved","tx_hash":"0xabc"}"#
         );
-        assert_eq!(probe.buf, b"{\"decision\":\"approved\"}\n");
-
-        // And nothing is written at all when there is no decision.
-        let mut probe = OrderProbe {
-            restored: &restored,
-            buf: Vec::new(),
-        };
-        restore_then_announce(|| restored.set(true), None, &mut probe);
-        assert!(probe.buf.is_empty());
+        assert!(
+            m.take_decision().is_none(),
+            "a second drain must not re-emit the same decision line"
+        );
     }
 
     #[test]
@@ -593,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn connecting_fatal_and_resolved_ignore_ordinary_keys() {
+    fn connecting_and_fatal_ignore_ordinary_keys() {
         assert!(map_key(&key(KeyCode::Enter), &Phase::Connecting).is_none());
         assert!(map_key(&key(KeyCode::Char('x')), &Phase::Connecting).is_none());
         assert!(
@@ -602,17 +576,6 @@ mod tests {
                 &Phase::Fatal(TransportError::ConnectionLost)
             )
             .is_none()
-        );
-        assert!(
-            map_key(
-                &key(KeyCode::Char('y')),
-                &Phase::Resolved {
-                    outcome: rustok_console::protocol::ResolveOutcome::Denied,
-                    exit: ExitOutcome::Rejected,
-                }
-            )
-            .is_none(),
-            "a resolved item can no longer be approved"
         );
     }
 
@@ -649,42 +612,47 @@ mod tests {
     #[test]
     fn the_decision_line_names_what_happened_to_the_money() {
         assert_eq!(
-            decision_line(
-                &ResolveOutcome::Executed {
-                    tx_hash: "0xabc".to_owned()
-                },
-                ExitOutcome::Approved
-            ),
+            decision_line(&Decision {
+                kind: DecisionKind::Approved,
+                tx_hash: Some("0xabc".to_owned()),
+                reason: None,
+            }),
             r#"{"decision":"approved","tx_hash":"0xabc"}"#
         );
         assert_eq!(
-            decision_line(&ResolveOutcome::Denied, ExitOutcome::Rejected),
+            decision_line(&Decision {
+                kind: DecisionKind::Rejected,
+                tx_hash: None,
+                reason: None,
+            }),
             r#"{"decision":"rejected"}"#
         );
         // The same server answer, denied by the deadline rather than by a human.
         assert_eq!(
-            decision_line(&ResolveOutcome::Denied, ExitOutcome::Expired),
+            decision_line(&Decision {
+                kind: DecisionKind::Expired,
+                tx_hash: None,
+                reason: None,
+            }),
             r#"{"decision":"expired"}"#
         );
         assert_eq!(
-            decision_line(
-                &ResolveOutcome::Failed {
-                    reason: "nonce too low".to_owned()
-                },
-                ExitOutcome::Failed
-            ),
+            decision_line(&Decision {
+                kind: DecisionKind::Failed,
+                tx_hash: None,
+                reason: Some("nonce too low".to_owned()),
+            }),
             r#"{"decision":"failed","reason":"nonce too low"}"#
         );
     }
 
     #[test]
     fn an_approval_by_another_session_reports_no_hash_we_never_saw() {
-        let line = decision_line(
-            &ResolveOutcome::AlreadyResolved {
-                state: TerminalState::Executed,
-            },
-            ExitOutcome::Approved,
-        );
+        let line = decision_line(&Decision {
+            kind: DecisionKind::Approved,
+            tx_hash: None,
+            reason: None,
+        });
 
         assert_eq!(line, r#"{"decision":"approved"}"#);
         assert!(
@@ -696,12 +664,11 @@ mod tests {
     #[test]
     fn the_decision_line_survives_a_hostile_server_reason() {
         // `reason` is server-controlled text landing on a caller's stdout.
-        let line = decision_line(
-            &ResolveOutcome::Failed {
-                reason: "\"}\n{\"decision\":\"approved\"".to_owned(),
-            },
-            ExitOutcome::Failed,
-        );
+        let line = decision_line(&Decision {
+            kind: DecisionKind::Failed,
+            tx_hash: None,
+            reason: Some("\"}\n{\"decision\":\"approved\"".to_owned()),
+        });
 
         assert!(
             !line.contains('\n'),

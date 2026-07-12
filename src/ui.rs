@@ -9,8 +9,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{AuthError, Confirm, ExitOutcome, Model, Phase, ResolveError};
-use crate::protocol::{Card, ResolveOutcome, Summary};
+use crate::app::{AuthError, Confirm, DecisionKind, Model, Notice, Phase, ResolveError};
+use crate::protocol::{Card, Summary};
 use crate::{format, theme};
 
 /// Render the whole screen for the current model.
@@ -27,38 +27,53 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
             items,
             selected,
             confirm,
-            note,
+            notice,
         } => render_watch(
             frame,
             items,
             *selected,
             confirm.as_deref(),
-            note.as_deref(),
+            notice.as_ref(),
+            model.wallet_address(),
             now_unix,
         ),
-        Phase::Resolved { outcome, exit } => render_centered(frame, &resolved_text(outcome, *exit)),
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
 }
 
-/// The terminal answer, shown verbatim before the console exits.
-fn resolved_text(outcome: &ResolveOutcome, exit: ExitOutcome) -> String {
-    let detail = match outcome {
-        ResolveOutcome::Executed { tx_hash } => format!("executed — {tx_hash}"),
-        ResolveOutcome::Failed { reason } => format!("execution failed — {reason}"),
-        ResolveOutcome::Denied => "denied".to_owned(),
-        ResolveOutcome::AlreadyResolved { state } => {
-            format!("already resolved by someone else ({state:?})")
+/// The transient notice line — the resident console's replacement for the old
+/// exit-with-outcome screen. Styled by weight: a lockout in the high-risk
+/// amber, a decision outcome in its semantic color, a plain note unstyled.
+fn notice_line(notice: &Notice) -> Line<'static> {
+    match notice {
+        Notice::Locked { retry_after_s } => {
+            let text = match retry_after_s {
+                // Only *pending* items are denied by the fail-closed drop — an
+                // item already executing is untouched (protocol §4), so this
+                // text must not bury a live signature.
+                Some(s) => format!("PIN locked — pending items were denied. Retry in ~{s}s."),
+                None => "PIN locked — pending items were denied.".to_owned(),
+            };
+            Line::from(Span::styled(text, theme::high_risk_style()))
         }
-        other => format!("{other:?}"),
-    };
-    let headline = match exit {
-        ExitOutcome::Approved => "APPROVED",
-        ExitOutcome::Rejected => "REJECTED",
-        ExitOutcome::Expired => "EXPIRED",
-        ExitOutcome::Failed => "FAILED",
-    };
-    format!("{headline}\n\n{detail}\n\nPress any key to close.")
+        Notice::Outcome { kind, detail } => {
+            let (headline, color) = match kind {
+                DecisionKind::Approved => ("APPROVED", theme::approve()),
+                DecisionKind::Rejected => ("REJECTED", theme::reject()),
+                DecisionKind::Expired => ("EXPIRED", theme::high_risk()),
+                DecisionKind::Failed => ("FAILED", theme::reject()),
+            };
+            let text = match detail {
+                Some(d) => format!("{headline} — {d}"),
+                None => headline.to_owned(),
+            };
+            Line::from(Span::styled(
+                text,
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ))
+        }
+        Notice::Note(text) => Line::from(text.clone()),
+    }
 }
 
 /// A framed panel in the brand palette: soft border, accent title. One helper so
@@ -147,10 +162,11 @@ fn render_watch(
     items: &[Summary],
     selected: usize,
     confirm: Option<&Confirm>,
-    note: Option<&str>,
+    notice: Option<&Notice>,
+    wallet: Option<&str>,
     now_unix: u64,
 ) {
-    let chunks = watch_chunks(frame.area(), confirm.is_some(), note.is_some());
+    let chunks = watch_chunks(frame.area(), confirm.is_some(), notice.is_some());
 
     frame.render_widget(
         Paragraph::new(format!(" Pending approvals: {}", items.len())),
@@ -158,14 +174,14 @@ fn render_watch(
     );
 
     render_queue(frame, items, selected, chunks[1]);
-    render_detail(frame, confirm, chunks[2]);
+    render_detail(frame, confirm, wallet, chunks[2]);
     // The same fit the model gates approve on (`priority_fields_fit`), taken
     // from the very chunk the card is drawn into.
-    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, chunks[2]));
+    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, wallet, chunks[2]));
     render_actions(frame, confirm, approve_ok, now_unix, chunks[3]);
 
-    if let Some(note) = note {
-        frame.render_widget(Paragraph::new(note), chunks[4]);
+    if let Some(notice) = notice {
+        frame.render_widget(Paragraph::new(notice_line(notice)), chunks[4]);
     }
 }
 
@@ -307,7 +323,7 @@ fn kind_word(s: &Summary) -> &'static str {
 /// arithmetic downstream is exact. One source for the renderer AND for
 /// [`priority_fields_fit`]: the approve gate can never disagree with what is
 /// actually drawn.
-fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
+fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let card: &Card = confirm.card();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -327,6 +343,28 @@ fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
     // Addresses are shown in FULL, verbatim — never shortened. A clear-signing
     // card is where the human verifies exactly WHO receives funds; a `0x1234…abcd`
     // ellipsis would hide an address-poisoning look-alike (`AGENTS.md` #1).
+    //
+    // With the wallet's own address known (`context`, proto 2) the card reads
+    // as a two-block From→To flow — stacked vertically, INSIDE the priority
+    // lines, so the fit gate counts every row of it (a side-by-side layout
+    // would live outside `priority_lines` and the gate could not see it).
+    // Without it (the read-op degraded) the card falls back to the To-only
+    // layout — the From block is display-only and never gates approve.
+    if let Some(from) = from {
+        push_wrapped(
+            &mut lines,
+            width,
+            "from  your wallet".to_owned(),
+            theme::label_style(),
+        );
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("      {from}"),
+            Style::new().fg(theme::ink()),
+        );
+        push_wrapped(&mut lines, width, "  ↓".to_owned(), theme::label_style());
+    }
     push_wrapped(
         &mut lines,
         width,
@@ -404,9 +442,9 @@ fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Whether the card's priority lines fit its inner area.
-fn card_priority_fits(confirm: &Confirm, area: ratatui::layout::Rect) -> bool {
+fn card_priority_fits(confirm: &Confirm, from: Option<&str>, area: ratatui::layout::Rect) -> bool {
     let inner = Block::bordered().inner(area);
-    priority_lines(confirm, usize::from(inner.width)).len() <= usize::from(inner.height)
+    priority_lines(confirm, from, usize::from(inner.width)).len() <= usize::from(inner.height)
 }
 
 /// The approve gate: can a `width`×`height` terminal show every priority field
@@ -419,10 +457,10 @@ fn card_priority_fits(confirm: &Confirm, area: ratatui::layout::Rect) -> bool {
 /// `has_note` is `false` by construction: a note and an open confirmation never
 /// coexist (`apply_get`/`apply_resolve` set one while clearing the other).
 #[must_use]
-pub fn priority_fields_fit(confirm: &Confirm, width: u16, height: u16) -> bool {
+pub fn priority_fields_fit(confirm: &Confirm, from: Option<&str>, width: u16, height: u16) -> bool {
     let area = ratatui::layout::Rect::new(0, 0, width, height);
     let chunks = watch_chunks(area, true, false);
-    card_priority_fits(confirm, chunks[2])
+    card_priority_fits(confirm, from, chunks[2])
 }
 
 /// Render the open confirmation's card — the core's fields **verbatim**, no
@@ -435,7 +473,12 @@ pub fn priority_fields_fit(confirm: &Confirm, width: u16, height: u16) -> bool {
 /// the priority fields alone cannot fit (a terminal below ~24 rows, or
 /// pathological server data), the card says so with a banner and the approve
 /// path is gated off ([`priority_fields_fit`]) until the terminal grows.
-fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::layout::Rect) {
+fn render_detail(
+    frame: &mut Frame,
+    confirm: Option<&Confirm>,
+    from: Option<&str>,
+    area: ratatui::layout::Rect,
+) {
     let block = themed_block(" Card ");
     let Some(confirm) = confirm else {
         let hint =
@@ -448,7 +491,7 @@ fn render_detail(frame: &mut Frame, confirm: Option<&Confirm>, area: ratatui::la
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
 
-    let mut lines = priority_lines(confirm, width);
+    let mut lines = priority_lines(confirm, from, width);
     if lines.len() > height {
         // The card cannot show what the human must read; approve is gated off
         // (`priority_fields_fit` — the model refuses `y` and PIN submits). The
@@ -585,7 +628,6 @@ fn resolve_error_text(err: &ResolveError) -> String {
     match err {
         ResolveError::PinRequired => "This approval needs your PIN.".to_owned(),
         ResolveError::BadPin(left) => format!("Wrong PIN — {left} attempt(s) left."),
-        ResolveError::Locked(secs) => format!("Locked out. Try again in {secs}s."),
         ResolveError::NotSet => "This wallet has no PIN set (run set-pin).".to_owned(),
         ResolveError::Unavailable => "PIN check unavailable — try again.".to_owned(),
         ResolveError::Busy => "Another approval is executing this request — retry.".to_owned(),
@@ -607,7 +649,9 @@ fn push_opt(lines: &mut Vec<Line<'static>>, width: usize, key: &str, value: Opti
 mod tests {
     use super::*;
     use crate::app::{Model, Msg};
-    use crate::protocol::{AuthOutcome, Card, DecodedCall, Kind, Risk};
+    use crate::protocol::{
+        AuthOutcome, Card, ContextOutcome, DecodedCall, Kind, Risk, WalletContext,
+    };
     use crate::transport::Reply;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -688,6 +732,10 @@ mod tests {
         }
     }
 
+    /// The wallet's own address in tests — full-length, so the From block
+    /// exercises real wrapping.
+    const WALLET: &str = "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb";
+
     fn to_watching(model: &mut Model, items: Vec<Summary>) {
         // The size report main sends at startup — a standard 80×24 terminal.
         model.update(Msg::Resize {
@@ -700,6 +748,32 @@ mod tests {
         model.update(Msg::PinDigit('1'));
         model.update(Msg::PinSubmit);
         model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        // the everyday session: the context lands right after auth
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+            },
+        )))));
+        model.update(Msg::Tick);
+        model.update(Msg::Reply(Reply::List(items)));
+    }
+
+    /// A session whose `context` degraded (`wallet_locked`): the card falls
+    /// back to the To-only layout of Phase 1.
+    fn to_watching_no_context(model: &mut Model, items: Vec<Summary>) {
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        model.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        model.update(Msg::PinDigit('1'));
+        model.update(Msg::PinSubmit);
+        model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
         model.update(Msg::Tick);
         model.update(Msg::Reply(Reply::List(items)));
     }
@@ -1207,17 +1281,97 @@ mod tests {
     }
 
     #[test]
-    fn the_resolved_screen_names_the_outcome_and_shows_the_tx_hash() {
+    fn the_outcome_notice_names_the_decision_and_shows_the_tx_hash() {
+        // Resident: the decision renders as a notice on the still-living
+        // queue screen, not as a terminal screen.
         let mut m = Model::new();
         open_card(&mut m, "a1", NOW + 27, false);
         m.update(Msg::Approve);
-        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Executed {
-            tx_hash: "0xfeed".to_owned(),
-        })));
+        m.update(Msg::Reply(Reply::Resolve(
+            crate::protocol::ResolveOutcome::Executed {
+                tx_hash: "0xfeed".to_owned(),
+            },
+        )));
 
-        let screen = draw(&m, 80, 12);
+        let screen = draw(&m, 80, 24);
 
         assert!(screen.contains("APPROVED"));
         assert!(screen.contains("0xfeed"), "the tx hash is shown verbatim");
+        assert!(
+            screen.contains("Pending approvals"),
+            "the queue screen is still alive behind the notice"
+        );
+    }
+
+    #[test]
+    fn the_lockout_notice_counts_down_and_names_the_fail_closed_denies() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, true);
+        m.update(Msg::Approve); // opens the PIN prompt
+        m.update(Msg::PinDigit('1'));
+        m.update(Msg::PinSubmit);
+        m.update(Msg::Reply(Reply::Resolve(
+            crate::protocol::ResolveOutcome::Locked { retry_after_s: 300 },
+        )));
+
+        let screen = draw(&m, 80, 24);
+
+        assert!(screen.contains("PIN locked"));
+        assert!(
+            screen.contains("pending items were denied"),
+            "only PENDING items are denied by the fail-closed drop (§4) — an \
+             executing item is untouched, and the text must not bury it"
+        );
+        assert!(screen.contains("~300s"));
+    }
+
+    #[test]
+    fn the_card_shows_a_two_block_from_to_flow_with_full_addresses() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+
+        let rows = draw_rows(&m, 80, 24);
+
+        assert!(
+            has_line_with(&rows, &["from", "your wallet"]),
+            "the From block names the wallet"
+        );
+        assert!(
+            has_line_with(&rows, &[WALLET]),
+            "the wallet address renders in FULL, verbatim — address-poisoning \
+             hides in shortened addresses"
+        );
+        assert!(has_line_with(&rows, &["to", "0xabc"]));
+    }
+
+    #[test]
+    fn a_degraded_context_falls_back_to_the_to_only_card() {
+        let mut m = Model::new();
+        to_watching_no_context(&mut m, vec![summary("a1", "0xabc", "5", false)]);
+        m.update(Msg::Open);
+        m.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(
+            Box::new(Card {
+                id: "a1".to_owned(),
+                chain_id: 1,
+                to: "0xabc".to_owned(),
+                amount_wei: "5".to_owned(),
+                decoded_call: None,
+                high_risk: false,
+                high_risk_reasons: vec![],
+                raw_data: "0x".to_owned(),
+                not_after_unix: NOW + 27,
+            }),
+        ))));
+
+        let rows = draw_rows(&m, 80, 24);
+
+        assert!(
+            !has_line_with(&rows, &["your wallet"]),
+            "no From block without the wallet context"
+        );
+        assert!(has_line_with(&rows, &["to", "0xabc"]));
+        // The display degraded — approve must NOT be gated on it.
+        let row = action_row(&rows);
+        assert!(row.contains("Approve"));
     }
 }
