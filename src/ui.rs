@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AuthError, Confirm, ExitOutcome, Model, Phase, ResolveError};
 use crate::protocol::{Card, ResolveOutcome, Summary};
+use crate::{format, theme};
 
 /// Render the whole screen for the current model.
 ///
@@ -274,49 +275,70 @@ fn kind_word(s: &Summary) -> &'static str {
 /// actually drawn.
 fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
     let card: &Card = confirm.card();
-    let bold = Style::new().add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    push_wrapped(&mut lines, width, format!("to: {}", card.to), Style::new());
+
+    // Native value, human-first: `10000000000000000` reads as `0.01 ETH`. A token
+    // op sends `0` native wei with the real amount in `decoded_call` (below), so a
+    // zero native value is NOT headlined as "0 ETH" — the decoded call carries the
+    // movement (e.g. an unlimited approval must not look like it moves nothing).
+    if !format::is_zero_wei(&card.amount_wei) {
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("amount  {}", format::wei_to_eth(&card.amount_wei)),
+            theme::heading_style(),
+        );
+    }
+    // Addresses are shown in FULL, verbatim — never shortened. A clear-signing
+    // card is where the human verifies exactly WHO receives funds; a `0x1234…abcd`
+    // ellipsis would hide an address-poisoning look-alike (`AGENTS.md` #1).
     push_wrapped(
         &mut lines,
         width,
-        format!("amount_wei: {}", card.amount_wei),
-        Style::new(),
+        format!("to  {}", card.to),
+        Style::new().fg(theme::accent_bright()),
     );
     push_wrapped(
         &mut lines,
         width,
-        format!("chain_id: {}", card.chain_id),
-        Style::new(),
+        format!("chain  {}", card.chain_id),
+        theme::label_style(),
     );
     if card.high_risk {
         push_wrapped(
             &mut lines,
             width,
-            format!("HIGH RISK: {}", card.high_risk_reasons.join(", ")),
-            bold,
+            format!("⚠ HIGH RISK  {}", card.high_risk_reasons.join(", ")),
+            theme::high_risk_style(),
         );
     }
-    match &card.decoded_call {
-        None => lines.push(Line::from("decoded_call: (none)")),
-        Some(dc) => {
+    // A plain send has nothing to decode — the old "decoded_call: (none)" line was
+    // noise, so it is dropped. A contract call keeps every decoded field: WHO is
+    // authorized (spender/operator/from/to/token) is the point of the card.
+    if let Some(dc) = &card.decoded_call {
+        // Label convention matches `push_opt` (`decoded_call.<field>`) so the method
+        // reads as one of the decoded fields, just emphasized.
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("decoded_call.method: {}", dc.method),
+            theme::heading_style(),
+        );
+        push_opt(&mut lines, width, "spender", dc.spender.as_deref());
+        push_opt(&mut lines, width, "operator", dc.operator.as_deref());
+        push_opt(&mut lines, width, "from", dc.from.as_deref());
+        push_opt(&mut lines, width, "to", dc.to.as_deref());
+        push_opt(&mut lines, width, "token", dc.token.as_deref());
+        push_opt(&mut lines, width, "amount", dc.amount.as_deref());
+        push_opt(&mut lines, width, "deadline", dc.deadline.as_deref());
+        if dc.is_unlimited == Some(true) {
             push_wrapped(
                 &mut lines,
                 width,
-                format!("decoded_call.method: {}", dc.method),
-                Style::new(),
+                "amount  UNLIMITED".to_owned(),
+                theme::high_risk_style(),
             );
-            push_opt(&mut lines, width, "spender", dc.spender.as_deref());
-            push_opt(&mut lines, width, "operator", dc.operator.as_deref());
-            push_opt(&mut lines, width, "from", dc.from.as_deref());
-            push_opt(&mut lines, width, "to", dc.to.as_deref());
-            push_opt(&mut lines, width, "token", dc.token.as_deref());
-            push_opt(&mut lines, width, "amount", dc.amount.as_deref());
-            push_opt(&mut lines, width, "deadline", dc.deadline.as_deref());
-            if dc.is_unlimited == Some(true) {
-                push_wrapped(&mut lines, width, "amount: UNLIMITED".to_owned(), bold);
-            }
         }
     }
     if let Some(pin_len) = confirm.pin_len() {
@@ -325,14 +347,24 @@ fn priority_lines(confirm: &Confirm, width: usize) -> Vec<Line<'static>> {
             &mut lines,
             width,
             "High-risk approval — enter your PIN:".to_owned(),
-            Style::new(),
+            theme::value_style(),
         );
         // Only the count is shown — never the digits.
-        push_wrapped(&mut lines, width, "●".repeat(pin_len), bold);
+        push_wrapped(
+            &mut lines,
+            width,
+            "●".repeat(pin_len),
+            theme::high_risk_style(),
+        );
     }
     if let Some(err) = confirm.error() {
         lines.push(Line::from(""));
-        push_wrapped(&mut lines, width, resolve_error_text(err), Style::new());
+        push_wrapped(
+            &mut lines,
+            width,
+            resolve_error_text(err),
+            Style::new().fg(theme::reject()),
+        );
     }
     lines
 }
@@ -1014,8 +1046,10 @@ mod tests {
         let mut m = Model::new();
         open_risk_card(&mut m, stage1_raw_data());
 
-        // 80×14: the stage-1 card's priority fields cannot all fit (B4).
-        let rows = draw_rows(&m, 80, 14);
+        // 80×13: the stage-1 card's priority fields cannot all fit (B4). The card
+        // is one row shorter since v2 (a zero native value is no longer headlined),
+        // so the too-small boundary moved down by one row.
+        let rows = draw_rows(&m, 80, 13);
         let screen = rows.join("\n");
 
         assert!(

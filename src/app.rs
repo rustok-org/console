@@ -1378,9 +1378,10 @@ mod tests {
     #[test]
     fn approve_is_dead_while_the_priority_fields_cannot_fit_the_terminal() {
         let mut m = confirming_tall("a");
+        // 13 rows: too short for the card since v2 dropped the zero native-value row.
         m.update(Msg::Resize {
             width: 80,
-            height: 14,
+            height: 13,
         });
 
         assert!(m.update(Msg::Approve).is_none());
@@ -1403,9 +1404,10 @@ mod tests {
     #[test]
     fn a_taller_terminal_re_arms_approve() {
         let mut m = confirming_tall("a");
+        // 13 rows: too short for the card (see approve_is_dead… for the boundary).
         m.update(Msg::Resize {
             width: 80,
-            height: 14,
+            height: 13,
         });
         assert!(m.update(Msg::Approve).is_none());
         assert!(confirm_of(&m).pin_len().is_none());
