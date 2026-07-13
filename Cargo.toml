@@ -21,6 +21,10 @@ zeroize = "1"
 # Display-cell arithmetic for the card's height budget (ui::render_detail) —
 # the same crate ratatui measures with, so our row math matches its renderer.
 unicode-width = "0.2"
+# QR module matrix for the Receive view (Project Nayuki's reference
+# implementation: MIT, zero transitive dependencies). Only the matrix comes
+# from the crate — the half-block rendering and quiet zone are ours (src/qr.rs).
+qrcodegen = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
