@@ -1,6 +1,6 @@
 {
-  "state": "reviewing",
-  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3) — protocol positions-op: спека написана (core/.claude/specs/2026-07-13-console-v2-phase2-p2-positions-op.md), /check пройден (5 находок вшиты), КОД-ГОТОВ, ждёт Гейта-2. Пара веток НЕ запушена: core feat/console-v2-phase2-p2-positions-op (approver+server) + console docs/console-v2-phase2-p2-positions-protocol (канон §3.8+резерв §3.9+ренумбер). Гейты: все 7 CI-джобов локально зелёные (вкл. features-прогон и release-GUARD), 4 red-мутации, 3 старых get_positions-теста без правок. Отчёт: core/.claude/reports/2026-07-13-console-v2-phase2-p2-positions-op.md. Op зеркалит context: auth-гейт + proto-гейт(≥2) + wallet_locked; источник = существующий PositionTracker через shared plain-data positions_for() (прецедент wallet_context_data); wire = Position 1:1 ручным json! (Serialize в positions-крейт НЕ добавляем); протокол-док: один ренумбер с резервом §3.9 под activity. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 3 Receive ЗАКРЫТ ЦЕЛИКОМ (PR#11 main a6c0d0d + DoD-скан QR телефоном 2026-07-13 байт-в-байт).",
+  "state": "idle",
+  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3 positions) ЗАКРЫТ: пара смержена по «мержи по зеленому, core первым» — core#92 → main a505fe1 (CI 6/6 pass + Release skipping-условный), следом console#12 → main 802347d (CI 4/4). Op positions: auth+proto-гейт, shared positions_for() (gRPC-путь переведён, 3 старых теста без правок), ручной json! через именованный шов position_json + тесты маппинга на реальных Position ОБОИХ путей (дыра gRPC-пути существовала до PR). Канон: §3.8 positions + §3.9 activity-reserved (PR3 без ренумбера) + таблицы §3.10/§3.11, приоритет list в §3.8. Гейты на смерженном main: workspace 30/30, features 116, fmt/clippy чисто. NEXT по §9.5: Этап 5 console-Дашборд (спека ОБЯЗАНА включить приоритет list над read-ops в клиентском шедулере — флаг Ревьюера) → core PR3 activity → Activity. Релизный поезд §8 ждёт конца Фазы 2.",
   "fast": false,
   "history": [
     {
@@ -194,7 +194,19 @@
       "to": "reviewing",
       "at": "2026-07-13T19:20:00+05:00",
       "gate": "Гейт-2 вердикт Ревьюера (core PR2): БЛОКЕРов нет (флот-5+security 0 находок), 2 МИНОРа — оба закрыты в раунде: (1) поле-в-поле маппинг не тестировался на непустом Position (дыра существовала и в gRPC-пути ДО PR) → position_json() вынесен именованным швом + тест на 2 полных Position (aave с «∞»/«80%» + erc4626) все 9 ключей; gRPC: прямой тест to_proto_position; red-пруфы — свапы symbol↔name и balance↔formatted роняли каждый свой тест. ⚠️ ОТКЛОНЕНИЕ от предписанного механизма (provider-фикстура через MockProvider) с обоснованием: MockProvider cfg(test)-приватен И типонесовместим с HashMap<u64,MultiProvider> (конкретный тип поверх HTTP-бэкендов); HTTP-стаб-паттерна в репо нет — новая тест-инфраструктура ради проверки маппинга (правила 3/5); цель находки (свап ключа = красный тест) достигнута с нулём новой поверхности — НА ПОДТВЕРЖДЕНИЕ Ревьюеру в дельте. (2) стейл-коммент READ_OPS_MIN_PROTO поправлен. НИТы: тесты перенесены ниже context-группы ✅; json!-стиль и §3.9-заглушка — оставлены (сам Ревьюер не требовал). Оба вопроса Инженера ратифицированы (current_address напрямую — perf-лоз подтвердил; §3.9 формулировка достаточна). Гейты после фиксов: fmt/clippy чисто, workspace 30/30, features 116 ok (+2 теста), deny ok×4. Ревьюер: «после фикса — чисто, только гляну дельту». Ждём взгляда на дельту → добро Капитана → push+PR-пара."
+    },
+    {
+      "from": "reviewing",
+      "to": "shipped",
+      "at": "2026-07-13T20:10:00+05:00",
+      "gate": "Гейт-2 «чисто» (Ревьюер проверил дельту d3766ae: оба маппинг-теста с гарантированно различимыми парами значений, +ассерт «ровно 9 полей» ловит и утечку; отклонение от provider-фикстуры принял, перепроверив обе предпосылки лично — MockProvider pub(crate)-недостижим, providers конкретный HashMap<u64,MultiProvider>; «юнит-тест на голой функции даже точнее бьёт по риску») + «Добро» Капитана → push + пара PR: core#92 + console#12."
+    },
+    {
+      "from": "shipped",
+      "to": "idle",
+      "at": "2026-07-13T20:20:00+05:00",
+      "gate": "Круг закрыт: «мержи по зеленому, core первым» — core#92 смержен сквошем (a505fe1, CI 6/6), затем console#12 (802347d, CI 4/4); порядок пары соблюдён, ветки удалены локально и на remote. Гейты на смерженном core-main: workspace 30/30 ok, features 116, fmt/clippy чисто. NEXT = Этап 5 console-Дашборд (свой круг, Гейт-1; спека обязана включить приоритет list — флаг Ревьюера уже в ТЗ §9.5 и в каноне §3.8)."
     }
   ],
-  "updated": "2026-07-13T19:20:00+05:00"
+  "updated": "2026-07-13T20:20:00+05:00"
 }
