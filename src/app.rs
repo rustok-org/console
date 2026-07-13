@@ -157,9 +157,24 @@ pub enum Phase {
         /// The transient notice line (decision outcome, PIN lockout, or an
         /// informational note) — one slot, latest event wins.
         notice: Option<Notice>,
+        /// Which screen is on top (nav-shell). Lives here, not on the
+        /// [`Model`]: a view before auth is unrepresentable.
+        view: View,
     },
     /// The connection is finished — render the reason and exit.
     Fatal(TransportError),
+}
+
+/// The resident console's screens (nav-shell). Both are real views — no
+/// placeholder tabs are registered (Gate-1, Stage 2 ratification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// The queue and its card — the approve surface, and the only view that
+    /// may open one.
+    Queue,
+    /// The wallet's own address + QR. Pure display: signs nothing, sends
+    /// nothing, adds no socket op.
+    Receive,
 }
 
 /// The one transient notice slot of the watch screen. A resident console keeps
@@ -346,6 +361,9 @@ pub enum Msg {
         /// Terminal height, in rows.
         height: u16,
     },
+    /// Switch to a view (nav-shell tab). Refused while a card is open or a
+    /// card request exists — see [`Model::on_view`].
+    View(View),
     /// Quit.
     Quit,
 }
@@ -493,7 +511,34 @@ impl Model {
                 self.viewport = (width, height);
                 None
             }
+            Msg::View(view) => {
+                self.on_view(view);
+                None
+            }
             Msg::Open => self.on_open(),
+        }
+    }
+
+    /// Switch the watch screen's view (nav-shell). Refused while ANY card
+    /// request exists — open, on the wire, or parked: an open card is the
+    /// decision surface, left by deciding and never by a tab (`AGENTS.md`
+    /// #5); a `get` on the wire (`awaiting_card`) or parked behind the poll
+    /// (`PendingIntent::Get` — `awaiting_card` is deliberately not raised
+    /// until `flush_pending` sends it) is a card about to open, and switching
+    /// in that gap would open it behind the Receive screen (Gate-1 finding).
+    /// The check only reads `pending` — the latest-wins park semantics of a
+    /// repeated Enter are untouched.
+    fn on_view(&mut self, view: View) {
+        if self.awaiting_card || matches!(self.pending, Some(PendingIntent::Get(_))) {
+            return;
+        }
+        if let Phase::Watching {
+            confirm: None,
+            view: current,
+            ..
+        } = &mut self.phase
+        {
+            *current = view;
         }
     }
 
@@ -644,11 +689,19 @@ impl Model {
             items,
             selected,
             confirm,
+            view,
             ..
         } = &self.phase
         else {
             return None;
         };
+        if *view != View::Queue {
+            // The queue owns card opening. The key map never sends Open from
+            // Receive, but the model is the security boundary, not the key
+            // map: a get solicited here would open a card behind the Receive
+            // screen (/check-3).
+            return None;
+        }
         if confirm.is_some() {
             return None; // already deciding one
         }
@@ -750,6 +803,7 @@ impl Model {
                     selected: 0,
                     confirm: None,
                     notice: None,
+                    view: View::Queue,
                 };
             }
             other => {
@@ -2349,6 +2403,122 @@ mod tests {
         assert!(m.update(Msg::Approve).is_none());
         assert!(m.update(Msg::Reject).is_none());
         assert!(m.update(Msg::Expire).is_none());
+    }
+
+    // ── nav-shell: the Receive view ──
+
+    fn view_of(m: &Model) -> View {
+        let Phase::Watching { view, .. } = m.phase() else {
+            panic!("watching");
+        };
+        *view
+    }
+
+    #[test]
+    fn the_view_switches_to_receive_and_back() {
+        let mut m = watching(vec![summary("a")]);
+        assert_eq!(view_of(&m), View::Queue, "the queue is the home view");
+        assert!(m.update(Msg::View(View::Receive)).is_none());
+        assert_eq!(view_of(&m), View::Receive);
+        assert!(m.update(Msg::View(View::Queue)).is_none());
+        assert_eq!(view_of(&m), View::Queue);
+    }
+
+    #[test]
+    fn a_view_switch_is_refused_while_a_card_is_open() {
+        // An open card is the decision surface: it is left by deciding,
+        // never by a tab (AGENTS.md #5).
+        let mut m = confirming("a", false);
+        m.update(Msg::View(View::Receive));
+        assert_eq!(view_of(&m), View::Queue, "the card pins the queue view");
+    }
+
+    #[test]
+    fn a_view_switch_is_refused_while_a_get_is_on_the_wire() {
+        // The card is about to open — switching now would open it behind the
+        // Receive screen.
+        let mut m = watching(vec![summary("a")]);
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(_))
+        ));
+        m.update(Msg::View(View::Receive));
+        assert_eq!(view_of(&m), View::Queue, "awaiting_card pins the queue");
+    }
+
+    #[test]
+    fn a_view_switch_is_refused_while_a_get_is_parked() {
+        // The Gate-1 finding, step by step: Enter lands while the list poll
+        // is in flight, so the get is PARKED (awaiting_card deliberately not
+        // raised until flush_pending sends it). The switch must see the
+        // parked get too — and the card must open on the Queue view, never
+        // behind Receive.
+        let mut m = watching(vec![summary("a")]);
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        )); // a poll is on the wire
+        assert!(m.update(Msg::Open).is_none(), "the get parks behind it");
+        m.update(Msg::View(View::Receive));
+        assert_eq!(view_of(&m), View::Queue, "a parked get pins the queue");
+        // The poll answers; the parked get goes out; the card opens — in Queue.
+        assert!(matches!(
+            m.update(Msg::Reply(Reply::List(vec![summary("a")]))),
+            Some(transport::Request::Get(_))
+        ));
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("a")))));
+        assert!(
+            matches!(
+                m.phase(),
+                Phase::Watching {
+                    confirm: Some(_),
+                    view: View::Queue,
+                    ..
+                }
+            ),
+            "the card opened on the queue view, not behind Receive"
+        );
+    }
+
+    #[test]
+    fn open_is_dead_on_the_receive_view() {
+        // The key map never sends Open from Receive, but the model is the
+        // security boundary, not the key map (/check-3).
+        let mut m = watching(vec![summary("a")]);
+        m.update(Msg::View(View::Receive));
+        assert!(m.update(Msg::Open).is_none(), "no get is solicited");
+        // And nothing was left armed: returning to the queue, the next open
+        // works normally.
+        m.update(Msg::View(View::Queue));
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(_))
+        ));
+    }
+
+    #[test]
+    fn the_receive_view_keeps_polling_the_queue() {
+        // The resident console stays live on the queue whichever view is on
+        // top: the tab bar's pending count follows reality.
+        let mut m = watching(vec![]);
+        m.update(Msg::View(View::Receive));
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        m.update(Msg::Reply(Reply::List(vec![summary("a")])));
+        let Phase::Watching { items, .. } = m.phase() else {
+            panic!("watching");
+        };
+        assert_eq!(items.len(), 1, "the list lands while Receive is on top");
+        assert_eq!(view_of(&m), View::Receive, "and the view stays put");
+    }
+
+    #[test]
+    fn a_view_switch_outside_the_watch_phase_is_ignored() {
+        let mut m = Model::new();
+        assert!(m.update(Msg::View(View::Receive)).is_none());
+        assert!(matches!(m.phase(), Phase::Connecting));
     }
 
     #[test]

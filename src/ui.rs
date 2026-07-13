@@ -9,9 +9,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{AuthError, Confirm, DecisionKind, Model, Notice, Phase, ResolveError};
+use crate::app::{AuthError, Confirm, DecisionKind, Model, Notice, Phase, ResolveError, View};
 use crate::protocol::{Card, Summary};
-use crate::{format, theme};
+use crate::{format, qr, theme};
 
 /// Render the whole screen for the current model.
 ///
@@ -28,17 +28,47 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
             selected,
             confirm,
             notice,
-        } => render_watch(
-            frame,
-            items,
-            *selected,
-            confirm.as_deref(),
-            notice.as_ref(),
-            model.wallet_address(),
-            now_unix,
-        ),
+            view,
+        } => match view {
+            View::Queue => render_watch(
+                frame,
+                items,
+                *selected,
+                confirm.as_deref(),
+                notice.as_ref(),
+                model.wallet_address(),
+                now_unix,
+            ),
+            View::Receive => render_receive(frame, items.len(), model.wallet_address()),
+        },
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
+}
+
+/// The nav-shell tab bar — one line, both registered views with their keys,
+/// the active one highlighted the way the queue highlights its selection
+/// (accent + reversed). The pending count rides the Queue tab so a human on
+/// Receive still sees work arriving.
+fn tab_line(active: View, pending: usize) -> Line<'static> {
+    let tab = |text: String, is_active: bool| {
+        if is_active {
+            Span::styled(
+                text,
+                Style::new()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::REVERSED),
+            )
+        } else {
+            Span::styled(text, theme::label_style())
+        }
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        tab(format!(" Queue·{pending} [a] "), active == View::Queue),
+        Span::raw(" "),
+        tab(" Receive [r] ".to_owned(), active == View::Receive),
+    ])
 }
 
 /// The transient notice line — the resident console's replacement for the old
@@ -168,8 +198,10 @@ fn render_watch(
 ) {
     let chunks = watch_chunks(frame.area(), confirm.is_some(), notice.is_some());
 
+    // The tab bar lives in the header row the layout already had — the card's
+    // geometry (and with it `priority_fields_fit`) is untouched by nav-shell.
     frame.render_widget(
-        Paragraph::new(format!(" Pending approvals: {}", items.len())),
+        Paragraph::new(tab_line(View::Queue, items.len())),
         chunks[0],
     );
 
@@ -209,7 +241,10 @@ fn render_actions(
     area: ratatui::layout::Rect,
 ) {
     let Some(confirm) = confirm else {
-        frame.render_widget(Paragraph::new("  ↑/↓ select · enter open · q quit"), area);
+        frame.render_widget(
+            Paragraph::new("  ↑/↓ select · enter open · r receive · q quit"),
+            area,
+        );
         return;
     };
     if confirm.is_resolving() {
@@ -316,6 +351,77 @@ fn kind_word(s: &Summary) -> &'static str {
         crate::protocol::Kind::Send => "send",
         crate::protocol::Kind::Call => "call",
     }
+}
+
+/// The Receive view: the wallet's own address in FULL (verbatim EIP-55 from
+/// `context` — the string a sender must see) and a QR of **exactly that
+/// string** (bare address, no URI scheme — Gate-1 ratification). Pure
+/// display: signs nothing, sends nothing.
+///
+/// The address is the priority element and always renders (wrapped, never
+/// clipped). The QR is the elastic one: when its rows do not fit the
+/// remaining area — too few rows OR too few columns (a `Wrap`-folded QR
+/// would still look scannable and scan as garbage) — an explicit marker
+/// takes its place, the raw_data honesty pattern.
+///
+/// Degraded context (`wallet_locked`, an old server — `None` here) and an
+/// empty address (`parse_context` rejects a missing one, not an empty one)
+/// show "no receive address": a QR of nothing must never be fabricated.
+fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
+    frame.render_widget(Paragraph::new(tab_line(View::Receive, pending)), chunks[0]);
+
+    let block = themed_block(" Receive ");
+    let inner = block.inner(chunks[1]);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let addr = wallet.filter(|a| !a.is_empty());
+    let Some(addr) = addr else {
+        push_wrapped(
+            &mut lines,
+            width,
+            "wallet context unavailable — no receive address".to_owned(),
+            theme::high_risk_style(),
+        );
+        frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+        return;
+    };
+
+    push_wrapped(
+        &mut lines,
+        width,
+        "your address".to_owned(),
+        theme::label_style(),
+    );
+    push_wrapped(
+        &mut lines,
+        width,
+        addr.to_owned(),
+        Style::new().fg(theme::accent_bright()),
+    );
+
+    match qr::half_block_rows(addr) {
+        Some(rows) if rows[0].chars().count() <= width && lines.len() + rows.len() <= height => {
+            lines.extend(
+                rows.into_iter()
+                    .map(|row| Line::from(Span::styled(row, theme::qr_style()))),
+            );
+        }
+        _ => {
+            // No wrapped, clipped or fabricated QR — say so instead.
+            push_wrapped(
+                &mut lines,
+                width,
+                "QR hidden — terminal too small (needs ~21 rows × 39 cols); \
+                 the address above is complete"
+                    .to_owned(),
+                theme::label_style(),
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
 }
 
 /// The card's priority lines — every field except `raw_data` — pre-wrapped to
@@ -1298,8 +1404,8 @@ mod tests {
         assert!(screen.contains("APPROVED"));
         assert!(screen.contains("0xfeed"), "the tx hash is shown verbatim");
         assert!(
-            screen.contains("Pending approvals"),
-            "the queue screen is still alive behind the notice"
+            screen.contains("Queue·"),
+            "the queue screen (tab bar) is still alive behind the notice"
         );
     }
 
@@ -1342,6 +1448,191 @@ mod tests {
              hides in shortened addresses"
         );
         assert!(has_line_with(&rows, &["to", "0xabc"]));
+    }
+
+    // ── nav-shell: tab bar + the Receive view ──
+
+    /// Background colors on the first rendered row containing `needle` —
+    /// the QR's white ground is as load-bearing as its black ink.
+    fn row_bgs_containing(
+        model: &Model,
+        w: u16,
+        h: u16,
+        needle: &str,
+    ) -> Vec<ratatui::style::Color> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains(needle) {
+                return (0..w).filter_map(|x| buffer[(x, y)].style().bg).collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Rows that carry QR half-blocks.
+    fn qr_rows(rows: &[String]) -> usize {
+        rows.iter()
+            .filter(|r| r.contains('█') || r.contains('▀') || r.contains('▄'))
+            .count()
+    }
+
+    #[test]
+    fn the_tab_bar_names_both_views_with_their_keys_and_the_pending_count() {
+        let mut m = Model::new();
+        to_watching(&mut m, vec![summary("a1", "0xabc", "0", false)]);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["Queue·1 [a]", "Receive [r]"]),
+            "both tabs, their keys, and the live pending count on one line"
+        );
+    }
+
+    #[test]
+    fn the_active_tab_is_highlighted() {
+        use ratatui::style::Modifier;
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+
+        // On the queue view, the Queue tab is the reversed one.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &m, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        let queue_at = row.find("Queue").expect("the Queue tab renders") as u16;
+        let receive_at = row.find("Receive").expect("the Receive tab renders") as u16;
+        assert!(
+            buffer[(queue_at, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the active tab reads as selected"
+        );
+        assert!(
+            !buffer[(receive_at, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the inactive tab does not"
+        );
+    }
+
+    #[test]
+    fn the_receive_view_shows_the_full_address_and_a_scannable_qr() {
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &[WALLET]),
+            "the wallet address renders in FULL on one row, verbatim EIP-55"
+        );
+        // Of the 19 QR text rows, the top and bottom 2 are pure quiet zone
+        // (spaces) — exactly 15 carry ink. Fewer would mean a clipped code.
+        assert_eq!(
+            qr_rows(&rows),
+            15,
+            "the version-3 QR renders whole: every ink row present"
+        );
+        assert!(
+            !rows.join("\n").contains("QR hidden"),
+            "a fitting QR shows no marker"
+        );
+        // COLOR carries the scan contrast: black ink on white ground,
+        // regardless of the terminal theme (canon: assert the style, not
+        // just the text).
+        let fgs = row_fgs_containing(&m, 80, 24, "█");
+        assert!(
+            fgs.contains(&ratatui::style::Color::Rgb(0, 0, 0)),
+            "QR ink is true black"
+        );
+        let bgs = row_bgs_containing(&m, 80, 24, "█");
+        assert!(
+            bgs.contains(&ratatui::style::Color::Rgb(0xFF, 0xFF, 0xFF)),
+            "QR ground is true white"
+        );
+    }
+
+    #[test]
+    fn a_short_terminal_hides_the_qr_with_an_explicit_marker() {
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        let rows = draw_rows(&m, 80, 12);
+        assert!(
+            has_line_with(&rows, &[WALLET]),
+            "the address — the priority element — still renders in full"
+        );
+        assert!(
+            rows.join("\n").contains("QR hidden"),
+            "the missing QR says so out loud"
+        );
+        assert_eq!(qr_rows(&rows), 0, "no partial QR ever renders");
+    }
+
+    #[test]
+    fn a_narrow_terminal_hides_the_qr_rather_than_wrap_it() {
+        // 30 columns: the 37-column QR would fold under Wrap into something
+        // that still LOOKS scannable — and scans as garbage (/check-2).
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        let rows = draw_rows(&m, 30, 24);
+        assert!(rows.join("\n").contains("QR hidden"));
+        assert_eq!(qr_rows(&rows), 0, "never a wrapped QR");
+        assert!(
+            has_line_with(&rows, &["your address"]),
+            "the address block is still there (wrapped by cells, not clipped)"
+        );
+    }
+
+    #[test]
+    fn a_degraded_context_shows_no_receive_address_and_no_qr() {
+        let mut m = Model::new();
+        to_watching_no_context(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            rows.join("\n").contains("no receive address"),
+            "an honest degradation, not a fabricated code"
+        );
+        assert_eq!(qr_rows(&rows), 0, "a QR of nothing must never render");
+        assert!(
+            !has_line_with(&rows, &["your address"]),
+            "no address block without an address"
+        );
+    }
+
+    #[test]
+    fn the_notice_is_queue_furniture_and_does_not_render_on_receive() {
+        // /check-5: the slot survives the switch untouched — back on the
+        // queue, the human still sees what happened.
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+        m.update(Msg::Approve);
+        m.update(Msg::Reply(Reply::Resolve(
+            crate::protocol::ResolveOutcome::Executed {
+                tx_hash: "0xfeed".to_owned(),
+            },
+        )));
+        m.update(Msg::View(crate::app::View::Receive));
+        assert!(
+            !draw(&m, 80, 24).contains("APPROVED"),
+            "the outcome notice stays off the Receive screen"
+        );
+        m.update(Msg::View(crate::app::View::Queue));
+        assert!(
+            draw(&m, 80, 24).contains("APPROVED"),
+            "and is still there when the human returns"
+        );
     }
 
     #[test]

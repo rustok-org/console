@@ -23,7 +23,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use rustok_console::app::{Decision, DecisionKind, Model, Msg, Phase};
+use rustok_console::app::{Decision, DecisionKind, Model, Msg, Phase, View};
 use rustok_console::transport::{Transport, TransportError};
 use rustok_console::ui;
 
@@ -311,10 +311,27 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             _ => None,
         },
         // The queue: no decision is pending, so quitting is free.
-        Phase::Watching { confirm: None, .. } => match key.code {
+        Phase::Watching {
+            confirm: None,
+            view: View::Queue,
+            ..
+        } => match key.code {
             KeyCode::Up | KeyCode::Char('k') => Some(Msg::MoveUp),
             KeyCode::Down | KeyCode::Char('j') => Some(Msg::MoveDown),
             KeyCode::Enter => Some(Msg::Open),
+            KeyCode::Char('r') => Some(Msg::View(View::Receive)),
+            KeyCode::Char('q') => Some(Msg::Quit),
+            _ => None,
+        },
+        // Receive is display-only: back to the queue, or quit. Everything
+        // else — navigation, Enter, y/n — is dead here (and `Msg::Open` is
+        // refused by the model too, the key map is not the boundary).
+        Phase::Watching {
+            confirm: None,
+            view: View::Receive,
+            ..
+        } => match key.code {
+            KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
@@ -368,6 +385,17 @@ mod tests {
             selected: 0,
             confirm: None,
             notice: None,
+            view: View::Queue,
+        }
+    }
+
+    fn receiving() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Receive,
         }
     }
 
@@ -564,6 +592,52 @@ mod tests {
             map_key(&key(KeyCode::Char('q')), &watching()),
             Some(Msg::Quit)
         ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('r')), &watching()),
+            Some(Msg::View(View::Receive))
+        ));
+    }
+
+    #[test]
+    fn the_receive_view_maps_only_back_and_quit() {
+        // `a` and Esc return to the queue; `q` still quits.
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('a')), &receiving()),
+            Some(Msg::View(View::Queue))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Esc), &receiving()),
+            Some(Msg::View(View::Queue))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('q')), &receiving()),
+            Some(Msg::Quit)
+        ));
+        // A display-only view: nothing else may act — Enter must not open a
+        // card behind the screen, y/n must not decide anything.
+        for dead in [
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('r'),
+            KeyCode::Char('7'),
+        ] {
+            assert!(
+                map_key(&key(dead), &receiving()).is_none(),
+                "{dead:?} must be dead on the Receive view"
+            );
+        }
+    }
+
+    #[test]
+    fn a_view_key_never_reaches_an_open_confirmation() {
+        // With a card open the confirm arm owns the keys: `r` is not a tab
+        // switch there (and the model refuses the switch besides).
+        let m = confirming(false);
+        assert!(map_key(&key(KeyCode::Char('r')), m.phase()).is_none());
+        assert!(map_key(&key(KeyCode::Char('a')), m.phase()).is_none());
     }
 
     #[test]
