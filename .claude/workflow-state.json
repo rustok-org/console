@@ -1,6 +1,6 @@
 {
-  "state": "idle",
-  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3 positions) ЗАКРЫТ: пара смержена по «мержи по зеленому, core первым» — core#92 → main a505fe1 (CI 6/6 pass + Release skipping-условный), следом console#12 → main 802347d (CI 4/4). Op positions: auth+proto-гейт, shared positions_for() (gRPC-путь переведён, 3 старых теста без правок), ручной json! через именованный шов position_json + тесты маппинга на реальных Position ОБОИХ путей (дыра gRPC-пути существовала до PR). Канон: §3.8 positions + §3.9 activity-reserved (PR3 без ренумбера) + таблицы §3.10/§3.11, приоритет list в §3.8. Гейты на смерженном main: workspace 30/30, features 116, fmt/clippy чисто. NEXT по §9.5: Этап 5 console-Дашборд (спека ОБЯЗАНА включить приоритет list над read-ops в клиентском шедулере — флаг Ревьюера) → core PR3 activity → Activity. Релизный поезд §8 ждёт конца Фазы 2.",
+  "state": "planning",
+  "task": "Console v2 Фаза 2, Этап 5 — Dashboard (баланс·позиции·waiting + read-op шедулер list-first): спека написана (.claude/specs/2026-07-13-console-v2-phase2-s5-dashboard.md), /check пройден (5 находок вшиты: порядок flush_pending>read-op; home=Dashboard трогает 5 хелперов; wallet_locked-рефреш не выкидывает данные но метит staleness; тристейт positions; bounded-рефреш на вход), ЖДЁТ ГЕЙТА-1. 5 решений предрешены: home=Dashboard (ТВОЙ ВЫБОР) · рефреш context чередованием · STALE_TICKS=12 · без адресов активов на дашборде · без секции активности до Этапа 7. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 4 (core PR2 positions) ЗАКРЫТ (core#92 a505fe1 + console#12 802347d).",
   "fast": false,
   "history": [
     {
@@ -206,7 +206,13 @@
       "to": "idle",
       "at": "2026-07-13T20:20:00+05:00",
       "gate": "Круг закрыт: «мержи по зеленому, core первым» — core#92 смержен сквошем (a505fe1, CI 6/6), затем console#12 (802347d, CI 4/4); порядок пары соблюдён, ветки удалены локально и на remote. Гейты на смерженном core-main: workspace 30/30 ok, features 116, fmt/clippy чисто. NEXT = Этап 5 console-Дашборд (свой круг, Гейт-1; спека обязана включить приоритет list — флаг Ревьюера уже в ТЗ §9.5 и в каноне §3.8)."
+    },
+    {
+      "from": "idle",
+      "to": "planning",
+      "at": "2026-07-13T21:00:00+05:00",
+      "gate": "Этап 5 Dashboard, спека к Гейту-1. Blast radius ДО спеки (main 802347d, 159+17+1): View+Dashboard = компилятор-форс (render-диспетч, map_key неисчерпывающие армы, tab_line 3-я вкладка); substring-ассерты выживают; protocol/transport аддитивны (hello уже proto 2); поведенческое ядро = read-op шедулер в on_reply(List). ОБЯЗАТЕЛЬСТВО спеки: флаг Ревьюера (приоритет list) — нормативная политика list-first: read-op только из on_reply(List), никогда из on_tick, тройная чистота слота, ПОСЛЕ flush_pending. /check: 5 находок (3 important — порядок parked-интент>read-op не был зафиксирован; home=Dashboard ломает предпосылку 5 тест-хелперов (blast radius был занижен — исправлено: явный переход в Queue); wallet_locked-рефреш рендерил бы старые балансы как свежие → staleness-нота без выброса данных; 1 sug — тристейт positions NotYet/Loaded/Unavailable; 1 nit — bounded-рефреш на вход зафиксирован) — ВСЕ вшиты. 5 предрешённых решений, №1 home=Dashboard — ТВОЙ ВЫБОР Капитана (буква плана Фазы 2 «PIN-unlock → Dashboard»). Кода нет до «го»."
     }
   ],
-  "updated": "2026-07-13T20:20:00+05:00"
+  "updated": "2026-07-13T21:00:00+05:00"
 }
