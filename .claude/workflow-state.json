@@ -1,6 +1,6 @@
 {
-  "state": "coding",
-  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3) — protocol positions-op: спека написана (core/.claude/specs/2026-07-13-console-v2-phase2-p2-positions-op.md), /check пройден (5 находок вшиты), ГЕЙТ-1 ПРОЙДЕН (две подписи 2026-07-13) → КОДИНГ: core-ветка feat/console-v2-phase2-p2-positions-op + companion console-ветка для протокол-дока (пара, мерж core первым). Op зеркалит context: auth-гейт + proto-гейт(≥2) + wallet_locked; источник = существующий PositionTracker через shared plain-data positions_for() (прецедент wallet_context_data); wire = Position 1:1 ручным json! (Serialize в positions-крейт НЕ добавляем); протокол-док: один ренумбер с резервом §3.9 под activity. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 3 Receive ЗАКРЫТ ЦЕЛИКОМ (PR#11 main a6c0d0d + DoD-скан QR телефоном 2026-07-13 байт-в-байт).",
+  "state": "reviewing",
+  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3) — protocol positions-op: спека написана (core/.claude/specs/2026-07-13-console-v2-phase2-p2-positions-op.md), /check пройден (5 находок вшиты), КОД-ГОТОВ, ждёт Гейта-2. Пара веток НЕ запушена: core feat/console-v2-phase2-p2-positions-op (approver+server) + console docs/console-v2-phase2-p2-positions-protocol (канон §3.8+резерв §3.9+ренумбер). Гейты: все 7 CI-джобов локально зелёные (вкл. features-прогон и release-GUARD), 4 red-мутации, 3 старых get_positions-теста без правок. Отчёт: core/.claude/reports/2026-07-13-console-v2-phase2-p2-positions-op.md. Op зеркалит context: auth-гейт + proto-гейт(≥2) + wallet_locked; источник = существующий PositionTracker через shared plain-data positions_for() (прецедент wallet_context_data); wire = Position 1:1 ручным json! (Serialize в positions-крейт НЕ добавляем); протокол-док: один ренумбер с резервом §3.9 под activity. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 3 Receive ЗАКРЫТ ЦЕЛИКОМ (PR#11 main a6c0d0d + DoD-скан QR телефоном 2026-07-13 байт-в-байт).",
   "fast": false,
   "history": [
     {
@@ -182,7 +182,13 @@
       "to": "coding",
       "at": "2026-07-13T18:00:00+05:00",
       "gate": "Гейт-1 core PR2 ПРОЙДЕН, обе подписи: Ревьюер перепроверил ВСЕ факты спеки по коду байт-в-байт (строки approver.rs/server.rs, Position без Serialize, «∞»-сентинель aave.rs:77 + его тест, 12 греп-вхождений §3.[789], 7 CI-джобов вкл. двойной cargo test и CI-only rustsec) — БЛОКЕРов нет, все 3 предрешённых решения ратифицированы (shared positions_for / wire=зеркало Position / no-address-параметр); Капитан «Го». ФЛАГ-ВПЕРЁД Ревьюера (не блокер PR2, зафиксирован в ТЗ §9.5 сразу): спека Этапа 5 обязана дать приоритет list над positions/activity в клиентском шедулере — медленный positions на единственном слоте заблокировал бы list (единственный источник знания о новом pending с дедлайном); риск доступности, не денег. Порядок кодинга: server.rs positions_for()+рефактор get_positions (3 старых теста без правок = мера) → approver.rs Req::Positions+handler+4 red→green теста → протокол-док (ренумбер с резервом §3.9) в console-ветке."
+    },
+    {
+      "from": "coding",
+      "to": "reviewing",
+      "at": "2026-07-13T18:40:00+05:00",
+      "gate": "Этап 4 (core PR2 positions) код-готов: Req::Positions + handler-зеркало context (proto→auth→wallet_locked→positions_for, ручной json! 9 полей) + shared positions_for() в server.rs (тело gRPC get_positions переведено, −5 строк). Протокол-док: §3.8 positions (wire-таблица, «∞», ltv c %, «render don't parse», best-effort, нормативное клиентское правило вкл. приоритет list — флаг Ревьюера лёг в канон) + §3.9 activity-reserved (PR3 без ренумбера) + таблицы §3.10/§3.11 + все ссылки грепом. Гейты (мои, дешёвые — все 7 CI-команд дословно): fmt --all чисто · clippy --workspace чисто · test --workspace 30/30 ok · test -p rustok-grpc --features test-approval 114+2 · deny ok×4 · release-build+strings GUARD OK. Red→green: 4 мутации (proto-гейт/auth-гейт/wallet_locked/ключ ответа) — каждая роняла ровно свой тест. Мера нулевого рефактора: 3 существующих get_positions-теста БЕЗ правок. Отклонение в плюс (1): приоритет list вписан и в §3.8 канона, не только в ТЗ-отметку Этапа 5. 2 вопроса Ревьюеру в отчёте. ⛔ Флот-5 (sonnet)+/rust-review+/security-review — Ревьюеру; push/PR ждут «чисто»."
     }
   ],
-  "updated": "2026-07-13T18:00:00+05:00"
+  "updated": "2026-07-13T18:40:00+05:00"
 }
