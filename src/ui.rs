@@ -358,11 +358,13 @@ fn kind_word(s: &Summary) -> &'static str {
 /// string** (bare address, no URI scheme — Gate-1 ratification). Pure
 /// display: signs nothing, sends nothing.
 ///
-/// The address is the priority element and always renders (wrapped, never
-/// clipped). The QR is the elastic one: when its rows do not fit the
-/// remaining area — too few rows OR too few columns (a `Wrap`-folded QR
-/// would still look scannable and scan as garbage) — an explicit marker
-/// takes its place, the raw_data honesty pattern.
+/// The address is the priority element: it renders wrapped, and when even it
+/// cannot fit, the screen says so with a banner — never a silent cut (the
+/// card's TOO SMALL pattern, [`render_detail`]). The QR is the elastic one:
+/// when its rows do not fit the remaining area — too few rows OR too few
+/// columns (a `Wrap`-folded QR would still look scannable and scan as
+/// garbage) — an explicit marker takes its place, the raw_data honesty
+/// pattern.
 ///
 /// Degraded context (`wallet_locked`, an old server — `None` here) and an
 /// empty address (`parse_context` rejects a missing one, not an empty one)
@@ -377,49 +379,68 @@ fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
     let height = usize::from(inner.height);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let addr = wallet.filter(|a| !a.is_empty());
-    let Some(addr) = addr else {
+    if let Some(addr) = wallet.filter(|a| !a.is_empty()) {
+        push_wrapped(
+            &mut lines,
+            width,
+            "your address".to_owned(),
+            theme::label_style(),
+        );
+        push_wrapped(
+            &mut lines,
+            width,
+            addr.to_owned(),
+            Style::new().fg(theme::accent_bright()),
+        );
+        match qr::half_block_rows(addr) {
+            // `first()`, not `[0]`: a non-empty row set is the encoder
+            // crate's invariant, not this module's contract — an empty one
+            // degrades to the marker instead of panicking.
+            Some(rows)
+                if rows.first().is_some_and(|r| r.chars().count() <= width)
+                    && lines.len() + rows.len() <= height =>
+            {
+                lines.extend(
+                    rows.into_iter()
+                        .map(|row| Line::from(Span::styled(row, theme::qr_style()))),
+                );
+            }
+            _ => {
+                // No wrapped, clipped or fabricated QR — say so instead.
+                // ~24 rows: tab bar + 2 borders + label + address + 19 QR.
+                push_wrapped(
+                    &mut lines,
+                    width,
+                    "QR hidden — terminal too small (needs ~24 rows × 39 cols); \
+                     the address above is complete"
+                        .to_owned(),
+                    theme::label_style(),
+                );
+            }
+        }
+    } else {
         push_wrapped(
             &mut lines,
             width,
             "wallet context unavailable — no receive address".to_owned(),
             theme::high_risk_style(),
         );
-        frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
-        return;
-    };
+    }
 
-    push_wrapped(
-        &mut lines,
-        width,
-        "your address".to_owned(),
-        theme::label_style(),
-    );
-    push_wrapped(
-        &mut lines,
-        width,
-        addr.to_owned(),
-        Style::new().fg(theme::accent_bright()),
-    );
-
-    match qr::half_block_rows(addr) {
-        Some(rows) if rows[0].chars().count() <= width && lines.len() + rows.len() <= height => {
-            lines.extend(
-                rows.into_iter()
-                    .map(|row| Line::from(Span::styled(row, theme::qr_style()))),
-            );
-        }
-        _ => {
-            // No wrapped, clipped or fabricated QR — say so instead.
-            push_wrapped(
-                &mut lines,
-                width,
-                "QR hidden — terminal too small (needs ~21 rows × 39 cols); \
-                 the address above is complete"
-                    .to_owned(),
-                theme::label_style(),
-            );
-        }
+    if lines.len() > height {
+        // Even the pre-QR lines overflow: the address is about to be cut,
+        // and it must never be cut in silence — a copied half-address is the
+        // receive surface's own poisoning vector. The banner takes the one
+        // row guaranteed visible when rows clip (same as `render_detail`).
+        let mut banner = Vec::new();
+        push_wrapped(
+            &mut banner,
+            width,
+            "TERMINAL TOO SMALL — the address below is cut; resize to read it in full".to_owned(),
+            Style::new().add_modifier(Modifier::BOLD),
+        );
+        banner.append(&mut lines);
+        lines = banner;
     }
     frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
 }
@@ -858,6 +879,31 @@ mod tests {
         model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
             WalletContext {
                 address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+            },
+        )))));
+        model.update(Msg::Tick);
+        model.update(Msg::Reply(Reply::List(items)));
+    }
+
+    /// A session whose `context` answered ok with an EMPTY address string —
+    /// distinct from a degraded context: `parse_context` rejects a missing
+    /// address but passes `""` through (T2).
+    fn to_watching_empty_address(model: &mut Model, items: Vec<Summary>) {
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        model.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        model.update(Msg::PinDigit('1'));
+        model.update(Msg::PinSubmit);
+        model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: String::new(),
                 balances: vec![],
                 allowed_chains: vec![1],
             },
@@ -1519,6 +1565,13 @@ mod tests {
                 .contains(Modifier::REVERSED),
             "the inactive tab does not"
         );
+        // COLOR too, not just the modifier: swapping accent() for the muted
+        // label color would keep REVERSED and pass a modifier-only check.
+        assert_eq!(
+            buffer[(queue_at, 0)].style().fg,
+            Some(theme::accent()),
+            "the active tab carries the brand accent"
+        );
     }
 
     #[test]
@@ -1608,6 +1661,64 @@ mod tests {
         assert!(
             !has_line_with(&rows, &["your address"]),
             "no address block without an address"
+        );
+    }
+
+    #[test]
+    fn the_qr_fit_gate_sits_exactly_on_its_boundaries() {
+        // T1: every existing snapshot sits far from the `<=` thresholds — an
+        // off-by-one in either comparison would slip through. Pin both
+        // boundaries with an equality case and its neighbour.
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        // Height boundary at width 80: the address fits one row, so the
+        // inner column is label(1) + address(1) + QR(19) = 21 = inner height
+        // of a 24-row terminal (1 tab + 2 borders). 24 is the equality case.
+        assert_eq!(qr_rows(&draw_rows(&m, 80, 24)), 15, "equality fits");
+        assert_eq!(qr_rows(&draw_rows(&m, 80, 23)), 0, "one row short hides");
+        assert!(draw_rows(&m, 80, 23).join("\n").contains("QR hidden"));
+
+        // Width boundary: the QR is 37 columns; borders make the terminal
+        // 39. At 39 the inner width equals 37 exactly (the address wraps to
+        // two rows, still leaving 22 ≤ 27 inner rows at height 30).
+        assert_eq!(qr_rows(&draw_rows(&m, 39, 30)), 15, "equality fits");
+        assert_eq!(qr_rows(&draw_rows(&m, 38, 30)), 0, "one col short hides");
+        assert!(draw_rows(&m, 38, 30).join("\n").contains("QR hidden"));
+    }
+
+    #[test]
+    fn an_empty_address_string_degrades_like_a_missing_context() {
+        // T2: `parse_context` rejects a MISSING address but passes "" — the
+        // view must not label an empty line "your address" nor fabricate a
+        // scannable QR of nothing (/check-4).
+        let mut m = Model::new();
+        to_watching_empty_address(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            rows.join("\n").contains("no receive address"),
+            "an empty address is no address"
+        );
+        assert_eq!(qr_rows(&rows), 0);
+        assert!(!has_line_with(&rows, &["your address"]));
+    }
+
+    #[test]
+    fn a_tiny_terminal_says_the_address_is_cut_never_cuts_it_in_silence() {
+        // МИНОР-1 (Гейт-2): when even label + address + marker overflow the
+        // panel, the top row must say so — a silently clipped address is a
+        // half-address someone may copy.
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        m.update(Msg::View(crate::app::View::Receive));
+
+        let rows = draw_rows(&m, 80, 5); // inner height 2 < the 3 lines built
+        assert!(
+            rows.join("\n").contains("TOO SMALL"),
+            "the overflow banner takes the guaranteed-visible row"
         );
     }
 

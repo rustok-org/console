@@ -34,12 +34,13 @@ pub fn half_block_rows(text: &str) -> Option<Vec<String>> {
     let size = qr.size();
 
     let cols = size + 2 * QUIET_ZONE;
+    let capacity = usize::try_from(cols).ok()? * '█'.len_utf8();
     let mut rows = Vec::new();
     // Module rows come in pairs; `get_module` answers light (false) outside
     // the code, which paints the quiet zone and the odd final half-row alike.
     let mut y = -QUIET_ZONE;
     while y < size + QUIET_ZONE {
-        let mut row = String::with_capacity(usize::try_from(cols).ok()? * '█'.len_utf8());
+        let mut row = String::with_capacity(capacity);
         for x in -QUIET_ZONE..size + QUIET_ZONE {
             row.push(match (qr.get_module(x, y), qr.get_module(x, y + 1)) {
                 (true, true) => '█',
