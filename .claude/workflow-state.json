@@ -1,6 +1,6 @@
 {
-  "state": "planning",
-  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3) — protocol positions-op: спека написана (core/.claude/specs/2026-07-13-console-v2-phase2-p2-positions-op.md), /check пройден (5 находок вшиты), ЖДЁТ ГЕЙТА-1. Op зеркалит context: auth-гейт + proto-гейт(≥2) + wallet_locked; источник = существующий PositionTracker через shared plain-data positions_for() (прецедент wallet_context_data); wire = Position 1:1 ручным json! (Serialize в positions-крейт НЕ добавляем); протокол-док: один ренумбер с резервом §3.9 под activity. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 3 Receive ЗАКРЫТ ЦЕЛИКОМ (PR#11 main a6c0d0d + DoD-скан QR телефоном 2026-07-13 байт-в-байт).",
+  "state": "coding",
+  "task": "Console v2 Фаза 2, Этап 4 (core PR 2/3) — protocol positions-op: спека написана (core/.claude/specs/2026-07-13-console-v2-phase2-p2-positions-op.md), /check пройден (5 находок вшиты), ГЕЙТ-1 ПРОЙДЕН (две подписи 2026-07-13) → КОДИНГ: core-ветка feat/console-v2-phase2-p2-positions-op + companion console-ветка для протокол-дока (пара, мерж core первым). Op зеркалит context: auth-гейт + proto-гейт(≥2) + wallet_locked; источник = существующий PositionTracker через shared plain-data positions_for() (прецедент wallet_context_data); wire = Position 1:1 ручным json! (Serialize в positions-крейт НЕ добавляем); протокол-док: один ренумбер с резервом §3.9 под activity. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 3 Receive ЗАКРЫТ ЦЕЛИКОМ (PR#11 main a6c0d0d + DoD-скан QR телефоном 2026-07-13 байт-в-байт).",
   "fast": false,
   "history": [
     {
@@ -176,7 +176,13 @@
       "to": "planning",
       "at": "2026-07-13T17:40:00+05:00",
       "gate": "Этап 4 (core PR2 positions), спека к Гейту-1. Blast radius ДО спеки (core main 6fea4e2): чисто аддитивно — новый Req::Positions (serde-tag enum, парс существующих op не меняется), новая ветка+handler; единственный рефактор = тело gRPC get_positions (server.rs:646) выносит tracker.track в shared positions_for() — мера нулевого поведения: 3 существующих get_positions-теста проходят БЕЗ правок; console/src не трогается (Дашборд=Этап 5); READ_OPS_MIN_PROTO=2 уже существует с док-комментом про positions/activity. /check: 5 находок (2 important — приёмка перечисляла не те CI-команды (core CI: fmt --all, clippy --workspace, test --workspace + ОТДЕЛЬНЫЙ test -p rustok-grpc --features test-approval, deny×2 джобы, Approval Acceptor Guard — все внесены дословно, память run-full-ci-gates-locally); Position НЕ derives Serialize → зафиксирован ручной json!-маппинг по паттерну context, serde-derive в positions-крейт не добавляем; 3 sug/nit — ренумбер протокол-дока ОДИН раз с резервом §3.9 под activity (12 перекрёстных ссылок, PR3 без чурна), клиентское правило «positions не слать при открытой карточке» фиксируется В КАНОНЕ §3.8 (направление Ревьюера 2026-07-12), порядок мержа пары core→console-док) — все вшиты. 3 решения предрешены: shared positions_for (прецедент wallet_context_data), wire=зеркало Position включая extra (⚠️ health_factor может быть строкой «∞»), socket-op БЕЗ address-параметра (консоль спрашивает про СВОЙ кошелёк). Кода нет до «го»."
+    },
+    {
+      "from": "planning",
+      "to": "coding",
+      "at": "2026-07-13T18:00:00+05:00",
+      "gate": "Гейт-1 core PR2 ПРОЙДЕН, обе подписи: Ревьюер перепроверил ВСЕ факты спеки по коду байт-в-байт (строки approver.rs/server.rs, Position без Serialize, «∞»-сентинель aave.rs:77 + его тест, 12 греп-вхождений §3.[789], 7 CI-джобов вкл. двойной cargo test и CI-only rustsec) — БЛОКЕРов нет, все 3 предрешённых решения ратифицированы (shared positions_for / wire=зеркало Position / no-address-параметр); Капитан «Го». ФЛАГ-ВПЕРЁД Ревьюера (не блокер PR2, зафиксирован в ТЗ §9.5 сразу): спека Этапа 5 обязана дать приоритет list над positions/activity в клиентском шедулере — медленный positions на единственном слоте заблокировал бы list (единственный источник знания о новом pending с дедлайном); риск доступности, не денег. Порядок кодинга: server.rs positions_for()+рефактор get_positions (3 старых теста без правок = мера) → approver.rs Req::Positions+handler+4 red→green теста → протокол-док (ренумбер с резервом §3.9) в console-ветке."
     }
   ],
-  "updated": "2026-07-13T17:40:00+05:00"
+  "updated": "2026-07-13T18:00:00+05:00"
 }
