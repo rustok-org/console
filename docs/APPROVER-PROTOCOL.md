@@ -13,10 +13,11 @@
 > is documented as-is and cross-referenced to a tracked follow-up rather than
 > silently "corrected" here.
 >
-> **proto 2 — DRAFT** (Console v2 Фаза 2, Этап 1) — additive over proto 1: the
-> read-op `context` (§3.7), gated behind `auth` unlike `list`/`get` (§2), plus the
-> `wallet_locked` error code (§3.9). A `proto: 1` session negotiated by an
-> already-shipped `console v0.1.0` continues to work unchanged — see §3.1 and §6.
+> **proto 2 — DRAFT** (Console v2 Фаза 2) — additive over proto 1: the read-ops
+> `context` (§3.7) and `positions` (§3.8), gated behind `auth` unlike `list`/`get`
+> (§2), plus the `wallet_locked` error code (§3.11). A `proto: 1` session
+> negotiated by an already-shipped `console v0.1.0` continues to work unchanged —
+> see §3.1 and §6.
 
 ## 1. Transport
 
@@ -42,7 +43,7 @@
 ## 2. Session
 
 ```
-connect → hello → { list | get }* → auth → { list | get | approve | deny | context }* → disconnect
+connect → hello → { list | get }* → auth → { list | get | approve | deny | context | positions }* → disconnect
 ```
 
 - A **session is one connection**. `auth` authorizes that connection only;
@@ -56,13 +57,14 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
   A future reviewer must not "fix" this into an auth-gate — it would defend
   nothing against a same-uid local process (§1), and it would gate data that
   isn't secret in the first place.
-- **`context` (proto 2+, §3.7) is auth-gated — deliberately NOT the same
-  pre-auth treatment as `list`/`get`.** Unlike the queue card, `context`
-  answers with the wallet's own address and balances: the human's private
-  financial data, not the agent's proposal. Before `auth` it → `unauthorized`,
-  the same code `approve`/`deny` already use. Future read-ops in this family
-  (`positions`, `activity`) follow the same default — auth-gated unless a
-  specific op's data is, like the queue, inherently not secret.
+- **`context` and `positions` (proto 2+, §3.7/§3.8) are auth-gated —
+  deliberately NOT the same pre-auth treatment as `list`/`get`.** Unlike the
+  queue card, they answer with the wallet's own address, balances, and DeFi
+  holdings: the human's private financial data, not the agent's proposal.
+  Before `auth` they → `unauthorized`, the same code `approve`/`deny` already
+  use. Future read-ops in this family (`activity`, §3.9) follow the same
+  default — auth-gated unless a specific op's data is, like the queue,
+  inherently not secret.
 - **Default-deny**: a malformed line, unknown `op`, a missing or mistyped field, or
   an oversized message (> 64 KiB, code `oversize`) yields a single `error` response
   and **no state change**. The server never executes anything as a result of an
@@ -78,7 +80,7 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
 
 ## 3. Messages
 
-Field wire-formats are normative and listed in **§3.8** — the console's serde types
+Field wire-formats are normative and listed in **§3.10** — the console's serde types
 must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 `decoded_call.amount` is a `0x`-hex string; they are **not** interchangeable).
 
@@ -246,7 +248,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
    "allowed_chains":[1,8453]}
 ← {"ok":false,"error":"unauthorized"}     // no auth on this connection
 ← {"ok":false,"error":"protocol_error"}   // session negotiated proto:1 (§3.1)
-← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.9
+← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.11
 ```
 
 - **Auth-gated, unlike `list`/`get`** (§2): before `auth` → `unauthorized`, same
@@ -256,7 +258,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   decorative. The shipped `console v0.1.0` never sends this op, so this path is
   defensive rather than an everyday client interaction.
 - `address` is the same **Address via Display → EIP-55 mixed-case** convention as
-  the top-level `to` (§3.8) — a console rendering a From→To block can place both
+  the top-level `to` (§3.10) — a console rendering a From→To block can place both
   side by side without re-casing either.
 - `balances` mirrors `list`'s `amount_wei` convention: **U256 via Display →
   decimal string**, at most one entry per chain in `allowed_chains`. A chain with
@@ -266,19 +268,77 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   this op reuses).
 - `allowed_chains` is the server's configured chain allow-list, in order — the
   same list `list`/`get` implicitly operate within.
-- **`wallet_locked`** (§3.9) answers if the core's own keyring isn't unlocked —
+- **`wallet_locked`** (§3.11) answers if the core's own keyring isn't unlocked —
   a state distinct from PIN `auth` above: this socket's `auth` gates *deciding*
   (§1), the core-level lock gates *having a signing key at all*. Today nothing
   in the shipped server re-locks an already-unlocked core at runtime, so this is
   a defensive path, not an observed production state — the client must still
   handle it (fail closed), not assume it cannot arrive.
 
-### 3.8 Field wire-formats (normative — the console's serde types mirror these)
+### 3.8 `positions` (proto 2+) — the wallet's own DeFi positions
+
+```json
+→ {"op":"positions"}
+← {"ok":true,"positions":[
+     {"protocol":"aave_v3","chain_id":1,
+      "asset_address":"0x…full-EIP55…","asset_symbol":"USD","asset_name":"Aave v3 account",
+      "asset_decimals":8,"balance":"100000000000","balance_formatted":"1000",
+      "extra":{"available_borrows_usd":"250","health_factor":"∞","ltv":"80%","total_debt_usd":"0"}}]}
+← {"ok":false,"error":"unauthorized"}     // no auth on this connection
+← {"ok":false,"error":"protocol_error"}   // session negotiated proto:1 (§3.1)
+← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.11
+```
+
+- **Auth-gated and proto-gated exactly like `context`** (§2, §3.7): private
+  financial data, `unauthorized` before `auth`, `protocol_error` on a session
+  that negotiated `proto:1`.
+- **Always the wallet's own address — the op takes no parameters.** The gRPC
+  agent-surface RPC over the same data accepts a target address; the human
+  channel deliberately does not (no view in the product asks about a foreign
+  address, and the socket must not grow surfaces it does not need).
+- **Best-effort, like `context` balances:** a failing RPC source (a chain, an
+  Aave pool call, a single vault) is skipped and logged **server-side**; the
+  call itself never fails. An empty `positions` list is a valid `ok:true`
+  answer and is indistinguishable on the wire from "no positions".
+- Position field wire-forms (normative):
+
+| Field | Wire form | Notes |
+|---|---|---|
+| `protocol` | string enum | `"aave_v3"` \| `"erc4626"` |
+| `chain_id` | number (u64) | `1` |
+| `asset_address` | **Address via Display → EIP-55 mixed-case** | Aave: the Pool contract; vault: the underlying token |
+| `asset_symbol` | string | `"USD"` for the Aave account |
+| `asset_name` | string | `"Aave v3 account"` |
+| `asset_decimals` | number (u8) | decimals `balance` is denominated in |
+| `balance` | raw integer decimal string, no point | Aave: total collateral (base units) |
+| `balance_formatted` | `balance` at `asset_decimals` places, trailing fractional zeros trimmed | `"1000"` |
+| `extra` | object, string → string, keys sorted (deterministic) | per-protocol, below |
+
+- **`extra` values are display strings — render them, never parse them as
+  numbers.** Per protocol:
+  - `aave_v3`: `available_borrows_usd` · `health_factor` (**may be the literal
+    `"∞"`** — Aave's no-debt sentinel) · `ltv` (carries a trailing `%`) ·
+    `total_debt_usd`.
+  - `erc4626`: `shares` (raw integer string) · `vault_address` (EIP-55).
+- **Client rule (normative):** a client with an open card must not issue
+  `positions` — the single in-flight slot (§1: no pipelining) belongs to the
+  decision. There is deliberately **no server-side timeout** on the underlying
+  on-chain reads (best-effort, the same class as `context` balances), so a
+  client scheduler must also prioritize `list` over `positions`/`activity`:
+  `list` is the only source of a NEW pending item with a ticking deadline.
+
+### 3.9 `activity` — reserved (proto 2, lands with core PR 3/3)
+
+Recent terminal outcomes (`executed` / `denied` / `expired` / `failed`). This
+anchor is reserved so the op's arrival does not renumber §3.10/§3.11 again;
+until that PR lands, `activity` is an unknown op → `protocol_error`.
+
+### 3.10 Field wire-formats (normative — the console's serde types mirror these)
 
 | Field | Where | Wire form | Example |
 |---|---|---|---|
 | `ok` | every response | bool | `true` |
-| `error` | error responses | string (see §3.9) | `"bad_pin"` |
+| `error` | error responses | string (see §3.11) | `"bad_pin"` |
 | `proto` | `hello` | number | `1` |
 | `supported` | `unsupported_proto` | array of number | `[1,2]` |
 | `server` | `hello` | string, informational | `"core-server/0.1.0"` |
@@ -314,7 +374,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 > bignum-safe type (not `u64`/`usize`): a truncated unlimited-approval would defeat
 > the very reason the console exists.
 
-### 3.9 Error-code vocabulary (every code the server emits)
+### 3.11 Error-code vocabulary (every code the server emits)
 
 | Code | Op(s) | Meaning |
 |---|---|---|
@@ -330,7 +390,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | `unknown_id` | get, approve, deny | id is not a live item (never parked, resolved+swept, or bad UUID) |
 | `already_resolved` | approve, deny | id already terminal (or in-flight); carries `state` |
 | `internal` | approve | unreachable post-execute inconsistency (defensive) |
-| `wallet_locked` | context | the core's own keyring isn't unlocked — distinct from PIN `auth` (§3.7) |
+| `wallet_locked` | context, positions | the core's own keyring isn't unlocked — distinct from PIN `auth` (§3.7) |
 
 ## 4. PIN & lockout semantics (server-side, normative)
 
@@ -371,7 +431,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | proto | core (server) | console (client) |
 |-------|---------------|------------------|
 | 1     | shipped as `0.1.0`; freezes at `v0.2.0` | ≥ `v0.1.0` |
-| 2     | DRAFT — adds `context` (§3.7) + `wallet_locked` (§3.9); freezes alongside its own console/core release pair (TBD) | a `proto:1` client is unaffected — it never sends `context` and the server still answers its `hello` with `proto:1` (§3.1) |
+| 2     | DRAFT — adds `context` (§3.7) + `positions` (§3.8) + `wallet_locked` (§3.11); freezes alongside its own console/core release pair (TBD) | a `proto:1` client is unaffected — it never sends `context`/`positions` and the server still answers its `hello` with `proto:1` (§3.1) |
 
 - **`proto` is the only compatibility gate.** The `server` version string is
   informational (§3.1) — a client must never gate on it. The shipped server reports
