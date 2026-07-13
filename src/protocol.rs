@@ -64,6 +64,10 @@ pub enum Request<'a> {
     /// (proto 2+, auth-gated — protocol §3.7). Sent once after `auth`; the
     /// address feeds the card's From→To block.
     Context,
+    /// Ask for the wallet's own DeFi positions (proto 2+, auth-gated —
+    /// protocol §3.8). Dispatched by the read-op scheduler only right after
+    /// a `list` reply, never ahead of one (the §3.8 client rule).
+    Positions,
 }
 
 /// Serialize a request to a single JSON line (no trailing `\n`; the transport adds
@@ -256,6 +260,47 @@ pub enum ContextOutcome {
     /// The wallet's context.
     Ok(Box<WalletContext>),
     /// The core's own keyring isn't unlocked (distinct from PIN auth, §3.9).
+    WalletLocked,
+}
+
+/// One DeFi position from `positions` (protocol §3.8), kept **verbatim** — the
+/// dashboard renders these strings and never parses them: `extra` values are
+/// display strings by canon (`health_factor` may be the literal `"∞"`, `ltv`
+/// carries a trailing `%`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Position {
+    /// Protocol wire form: `"aave_v3"` | `"erc4626"`. Kept as a string — an
+    /// unknown future protocol renders as-is instead of failing the parse.
+    pub protocol: String,
+    /// Chain the position lives on.
+    pub chain_id: u64,
+    /// Asset address (EIP-55) — the Aave Pool contract or the vault's
+    /// underlying token. Not rendered on the dashboard (Gate-1 decision №4);
+    /// carried so the client type mirrors §3.8 whole.
+    pub asset_address: String,
+    /// Human-readable asset symbol (`"USD"` for the Aave account).
+    pub asset_symbol: String,
+    /// Human-readable asset name.
+    pub asset_name: String,
+    /// Decimal places `balance` is denominated in.
+    pub asset_decimals: u8,
+    /// Raw integer balance, decimal string (no point).
+    pub balance: String,
+    /// `balance` at `asset_decimals` places, trailing zeros trimmed.
+    pub balance_formatted: String,
+    /// Per-protocol extras — display strings, keys sorted (§3.8).
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, String>,
+}
+
+/// Outcome of `positions` (§3.8). `WalletLocked` degrades the dashboard's
+/// positions block only — it never gates anything.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PositionsOutcome {
+    /// The wallet's positions — an empty list is a valid answer (best-effort:
+    /// no positions, or every source skipped on RPC failure; §3.8).
+    Ok(Vec<Position>),
+    /// The core's own keyring isn't unlocked (§3.11).
     WalletLocked,
 }
 
@@ -494,6 +539,36 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
     } else {
         Err(ProtocolError::Unexpected(raw.error.unwrap_or_else(|| {
             "context without ok or error".to_owned()
+        })))
+    }
+}
+
+/// Parse a `positions` reply (§3.8). Mirrors [`parse_context`]'s error
+/// surface: `wallet_locked` is the one degradable answer;
+/// `unauthorized`/`protocol_error` mean the channel is not what we negotiated
+/// (we only send `positions` post-auth on a proto-2 session) — the same
+/// fail-closed class as an unexpected resolve code.
+///
+/// # Errors
+/// [`ProtocolError::Malformed`]/[`ProtocolError::Unexpected`] as above.
+pub fn parse_positions(line: &str) -> Result<PositionsOutcome, ProtocolError> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ok: bool,
+        positions: Option<Vec<Position>>,
+        error: Option<String>,
+    }
+    let raw: Raw = parse_line(line)?;
+    if raw.ok {
+        let positions = raw.positions.ok_or_else(|| {
+            ProtocolError::Malformed("ok positions without a positions array".to_owned())
+        })?;
+        Ok(PositionsOutcome::Ok(positions))
+    } else if raw.error.as_deref() == Some("wallet_locked") {
+        Ok(PositionsOutcome::WalletLocked)
+    } else {
+        Err(ProtocolError::Unexpected(raw.error.unwrap_or_else(|| {
+            "positions without ok or error".to_owned()
         })))
     }
 }
@@ -1009,5 +1084,85 @@ mod tests {
                 "deny must never accept: {line}"
             );
         }
+    }
+
+    // ── positions (§3.8) ──
+
+    #[test]
+    fn parse_positions_keeps_every_field_and_extra_verbatim() {
+        // The canonical §3.8 example: display strings ("∞", "80%") must cross
+        // untouched — the dashboard renders them, it never parses them.
+        let line = r#"{"ok":true,"positions":[
+            {"protocol":"aave_v3","chain_id":1,
+             "asset_address":"0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
+             "asset_symbol":"USD","asset_name":"Aave v3 account",
+             "asset_decimals":8,"balance":"100000000000","balance_formatted":"1000",
+             "extra":{"available_borrows_usd":"250","health_factor":"∞","ltv":"80%","total_debt_usd":"0"}}]}"#
+            .replace('\n', "");
+        let PositionsOutcome::Ok(positions) = parse_positions(&line).unwrap() else {
+            panic!("ok positions");
+        };
+        assert_eq!(positions.len(), 1);
+        let p = &positions[0];
+        assert_eq!(p.protocol, "aave_v3");
+        assert_eq!(p.chain_id, 1);
+        assert_eq!(p.asset_symbol, "USD");
+        assert_eq!(p.asset_name, "Aave v3 account");
+        assert_eq!(p.asset_decimals, 8);
+        assert_eq!(p.balance, "100000000000");
+        assert_eq!(p.balance_formatted, "1000");
+        assert_eq!(p.extra["health_factor"], "∞");
+        assert_eq!(p.extra["ltv"], "80%");
+        assert_eq!(p.extra.len(), 4);
+    }
+
+    #[test]
+    fn parse_positions_accepts_an_empty_list_as_success() {
+        // Best-effort canon: no positions, or every source skipped — still ok.
+        let line = r#"{"ok":true,"positions":[]}"#;
+        assert_eq!(parse_positions(line).unwrap(), PositionsOutcome::Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_positions_wallet_locked_degrades() {
+        let line = r#"{"ok":false,"error":"wallet_locked"}"#;
+        assert_eq!(
+            parse_positions(line).unwrap(),
+            PositionsOutcome::WalletLocked
+        );
+    }
+
+    #[test]
+    fn parse_positions_unexpected_errors_fail_closed() {
+        // unauthorized/protocol_error mean the channel is not what we
+        // negotiated — an error, not a degradation.
+        for code in ["unauthorized", "protocol_error"] {
+            let line = format!(r#"{{"ok":false,"error":"{code}"}}"#);
+            assert!(matches!(
+                parse_positions(&line),
+                Err(ProtocolError::Unexpected(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_positions_ok_without_array_is_malformed() {
+        let line = r#"{"ok":true}"#;
+        assert!(matches!(
+            parse_positions(line),
+            Err(ProtocolError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_positions("not json"),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn positions_request_encodes_the_documented_op() {
+        assert_eq!(
+            encode_request(&Request::Positions).unwrap(),
+            r#"{"op":"positions"}"#
+        );
     }
 }

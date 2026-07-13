@@ -24,9 +24,9 @@ use std::thread::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, ResolveOutcome,
-    Summary, encode_request, parse_approve, parse_auth, parse_context, parse_deny, parse_get,
-    parse_hello, parse_list,
+    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, PositionsOutcome,
+    ResolveOutcome, Summary, encode_request, parse_approve, parse_auth, parse_context, parse_deny,
+    parse_get, parse_hello, parse_list, parse_positions,
 };
 
 /// Informational client id sent in `hello` (the server does not validate it).
@@ -54,6 +54,8 @@ pub enum Request {
     Deny(String),
     /// Ask for the wallet's own context (proto 2+, auth-gated).
     Context,
+    /// Ask for the wallet's own DeFi positions (proto 2+, auth-gated).
+    Positions,
 }
 
 /// A message from the worker to the MVU layer.
@@ -74,6 +76,8 @@ pub enum Reply {
     Resolve(ResolveOutcome),
     /// Result of a `context` (proto 2+).
     Context(ContextOutcome),
+    /// Result of a `positions` (proto 2+).
+    Positions(PositionsOutcome),
     /// The connection is finished and unusable — the worker has exited.
     Fatal(TransportError),
 }
@@ -285,6 +289,11 @@ fn serve_one(
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
             exchange(writer, reader, &line)?
         }
+        Request::Positions => {
+            let line = encode_request(&protocol::Request::Positions)
+                .map_err(|e| TransportError::Protocol(e.to_string()))?;
+            exchange(writer, reader, &line)?
+        }
     };
     let parsed = match req {
         Request::Auth(_) => parse_auth(&resp).map(Reply::Auth),
@@ -293,6 +302,7 @@ fn serve_one(
         Request::Approve(_) | Request::ApprovePin(_) => parse_approve(&resp).map(Reply::Resolve),
         Request::Deny(_) => parse_deny(&resp).map(Reply::Resolve),
         Request::Context => parse_context(&resp).map(Reply::Context),
+        Request::Positions => parse_positions(&resp).map(Reply::Positions),
     };
     parsed.map_err(|e| TransportError::Protocol(e.to_string()))
 }

@@ -319,6 +319,7 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Up | KeyCode::Char('k') => Some(Msg::MoveUp),
             KeyCode::Down | KeyCode::Char('j') => Some(Msg::MoveDown),
             KeyCode::Enter => Some(Msg::Open),
+            KeyCode::Char('d') => Some(Msg::View(View::Dashboard)),
             KeyCode::Char('r') => Some(Msg::View(View::Receive)),
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
@@ -332,6 +333,18 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             ..
         } => match key.code {
             KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
+            KeyCode::Char('d') => Some(Msg::View(View::Dashboard)),
+            KeyCode::Char('q') => Some(Msg::Quit),
+            _ => None,
+        },
+        // The Dashboard is display-only: navigation and quit, nothing else.
+        Phase::Watching {
+            confirm: None,
+            view: View::Dashboard,
+            ..
+        } => match key.code {
+            KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
+            KeyCode::Char('r') => Some(Msg::View(View::Receive)),
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
@@ -428,6 +441,7 @@ mod tests {
                 allowed_chains: vec![1],
             },
         )))));
+        m.update(Msg::View(View::Queue)); // Stage-5 home is Dashboard
         m.update(Msg::Tick);
         m.update(Msg::Reply(Reply::List(vec![Summary {
             id: "a".to_owned(),
@@ -766,5 +780,66 @@ mod tests {
             fatal_code(&TransportError::Protocol("x".to_owned())),
             EXIT_FATAL
         );
+    }
+
+    fn dashboarding() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Dashboard,
+        }
+    }
+
+    #[test]
+    fn the_dashboard_view_maps_navigation_and_quit_only() {
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('a')), &dashboarding()),
+            Some(Msg::View(View::Queue))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Esc), &dashboarding()),
+            Some(Msg::View(View::Queue))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('r')), &dashboarding()),
+            Some(Msg::View(View::Receive))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('q')), &dashboarding()),
+            Some(Msg::Quit)
+        ));
+        // Display-only: Enter must not open a card behind the screen.
+        for dead in [
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('d'),
+            KeyCode::Char('7'),
+        ] {
+            assert!(
+                map_key(&key(dead), &dashboarding()).is_none(),
+                "{dead:?} must be dead on the Dashboard"
+            );
+        }
+    }
+
+    #[test]
+    fn every_view_reaches_every_other_view() {
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('d')), &watching()),
+            Some(Msg::View(View::Dashboard))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('d')), &receiving()),
+            Some(Msg::View(View::Dashboard))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('r')), &dashboarding()),
+            Some(Msg::View(View::Receive))
+        ));
     }
 }

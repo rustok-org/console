@@ -9,7 +9,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{AuthError, Confirm, DecisionKind, Model, Notice, Phase, ResolveError, View};
+use crate::app::{
+    AuthError, Confirm, DecisionKind, Model, Notice, Phase, Positions, ResolveError, View,
+};
 use crate::protocol::{Card, Summary};
 use crate::{format, qr, theme};
 
@@ -40,6 +42,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
                 now_unix,
             ),
             View::Receive => render_receive(frame, items.len(), model.wallet_address()),
+            View::Dashboard => render_dashboard(frame, items.len(), model),
         },
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
@@ -64,6 +67,8 @@ fn tab_line(active: View, pending: usize) -> Line<'static> {
         }
     };
     Line::from(vec![
+        Span::raw(" "),
+        tab(" Dashboard [d] ".to_owned(), active == View::Dashboard),
         Span::raw(" "),
         tab(format!(" Queue·{pending} [a] "), active == View::Queue),
         Span::raw(" "),
@@ -442,6 +447,156 @@ fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
         banner.append(&mut lines);
         lines = banner;
     }
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+}
+
+/// The Dashboard: per-chain balance (from `context`), DeFi positions (the
+/// `positions` read-op), and the "waiting for you" count. Pure display —
+/// nothing here signs or gates; the values render **verbatim** (`extra` are
+/// display strings by canon §3.8 — including the literal `"∞"`).
+///
+/// Honesty rules: a failed balance refresh flags the block as possibly stale
+/// (never silently shows old data as fresh); positions that do not fit end
+/// with an explicit "+N more" marker, never a silent clip.
+fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
+    frame.render_widget(
+        Paragraph::new(tab_line(View::Dashboard, pending)),
+        chunks[0],
+    );
+
+    let block = themed_block(" Dashboard ");
+    let inner = block.inner(chunks[1]);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // ── Waiting for you — the reason this console exists comes first.
+    let waiting = if pending == 0 {
+        "Waiting for you: nothing pending".to_owned()
+    } else {
+        format!("Waiting for you: {pending} pending — press a")
+    };
+    let waiting_style = if pending == 0 {
+        theme::label_style()
+    } else {
+        theme::high_risk_style()
+    };
+    push_wrapped(&mut lines, width, waiting, waiting_style);
+    lines.push(Line::from(""));
+
+    // ── Balance (from `context`; per-chain native ETH).
+    push_wrapped(
+        &mut lines,
+        width,
+        "balance".to_owned(),
+        theme::label_style(),
+    );
+    match model.wallet_context() {
+        Some(ctx) if !ctx.balances.is_empty() => {
+            for b in &ctx.balances {
+                push_wrapped(
+                    &mut lines,
+                    width,
+                    format!(
+                        "  chain {}  {} {}",
+                        b.chain_id,
+                        format::wei_to_eth(&b.balance),
+                        b.symbol
+                    ),
+                    theme::value_style(),
+                );
+            }
+        }
+        Some(_) => push_wrapped(
+            &mut lines,
+            width,
+            "  no balances reported".to_owned(),
+            theme::label_style(),
+        ),
+        None => push_wrapped(
+            &mut lines,
+            width,
+            "  balance unavailable".to_owned(),
+            theme::label_style(),
+        ),
+    }
+    if model.context_stale() {
+        push_wrapped(
+            &mut lines,
+            width,
+            "  balance may be stale — refresh failed".to_owned(),
+            theme::high_risk_style(),
+        );
+    }
+    lines.push(Line::from(""));
+
+    // ── Positions (tri-state: loading / loaded / unavailable).
+    push_wrapped(
+        &mut lines,
+        width,
+        "positions".to_owned(),
+        theme::label_style(),
+    );
+    match model.positions() {
+        Positions::NotYet => push_wrapped(
+            &mut lines,
+            width,
+            "  loading positions…".to_owned(),
+            theme::label_style(),
+        ),
+        Positions::Unavailable => push_wrapped(
+            &mut lines,
+            width,
+            "  positions unavailable".to_owned(),
+            theme::label_style(),
+        ),
+        Positions::Loaded(list) if list.is_empty() => push_wrapped(
+            &mut lines,
+            width,
+            "  no DeFi positions".to_owned(),
+            theme::label_style(),
+        ),
+        Positions::Loaded(list) => {
+            // The budget guards against a silent clip: rows that do not fit
+            // are replaced by an explicit "+N more" marker (raw_data pattern).
+            let budget = height.saturating_sub(lines.len() + 1);
+            let mut shown = 0usize;
+            for (i, p) in list.iter().enumerate() {
+                let extra: String = p
+                    .extra
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let mut row = format!(
+                    "  {} · {} {} {}",
+                    p.protocol, p.balance_formatted, p.asset_symbol, p.asset_name
+                );
+                if !extra.is_empty() {
+                    row.push_str("  —  ");
+                    row.push_str(&extra);
+                }
+                let mut rendered = Vec::new();
+                push_wrapped(&mut rendered, width, row, theme::value_style());
+                let remaining = list.len() - i;
+                if lines.len() + rendered.len() > budget + if remaining == 1 { 1 } else { 0 } {
+                    push_wrapped(
+                        &mut lines,
+                        width,
+                        format!("  +{remaining} more — terminal too small"),
+                        theme::label_style(),
+                    );
+                    break;
+                }
+                lines.append(&mut rendered);
+                shown += 1;
+            }
+            let _ = shown;
+        }
+    }
+
     frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
 }
 
@@ -883,6 +1038,7 @@ mod tests {
                 allowed_chains: vec![1],
             },
         )))));
+        model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
         model.update(Msg::Tick);
         model.update(Msg::Reply(Reply::List(items)));
     }
@@ -908,6 +1064,7 @@ mod tests {
                 allowed_chains: vec![1],
             },
         )))));
+        model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
         model.update(Msg::Tick);
         model.update(Msg::Reply(Reply::List(items)));
     }
@@ -926,6 +1083,7 @@ mod tests {
         model.update(Msg::PinSubmit);
         model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
         model.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
         model.update(Msg::Tick);
         model.update(Msg::Reply(Reply::List(items)));
     }
@@ -1775,5 +1933,174 @@ mod tests {
         // The display degraded — approve must NOT be gated on it.
         let row = action_row(&rows);
         assert!(row.contains("Approve"));
+    }
+
+    // ── Stage 5: the Dashboard view ──
+
+    use crate::protocol::{ChainBalance, Position, PositionsOutcome};
+
+    /// Drive a model onto the (home) Dashboard with the given balances, then
+    /// feed it the positions reply the scheduler solicits.
+    fn to_dashboard(balances: Vec<ChainBalance>, positions: PositionsOutcome) -> Model {
+        let mut m = to_dashboard_loading(balances);
+        m.update(Msg::Reply(Reply::Positions(positions)));
+        m
+    }
+
+    /// Same, stopped BEFORE the positions reply lands (the loading state).
+    fn to_dashboard_loading(balances: Vec<ChainBalance>) -> Model {
+        let mut m = Model::new();
+        m.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        m.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        m.update(Msg::PinDigit('1'));
+        m.update(Msg::PinSubmit);
+        m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances,
+                allowed_chains: vec![1],
+            },
+        )))));
+        m.update(Msg::Tick);
+        // The scheduler answers this list reply with the positions request.
+        m.update(Msg::Reply(Reply::List(vec![])));
+        m
+    }
+
+    fn aave_position() -> Position {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("health_factor".to_owned(), "∞".to_owned());
+        extra.insert("ltv".to_owned(), "80%".to_owned());
+        Position {
+            protocol: "aave_v3".to_owned(),
+            chain_id: 1,
+            asset_address: "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2".to_owned(),
+            asset_symbol: "USD".to_owned(),
+            asset_name: "Aave v3 account".to_owned(),
+            asset_decimals: 8,
+            balance: "100000000000".to_owned(),
+            balance_formatted: "1000".to_owned(),
+            extra,
+        }
+    }
+
+    #[test]
+    fn the_dashboard_shows_balance_positions_and_the_waiting_count() {
+        let balances = vec![ChainBalance {
+            chain_id: 1,
+            symbol: "ETH".to_owned(),
+            balance: "10000000000000000".to_owned(), // 0.01 ETH
+        }];
+        let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["chain 1", "0.01 ETH"]),
+            "the balance reads humanly, per chain"
+        );
+        assert!(
+            has_line_with(&rows, &["aave_v3", "1000 USD", "Aave v3 account"]),
+            "a position line carries protocol, formatted balance, and name"
+        );
+        assert!(
+            has_line_with(&rows, &["health_factor ∞"]) && has_line_with(&rows, &["ltv 80%"]),
+            "extra values render verbatim — display strings, never parsed"
+        );
+        assert!(
+            has_line_with(&rows, &["Waiting for you: nothing pending"]),
+            "the waiting block is present even when idle"
+        );
+        assert!(
+            !rows.join("\n").contains(&aave_position().asset_address),
+            "asset addresses are not rendered on the dashboard (Gate-1 №4)"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_loading_state_is_not_unavailable() {
+        let m = to_dashboard_loading(vec![]);
+        let screen = draw(&m, 80, 24);
+        assert!(screen.contains("loading positions"), "NotYet says loading");
+        assert!(
+            !screen.contains("positions unavailable"),
+            "…and never claims unavailability it has not observed"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_degrades_honestly() {
+        // wallet_locked positions → unavailable; empty list → no positions.
+        let m = to_dashboard(vec![], PositionsOutcome::WalletLocked);
+        assert!(draw(&m, 80, 24).contains("positions unavailable"));
+
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(vec![]));
+        let screen = draw(&m, 80, 24);
+        assert!(screen.contains("no DeFi positions"));
+        assert!(
+            screen.contains("no balances reported"),
+            "empty balances are named, not blank"
+        );
+    }
+
+    #[test]
+    fn a_failed_balance_refresh_is_flagged_on_the_dashboard() {
+        let balances = vec![ChainBalance {
+            chain_id: 1,
+            symbol: "ETH".to_owned(),
+            balance: "5".to_owned(),
+        }];
+        let mut m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        let screen = draw(&m, 80, 24);
+        assert!(
+            screen.contains("may be stale"),
+            "old data shown as possibly stale, never as fresh"
+        );
+    }
+
+    #[test]
+    fn overflowing_positions_end_with_an_explicit_marker() {
+        let many: Vec<Position> = (0..40)
+            .map(|i| {
+                let mut p = aave_position();
+                p.asset_symbol = format!("TOK{i}");
+                p
+            })
+            .collect();
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            rows.join("\n").contains("more — terminal too small"),
+            "clipped positions say so out loud (raw_data honesty pattern)"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_tab_is_first_and_active_on_the_home_view() {
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(vec![]));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &m, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            row.contains("Dashboard [d]")
+                && row.contains("Queue·0 [a]")
+                && row.contains("Receive [r]"),
+            "all three tabs with their keys: {row}"
+        );
+        let dash_at = row.find("Dashboard").unwrap() as u16;
+        assert!(
+            buffer[(dash_at, 0)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "the active (home) tab is the Dashboard"
+        );
     }
 }
