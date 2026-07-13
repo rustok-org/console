@@ -7,6 +7,7 @@
 pub mod app;
 pub mod format;
 pub mod protocol;
+pub mod qr;
 pub mod theme;
 pub mod transport;
 pub mod ui;

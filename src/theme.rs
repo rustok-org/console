@@ -104,6 +104,17 @@ pub fn high_risk_style() -> Style {
     Style::new().fg(high_risk()).add_modifier(Modifier::BOLD)
 }
 
+/// QR modules — true black on true white, whatever the brand palette or the
+/// terminal theme: a scanner's contrast floor is a function, not branding.
+/// Under `NO_COLOR` both drop to the terminal default and the half-block
+/// characters alone carry the polarity (dark module = block) — correct on a
+/// light terminal, inverted on a dark one, which most scanners still read.
+pub fn qr_style() -> Style {
+    Style::new()
+        .fg(role(0x00, 0x00, 0x00))
+        .bg(role(0xFF, 0xFF, 0xFF))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
