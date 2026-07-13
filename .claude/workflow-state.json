@@ -1,6 +1,6 @@
 {
-  "state": "shipped",
-  "task": "Console v2 Фаза 2, Этап 3 Receive (адрес + QR + nav-shell) — ГЕЙТ-1 ПРОЙДЕН (2026-07-13, две подписи: Ревьюер раунд-2 «БЛОКЕРов нет, го» + Капитан «го» и ратификация вопроса 2 — QR кодирует ГОЛЫЙ EIP-55 адрес, не ethereum:-URI). Спека: .claude/specs/2026-07-13-console-v2-phase2-s3-receive.md. SHIPPED: «добро» Капитана получено → push + PR #11 (https://github.com/rustok-org/console/pull/11), CI 4/4 зелёный (Test/Clippy/Format/Advisories). Ждёт мержа Капитаном; после мержа — DoD-скан QR телефоном. Ветка feat/console-v2-phase2-s3-receive (16fa03f+94f5ddb, не запушено); отчёт .claude/reports/2026-07-13-console-v2-phase2-s3-receive.md; гейты 156+17+1/fmt/clippy/deny зелёные, 6 red-мутаций, смоук 9/9. Порядок был: qr.rs (dep qrcodegen + рендер, red→green) → app.rs (View + гейт переключения с тройной защитой + Open-гвард) → main.rs (map_key) → ui.rs (таб-бар в хедер-строке + render_receive + снапшоты). Дешёвые гейты мои (fmt/clippy/test/deny); флот-5 (sonnet)+/rust-review+/security-review — Ревьюеру на Гейте-2; push/PR после «чисто». Предыдущее: Этап 2 ЗАКРЫТ (PR console#10 → main 4efb062, смержен Капитаном 2026-07-13): резидентная консоль — решение возвращает в очередь (Phase::Resolved/ExitOutcome удалены), decision stream на не-TTY stdout (инвариант #7 эволюционировал, ADR в .claude/decisions/), exit-коды сессии с v0.1-значениями, PIN-lockout-баннер, клиент proto 2 + context, двух-блочный From→To verbatim внутри priority_lines. CI-сверка с core (референс): 4 базовых гейта идентичны (fmt/clippy/test/deny, pinned actions, concurrency) — core-экстры либо core-специфичны (Approval Acceptor Guard, protobuf), либо покрыты иначе (release → docker-publish binary-carrier); достаточно, правок не требуется. NEXT (по ратифицированному порядку, НЕ начат — решение Капитана 2026-07-13 закрыть сессию): Этап 3 Receive (адрес+QR; введёт View-enum с двумя реальными видами; открытый вопрос §9.3 — крейт qrcode vs ASCII-QR, проверить cargo deny). Затем: core PR2 positions → Дашборд → core PR3 activity → Activity. Релизный поезд §8 ждёт конца Фазы 2.",
+  "state": "idle",
+  "task": "Console v2 Фаза 2, Этап 3 ЗАКРЫТ (PR console#11 → main a6c0d0d, смержен по «мержи по зеленому» Капитана, CI 4/4 до мержа): Receive (полный EIP-55 verbatim + QR той же строки, голый адрес — ратификация Капитана) + nav-shell (View в Phase::Watching, таб-бар в существующей хедер-строке — watch_chunks/fit-гейт не тронуты; тройной гейт переключения confirm/awaiting_card/parked-Get; on_open view-гвард) + src/qr.rs (qrcodegen 1.8.0, MIT, 0 deps, полублоки+тихая зона 4, ECC M) + fail-honest деградации (QR hidden по высоте И ширине; пустой адрес; overflow-банер адреса). Гейты на смерженном main: cargo test 159+17+1 зелёно, fmt чисто, clippy чисто. DoD-остаток: скан QR телефоном на живом прогоне (за Капитаном; ожидание — байт-в-байт адрес context). NEXT по ратифицированному порядку (§9.5): core PR2 positions → Этап 5 Дашборд → core PR3 activity → Этап 7 Activity. Релизный поезд §8 ждёт конца Фазы 2. Примечание: remote-ветка release/v0.1.0 исчезла с origin (не этой сессией; тег v0.1.0 цел — релиз живёт на теге).",
   "fast": false,
   "history": [
     {
@@ -158,7 +158,13 @@
       "to": "shipped",
       "at": "2026-07-13T15:30:00+05:00",
       "gate": "«Добро» Капитана → push + PR #11; CI 4/4 зелёный до мержа (Test 159+17+1 / Clippy / Format / Advisories). Ветка feat/console-v2-phase2-s3-receive, 5 коммитов (16fa03f qr → 94f5ddb nav-shell+Receive → 43fb2d5 docs → af5ba77 фиксы Гейта-2 → docs). Остаток круга: мерж Капитаном → запись «круг закрыт» → DoD-скан QR телефоном на живом прогоне (ожидание: байт-в-байт адрес контекста). NEXT по ратифицированному порядку: core PR2 positions → Этап 5 Дашборд."
+    },
+    {
+      "from": "shipped",
+      "to": "idle",
+      "at": "2026-07-13T15:50:00+05:00",
+      "gate": "Круг закрыт: PR #11 смержен сквошем (main a6c0d0d) по слову Капитана «мержи по зеленому», CI 4/4 зелёный до мержа; ветки удалены локально и на remote (prune чист). Гейты на смерженном main: cargo test 159+17+1, fmt чисто, clippy --all-targets -D warnings чисто. DoD-остаток: живой скан QR телефоном (за Капитаном). Замечание вне круга: origin/release/v0.1.0 исчезла с remote (удалена не этой сессией — мой delete целил только feature-ветку и вернул «уже нет»); тег v0.1.0 на месте. NEXT = core PR2 positions (репо core, свой круг со своим Гейтом-1)."
     }
   ],
-  "updated": "2026-07-13T15:30:00+05:00"
+  "updated": "2026-07-13T15:50:00+05:00"
 }
