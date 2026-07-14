@@ -12,11 +12,12 @@
 //! explicit `y` approves; `n`, Esc, Ctrl-C and the expiry deadline all send `deny`.
 //! Leaving the confirmation without deciding is not offered.
 
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    AuthOutcome, Card, ContextOutcome, GetOutcome, PositionsOutcome, ResolveOutcome, Summary,
-    TerminalState, WalletContext,
+    AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, PositionsOutcome,
+    ResolveOutcome, Summary, TerminalState, WalletContext,
 };
 use crate::transport::{self, Reply, TransportError};
 use crate::ui;
@@ -178,6 +179,11 @@ pub enum View {
     /// The wallet's own address + QR. Pure display: signs nothing, sends
     /// nothing, adds no socket op.
     Receive,
+    /// Terminal outcomes — the local log merged with the server's retained
+    /// window (Stage 7). Pure display with a state filter; addresses here
+    /// are SHORTENED (`format::short_addr`) — a display list, not a signing
+    /// surface (ТЗ §4.1).
+    Activity,
 }
 
 /// The dashboard's positions block — a tri-state, so "still loading" never
@@ -263,6 +269,156 @@ pub struct Decision {
     pub tx_hash: Option<String>,
     /// The failure reason, on a failed execution.
     pub reason: Option<String>,
+}
+
+/// One row of the console's activity history — the local log's stored form
+/// (one JSONL line) and the Activity view's display form, one representation
+/// end to end. `to`/`amount_wei`/`chain_id` are `None` on a server-only
+/// record: the retained window drops the preview on resolve, so a record
+/// first seen via `activity` is honestly poorer than one written at decision
+/// time. Unknown fields are ignored on load (soft evolution, no version field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// Resolution time, unix seconds — stamped by the run loop (the model has
+    /// no clock): `now` for a decision made here, `arrival − age_secs` for a
+    /// server outcome (§3.9).
+    pub unix: u64,
+    /// The item's preview id — the dedup key (§3.9).
+    pub id: String,
+    /// Terminal state, protocol vocabulary (§3.5/§3.9 words, one end to end).
+    pub state: OutcomeState,
+    /// Recipient (EIP-55, stored verbatim) — rich records only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Native value, decimal wei string — rich records only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_wei: Option<String>,
+    /// Chain id — rich records only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
+    /// Executed transaction hash, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    /// Operator-masked failure reason, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl HistoryEntry {
+    /// Fill this entry's MISSING fields from another record of the same
+    /// outcome — present fields are never overwritten. The ONE merge seam
+    /// for every duplicate-id path: the in-session fill
+    /// ([`Model::fill_history_detail`]) and the load-time dedup (Gate-2
+    /// BLOCKER-1: a whole-record replace by timestamp traded a rich record
+    /// for a poor one written by a second console — the stamps come from
+    /// different formulas and are not comparable).
+    pub fn fill_missing_from(&mut self, other: &HistoryEntry) {
+        if self.to.is_none() {
+            self.to.clone_from(&other.to);
+        }
+        if self.amount_wei.is_none() {
+            self.amount_wei.clone_from(&other.amount_wei);
+        }
+        if self.chain_id.is_none() {
+            self.chain_id = other.chain_id;
+        }
+        if self.tx_hash.is_none() {
+            self.tx_hash.clone_from(&other.tx_hash);
+        }
+        if self.reason.is_none() {
+            self.reason.clone_from(&other.reason);
+        }
+    }
+}
+
+/// A decision made on THIS console, drained by the run loop
+/// ([`Model::take_decided_outcome`]) to be stamped (unix = now), appended to
+/// the local log, and pushed back via [`Model::push_history`]. The timestamp
+/// is deliberately absent — the model has no clock (Stage-2 lesson). Born in
+/// `apply_resolve` while the card is still open: the ONLY moment to/amount
+/// are known (the server's retained outcome drops the preview).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecidedOutcome {
+    /// The item's preview id.
+    pub id: String,
+    /// Terminal state, protocol vocabulary.
+    pub state: OutcomeState,
+    /// Recipient, EIP-55 verbatim (from the open card).
+    pub to: String,
+    /// Native value, decimal wei string (from the open card).
+    pub amount_wei: String,
+    /// Chain id (from the open card).
+    pub chain_id: u64,
+    /// Executed transaction hash, when this console saw it.
+    pub tx_hash: Option<String>,
+    /// Failure reason, when this console saw it.
+    pub reason: Option<String>,
+}
+
+/// The Activity view's outcome filter, cycled by `f`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryFilter {
+    /// Every outcome.
+    #[default]
+    All,
+    /// Executed only.
+    Executed,
+    /// Denied only.
+    Denied,
+    /// Expired only.
+    Expired,
+    /// Failed only.
+    Failed,
+}
+
+impl HistoryFilter {
+    /// The next filter in the `f`-cycle.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Executed,
+            Self::Executed => Self::Denied,
+            Self::Denied => Self::Expired,
+            Self::Expired => Self::Failed,
+            Self::Failed => Self::All,
+        }
+    }
+
+    /// Whether an entry in this state passes the filter.
+    #[must_use]
+    pub fn admits(self, state: OutcomeState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Executed => state == OutcomeState::Executed,
+            Self::Denied => state == OutcomeState::Denied,
+            Self::Expired => state == OutcomeState::Expired,
+            Self::Failed => state == OutcomeState::Failed,
+        }
+    }
+
+    /// The view-header label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Executed => "executed",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The protocol word for a decision made here — the ONE mapping between
+/// [`DecisionKind`] and the stored/wire vocabulary (a named seam: a swapped
+/// arm must fail a test, not pass every gate green).
+fn outcome_state(kind: DecisionKind) -> OutcomeState {
+    match kind {
+        DecisionKind::Approved => OutcomeState::Executed,
+        DecisionKind::Rejected => OutcomeState::Denied,
+        DecisionKind::Expired => OutcomeState::Expired,
+        DecisionKind::Failed => OutcomeState::Failed,
+    }
 }
 
 /// An open card **is** the confirmation dialog (`AGENTS.md` #5): it is left by
@@ -394,6 +550,10 @@ pub enum Msg {
     /// Switch to a view (nav-shell tab). Refused while a card is open or a
     /// card request exists — see [`Model::on_view`].
     View(View),
+    /// Cycle the Activity view's outcome filter (`f`). A no-op outside the
+    /// Activity view — the key is only mapped there, but the model is the
+    /// boundary, not the key map.
+    Filter,
     /// Quit.
     Quit,
 }
@@ -433,7 +593,27 @@ pub struct Model {
     /// block is flagged stale (Gate-1: named mechanism, not derived from
     /// `read_age`). Cleared by a successful refresh.
     context_stale: bool,
+    /// Activity history, newest first (unix desc, id asc) — fed ONLY by the
+    /// run loop (log load + stamped pushes); the model never stamps a time
+    /// (it has no clock). Capped at [`HISTORY_CAP`].
+    history: Vec<HistoryEntry>,
+    /// The Activity view's outcome filter (`f` cycles it).
+    history_filter: HistoryFilter,
+    /// A decision made here, waiting for the run loop to stamp and persist
+    /// it ([`Self::take_decided_outcome`]).
+    decided: Option<DecidedOutcome>,
+    /// Server outcomes from `activity` replies, waiting for the run loop's
+    /// dedup/stamp pass ([`Self::take_server_outcomes`]).
+    server_outcomes: Vec<OutcomeEntry>,
+    /// A static log-degradation note for the Activity footer, set once at
+    /// startup by the run loop (persistence off / log partially unreadable).
+    /// `None` when the log is healthy.
+    history_note: Option<String>,
 }
+
+/// In-memory/display cap on the activity history (the file compacts at 2×
+/// this on load — run-loop side, which is why it is `pub`).
+pub const HISTORY_CAP: usize = 500;
 
 /// A parked user intent (no `List` — the poll is suppressed, not queued).
 ///
@@ -478,6 +658,11 @@ impl Default for Model {
             read_age: STALE_TICKS,
             next_read: ReadOp::default(),
             context_stale: false,
+            history: Vec::new(),
+            history_filter: HistoryFilter::default(),
+            decided: None,
+            server_outcomes: Vec::new(),
+            history_note: None,
         }
     }
 }
@@ -535,6 +720,82 @@ impl Model {
         self.decision.take()
     }
 
+    /// The activity history, newest first (unix desc, id asc — display order).
+    #[must_use]
+    pub fn history(&self) -> &[HistoryEntry] {
+        &self.history
+    }
+
+    /// The Activity view's current outcome filter.
+    #[must_use]
+    pub fn history_filter(&self) -> HistoryFilter {
+        self.history_filter
+    }
+
+    /// The static log-degradation note for the Activity footer, if any.
+    #[must_use]
+    pub fn history_note(&self) -> Option<&str> {
+        self.history_note.as_deref()
+    }
+
+    /// Set the log-degradation footer note (run-loop startup, at most once).
+    pub fn set_history_note(&mut self, note: String) {
+        self.history_note = Some(note);
+    }
+
+    /// Seed the history from the local log (run-loop startup; the caller
+    /// dedups by id — it owns the dedup set). Sorted and capped here so the
+    /// display invariant never depends on file order.
+    pub fn set_history(&mut self, entries: Vec<HistoryEntry>) {
+        self.history = entries;
+        self.sort_and_cap_history();
+    }
+
+    /// Add one stamped entry (run loop only; id uniqueness is the caller's
+    /// contract — it owns the dedup set).
+    pub fn push_history(&mut self, entry: HistoryEntry) {
+        self.history.push(entry);
+        self.sort_and_cap_history();
+    }
+
+    /// Fill MISSING detail on the known entry with `from.id` (spec /check-2),
+    /// both ways: an item resolved by another connection leaves our rich
+    /// record without tx_hash/reason (the server window carries them); a
+    /// server-only record gains to/amount/chain when the same id is later
+    /// decided here. Present fields are never overwritten (the shared
+    /// [`HistoryEntry::fill_missing_from`] seam); the file keeps its first
+    /// record (append-only) — this enriches the session view only. Takes the
+    /// whole record, not positional Options — five same-typed parameters
+    /// were a silent-swap hazard (Gate-2 МИНОР-9).
+    pub fn fill_history_detail(&mut self, from: &HistoryEntry) {
+        if let Some(entry) = self.history.iter_mut().find(|e| e.id == from.id) {
+            entry.fill_missing_from(from);
+        }
+    }
+
+    /// Drain the decision made here, for the run loop to stamp (unix = now),
+    /// persist, and push back via [`Self::push_history`] — in the same loop
+    /// pass, before the next render (the order is normative).
+    pub fn take_decided_outcome(&mut self) -> Option<DecidedOutcome> {
+        self.decided.take()
+    }
+
+    /// Drain the server outcomes queued by `activity` replies, for the run
+    /// loop's dedup/stamp pass (unix = arrival − age, §3.9).
+    pub fn take_server_outcomes(&mut self) -> Vec<OutcomeEntry> {
+        std::mem::take(&mut self.server_outcomes)
+    }
+
+    /// Newest first: unix desc, id asc on ties (a lockout batch shares one
+    /// second — determinism mirrors the server's own tiebreak). Two RICH
+    /// decisions inside one second tie-break by id too — a documented
+    /// consequence of whole-second stamps, not chronology (Gate-1 finding).
+    fn sort_and_cap_history(&mut self) {
+        self.history
+            .sort_unstable_by(|a, b| b.unix.cmp(&a.unix).then_with(|| a.id.cmp(&b.id)));
+        self.history.truncate(HISTORY_CAP);
+    }
+
     /// Fold one message into the model, returning at most one request to send.
     pub fn update(&mut self, msg: Msg) -> Option<transport::Request> {
         match msg {
@@ -583,6 +844,17 @@ impl Model {
                 self.on_view(view);
                 None
             }
+            Msg::Filter => {
+                if let Phase::Watching {
+                    view: View::Activity,
+                    confirm: None,
+                    ..
+                } = &self.phase
+                {
+                    self.history_filter = self.history_filter.next();
+                }
+                None
+            }
             Msg::Open => self.on_open(),
         }
     }
@@ -607,8 +879,8 @@ impl Model {
         } = &mut self.phase
         {
             *current = view;
-            if view == View::Dashboard {
-                // Entering the dashboard marks the read data stale: the next
+            if matches!(view, View::Dashboard | View::Activity) {
+                // Entering a read-op view marks the read data stale: the next
                 // list reply refreshes it. Bounded structurally — at most one
                 // read-op per list reply (spec /check-5).
                 self.read_age = self.read_age.max(STALE_TICKS);
@@ -861,6 +1133,7 @@ impl Model {
             }
             Reply::Context(outcome) => self.apply_context(outcome),
             Reply::Positions(outcome) => self.apply_positions(outcome),
+            Reply::Activity(outcomes) => self.apply_activity(outcomes),
             Reply::List(items) => self.apply_list(items),
             Reply::Get(outcome) => self.apply_get(outcome),
             Reply::Resolve(outcome) => self.apply_resolve(outcome),
@@ -887,11 +1160,15 @@ impl Model {
     }
 
     /// The read-op scheduler (list-first policy, canon §3.8 + the Reviewer's
-    /// Gate-1 flag): a read-op (`positions` | `context` refresh, alternating)
-    /// goes out ONLY right after a fresh `list` reply — never from a tick
-    /// (the tick belongs to `list`), never ahead of a parked user intent
-    /// (`flush_pending` ran first), never with a card open or a card request
-    /// anywhere in flight, and only when the read data has gone stale.
+    /// Gate-1 flag): a read-op goes out ONLY right after a fresh `list`
+    /// reply — never from a tick (the tick belongs to `list`), never ahead
+    /// of a parked user intent (`flush_pending` ran first), never with a
+    /// card open or a card request anywhere in flight, and only when the
+    /// read data has gone stale. WHICH op is the view's choice: the
+    /// Dashboard alternates `positions`/`context` (the two-valued
+    /// [`ReadOp`] state is untouched by Stage 7); the Activity view sends
+    /// `activity` — it never joins the alternation, so leaving and
+    /// re-entering the Dashboard resumes exactly where it left off.
     ///
     /// Guaranteed and tested: the ORDER OF ORIGINATION — a read-op never cuts
     /// ahead of a due `list`. Honest limit (Gate-1): once a read-op is on the
@@ -899,16 +1176,14 @@ impl Model {
     /// list polling stalls with it — the same risk class as the post-auth
     /// `context` fetch accepted since Stage 2, occurring more often here.
     fn dispatch_read_op(&mut self) -> Option<transport::Request> {
-        if !matches!(
-            self.phase,
+        let view = match &self.phase {
             Phase::Watching {
                 confirm: None,
-                view: View::Dashboard,
+                view: view @ (View::Dashboard | View::Activity),
                 ..
-            }
-        ) {
-            return None;
-        }
+            } => *view,
+            _ => return None,
+        };
         // `pending` is None here (flush_pending ran first and found nothing)
         // and `awaiting_card` cannot coexist with a just-answered list on the
         // single slot — both checked anyway: the model is the boundary.
@@ -917,6 +1192,9 @@ impl Model {
         }
         self.read_age = 0; // the cadence counts from dispatch
         self.in_flight = true;
+        if view == View::Activity {
+            return Some(transport::Request::Activity);
+        }
         let req = match self.next_read {
             ReadOp::Positions => transport::Request::Positions,
             ReadOp::Context => transport::Request::Context,
@@ -926,6 +1204,14 @@ impl Model {
             ReadOp::Context => ReadOp::Positions,
         };
         Some(req)
+    }
+
+    /// Fold an `activity` answer: queue the server outcomes for the run
+    /// loop's dedup/stamp pass ([`Self::take_server_outcomes`]). Deliberately
+    /// view-independent — history is global state, an in-flight answer
+    /// landing after a tab switch still counts.
+    fn apply_activity(&mut self, outcomes: Vec<OutcomeEntry>) {
+        self.server_outcomes.extend(outcomes);
     }
 
     /// Fold a `positions` answer — feeds the dashboard block only, gates
@@ -1071,13 +1357,28 @@ impl Model {
             let detail = tx_hash.clone().or_else(|| reason.clone());
             self.decision = Some(Decision {
                 kind,
-                tx_hash,
-                reason,
+                tx_hash: tx_hash.clone(),
+                reason: reason.clone(),
             });
             if let Phase::Watching {
                 confirm, notice, ..
             } = &mut self.phase
             {
+                if let Some(c) = confirm.as_deref() {
+                    // The card is still open — the ONLY moment to/amount are
+                    // known (the server's retained outcome drops the preview):
+                    // the rich history record is born here, stamped and
+                    // persisted by the run loop (Stage 7).
+                    self.decided = Some(DecidedOutcome {
+                        id: c.card.id.clone(),
+                        state: outcome_state(kind),
+                        to: c.card.to.clone(),
+                        amount_wei: c.card.amount_wei.clone(),
+                        chain_id: c.card.chain_id,
+                        tx_hash,
+                        reason,
+                    });
+                }
                 *confirm = None;
                 *notice = Some(Notice::Outcome { kind, detail });
             }
@@ -2924,5 +3225,253 @@ mod tests {
         let mut m = confirming("a", false);
         m.update(Msg::View(View::Dashboard));
         assert_eq!(view_of(&m), View::Queue, "the card pins the queue view");
+    }
+
+    // ── Stage 7: the Activity view, its scheduler slot, the history model ──
+
+    fn history_entry(id: &str, unix: u64, state: OutcomeState) -> HistoryEntry {
+        HistoryEntry {
+            unix,
+            id: id.to_owned(),
+            state,
+            to: None,
+            amount_wei: None,
+            chain_id: None,
+            tx_hash: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn the_activity_view_dispatches_the_activity_read_op() {
+        let mut m = on_dashboard();
+        m.update(Msg::View(View::Activity));
+        assert!(
+            matches!(poll_round(&mut m), Some(transport::Request::Activity)),
+            "on the Activity view the list-first slot carries the activity op"
+        );
+    }
+
+    #[test]
+    fn the_tick_belongs_to_list_on_the_activity_view_too() {
+        let mut m = on_dashboard();
+        m.update(Msg::View(View::Activity));
+        assert!(
+            matches!(m.update(Msg::Tick), Some(transport::Request::List)),
+            "a tick never births a read-op — the activity op waits for the list reply"
+        );
+    }
+
+    #[test]
+    fn entering_activity_marks_the_read_data_stale() {
+        let mut m = on_dashboard();
+        // Consume the born-stale dispatch and hand its answer back: fresh data.
+        assert!(matches!(
+            poll_round(&mut m),
+            Some(transport::Request::Positions)
+        ));
+        m.update(Msg::Reply(Reply::Positions(PositionsOutcome::Ok(vec![]))));
+        assert!(poll_round(&mut m).is_none(), "fresh data: no read-op due");
+        m.update(Msg::View(View::Activity));
+        assert!(
+            matches!(poll_round(&mut m), Some(transport::Request::Activity)),
+            "entering the Activity view marks the data stale — the next list reply fetches"
+        );
+    }
+
+    #[test]
+    fn activity_never_joins_the_dashboard_alternation() {
+        let mut m = on_dashboard();
+        assert!(matches!(
+            poll_round(&mut m),
+            Some(transport::Request::Positions)
+        ));
+        m.update(Msg::Reply(Reply::Positions(PositionsOutcome::Ok(vec![]))));
+        // Visit Activity: its op rides the slot without touching next_read.
+        m.update(Msg::View(View::Activity));
+        assert!(matches!(
+            poll_round(&mut m),
+            Some(transport::Request::Activity)
+        ));
+        m.update(Msg::Reply(Reply::Activity(vec![])));
+        // Back on the Dashboard the alternation resumes exactly where it left.
+        m.update(Msg::View(View::Dashboard));
+        assert!(
+            matches!(poll_round(&mut m), Some(transport::Request::Context)),
+            "the two-valued alternation is untouched by the activity slot"
+        );
+    }
+
+    #[test]
+    fn a_decision_here_births_a_rich_history_record() {
+        let mut m = watching(vec![summary("a1")]);
+        assert!(matches!(
+            m.update(Msg::Open),
+            Some(transport::Request::Get(_))
+        ));
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card("a1")))));
+        assert!(matches!(
+            m.update(Msg::Approve),
+            Some(transport::Request::Approve(_))
+        ));
+        m.update(Msg::Reply(Reply::Resolve(ResolveOutcome::Executed {
+            tx_hash: "0xfeed".to_owned(),
+        })));
+
+        let d = m
+            .take_decided_outcome()
+            .expect("a rich record is born at decision time, while the card is open");
+        assert_eq!(d.id, "a1");
+        assert_eq!(d.state, OutcomeState::Executed);
+        assert_eq!(d.to, "0xabc", "the card's recipient, verbatim");
+        assert_eq!(d.amount_wei, "0", "the card's amount");
+        assert_eq!(d.chain_id, 1);
+        assert_eq!(d.tx_hash.as_deref(), Some("0xfeed"));
+        assert_eq!(d.reason, None);
+        assert!(m.take_decided_outcome().is_none(), "drained exactly once");
+        // The ADR-#7 decision-line drain is a separate, untouched channel.
+        assert!(m.take_decision().is_some());
+    }
+
+    #[test]
+    fn server_outcomes_queue_for_the_run_loop_and_drain_once() {
+        let mut m = on_dashboard();
+        m.update(Msg::Reply(Reply::Activity(vec![OutcomeEntry {
+            id: "s1".to_owned(),
+            state: OutcomeState::Denied,
+            tx_hash: None,
+            reason: None,
+            age_secs: 42,
+        }])));
+        let drained = m.take_server_outcomes();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, "s1");
+        assert!(
+            m.take_server_outcomes().is_empty(),
+            "the queue drains exactly once"
+        );
+    }
+
+    #[test]
+    fn history_sorts_newest_first_ties_by_id_and_caps() {
+        let mut m = Model::new();
+        m.set_history(vec![
+            history_entry("b", 100, OutcomeState::Denied),
+            history_entry("c", 200, OutcomeState::Executed),
+            history_entry("a", 100, OutcomeState::Denied),
+        ]);
+        let ids: Vec<&str> = m.history().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["c", "a", "b"],
+            "newest first; a shared second falls back to id order"
+        );
+
+        let many: Vec<HistoryEntry> = (0..=HISTORY_CAP)
+            .map(|i| history_entry(&format!("id{i:04}"), i as u64, OutcomeState::Denied))
+            .collect();
+        m.set_history(many);
+        assert_eq!(
+            m.history().len(),
+            HISTORY_CAP,
+            "capped at the display limit"
+        );
+        assert!(
+            m.history().iter().all(|e| e.unix >= 1),
+            "what fell off the cap is exactly the oldest entry"
+        );
+    }
+
+    #[test]
+    fn two_rich_decisions_in_one_second_order_by_id_not_chronology() {
+        // Gate-1 finding, documented on purpose: unix is whole seconds — two
+        // decisions inside one second CANNOT be ordered by time here; the id
+        // tiebreak (asc) makes the order deterministic, not chronological.
+        let mut ids = [uuid_like("f"), uuid_like("0")];
+        ids.sort();
+        let (small, big) = (ids[0].clone(), ids[1].clone());
+        let mut m = Model::new();
+        // Decided big-id first, small-id second — same second.
+        m.push_history(history_entry(&big, 77, OutcomeState::Denied));
+        m.push_history(history_entry(&small, 77, OutcomeState::Denied));
+        let got: Vec<&str> = m.history().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![small.as_str(), big.as_str()],
+            "id order wins inside one second — regardless of decision order"
+        );
+    }
+
+    fn uuid_like(prefix: &str) -> String {
+        format!("{prefix}1b2c3d-0000-0000-0000-000000000000")
+    }
+
+    #[test]
+    fn fill_history_detail_fills_only_the_missing_fields() {
+        // Gate-2 МИНОР-6: every one of the five fields is exercised in BOTH
+        // directions — present (never overwritten) and missing (filled),
+        // reason included with a real value.
+        let mut m = Model::new();
+        let mut base = history_entry("a", 10, OutcomeState::Failed);
+        base.to = Some("0xTO".to_owned());
+        base.reason = Some("broadcast failed".to_owned());
+        m.set_history(vec![base]);
+
+        let mut from = history_entry("a", 99, OutcomeState::Failed);
+        from.to = Some("0xEVIL".to_owned());
+        from.amount_wei = Some("5".to_owned());
+        from.chain_id = Some(1);
+        from.tx_hash = Some("0xfeed".to_owned());
+        from.reason = Some("a different story".to_owned());
+        m.fill_history_detail(&from);
+
+        let e = &m.history()[0];
+        assert_eq!(
+            e.to.as_deref(),
+            Some("0xTO"),
+            "a present field is never overwritten"
+        );
+        assert_eq!(
+            e.reason.as_deref(),
+            Some("broadcast failed"),
+            "a present reason is never overwritten"
+        );
+        assert_eq!(e.amount_wei.as_deref(), Some("5"), "a missing field fills");
+        assert_eq!(e.chain_id, Some(1));
+        assert_eq!(e.tx_hash.as_deref(), Some("0xfeed"));
+
+        // And the reverse direction: a poor base gains a real reason.
+        let mut m = Model::new();
+        m.set_history(vec![history_entry("b", 10, OutcomeState::Failed)]);
+        let mut from = history_entry("b", 99, OutcomeState::Failed);
+        from.reason = Some("broadcast failed".to_owned());
+        m.fill_history_detail(&from);
+        assert_eq!(
+            m.history()[0].reason.as_deref(),
+            Some("broadcast failed"),
+            "a missing reason fills with the real value"
+        );
+    }
+
+    #[test]
+    fn the_filter_cycles_only_on_the_activity_view() {
+        let mut m = on_dashboard();
+        m.update(Msg::Filter);
+        assert_eq!(
+            m.history_filter(),
+            HistoryFilter::All,
+            "no cycling off the Activity view — the model is the boundary"
+        );
+        m.update(Msg::View(View::Activity));
+        m.update(Msg::Filter);
+        assert_eq!(m.history_filter(), HistoryFilter::Executed);
+        for _ in 0..4 {
+            m.update(Msg::Filter);
+        }
+        assert_eq!(
+            m.history_filter(),
+            HistoryFilter::All,
+            "the cycle closes back on All"
+        );
     }
 }

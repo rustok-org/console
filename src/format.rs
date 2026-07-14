@@ -54,6 +54,22 @@ pub fn is_zero_wei(wei: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|b| b == b'0')
 }
 
+/// Shorten an address for a DISPLAY-LIST row: `0x489Fe0…bbbb` (first 6 + last 4
+/// hex digits, EIP-55 casing preserved verbatim). **Never on a signing or
+/// approving surface** — the card, From→To and Receive render addresses in full
+/// (address poisoning; ТЗ §4.1): this exists for the Activity list only, where
+/// the row is display, not a decision. Input without a `0x` prefix, non-ASCII,
+/// or too short to save space is returned verbatim (display never crashes).
+#[must_use]
+pub fn short_addr(addr: &str) -> String {
+    match addr.strip_prefix("0x") {
+        Some(hex) if hex.is_ascii() && hex.len() > 12 => {
+            format!("0x{}…{}", &hex[..6], &hex[hex.len() - 4..])
+        }
+        _ => addr.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +109,39 @@ mod tests {
         assert!(!is_zero_wei("1"));
         assert!(!is_zero_wei("10000000000000000"));
         assert!(!is_zero_wei(""));
+    }
+
+    #[test]
+    fn short_addr_keeps_head_tail_and_eip55_casing() {
+        assert_eq!(
+            short_addr("0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb"),
+            "0x489Fe0…bbbb",
+            "first 6 + last 4, casing verbatim"
+        );
+    }
+
+    #[test]
+    fn short_addr_returns_unshortenable_input_verbatim() {
+        assert_eq!(
+            short_addr("0x1234567890ab"),
+            "0x1234567890ab",
+            "12 hex: nothing saved"
+        );
+        assert_eq!(
+            short_addr("not-an-address"),
+            "not-an-address",
+            "no 0x prefix"
+        );
+        assert_eq!(short_addr(""), "");
+    }
+
+    #[test]
+    fn short_addr_never_panics_on_non_ascii() {
+        let hostile = "0xдлинная-не-ascii-строка-длиннее-двенадцати";
+        assert_eq!(
+            short_addr(hostile),
+            hostile,
+            "non-ASCII input is returned verbatim"
+        );
     }
 }
