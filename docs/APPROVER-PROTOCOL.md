@@ -14,10 +14,10 @@
 > silently "corrected" here.
 >
 > **proto 2 — DRAFT** (Console v2 Фаза 2) — additive over proto 1: the read-ops
-> `context` (§3.7) and `positions` (§3.8), gated behind `auth` unlike `list`/`get`
-> (§2), plus the `wallet_locked` error code (§3.11). A `proto: 1` session
-> negotiated by an already-shipped `console v0.1.0` continues to work unchanged —
-> see §3.1 and §6.
+> `context` (§3.7), `positions` (§3.8) and `activity` (§3.9), gated behind `auth`
+> unlike `list`/`get` (§2), plus the `wallet_locked` error code (§3.11). A
+> `proto: 1` session negotiated by an already-shipped `console v0.1.0` continues
+> to work unchanged — see §3.1 and §6.
 
 ## 1. Transport
 
@@ -43,7 +43,7 @@
 ## 2. Session
 
 ```
-connect → hello → { list | get }* → auth → { list | get | approve | deny | context | positions }* → disconnect
+connect → hello → { list | get }* → auth → { list | get | approve | deny | context | positions | activity }* → disconnect
 ```
 
 - A **session is one connection**. `auth` authorizes that connection only;
@@ -57,14 +57,12 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
   A future reviewer must not "fix" this into an auth-gate — it would defend
   nothing against a same-uid local process (§1), and it would gate data that
   isn't secret in the first place.
-- **`context` and `positions` (proto 2+, §3.7/§3.8) are auth-gated —
-  deliberately NOT the same pre-auth treatment as `list`/`get`.** Unlike the
-  queue card, they answer with the wallet's own address, balances, and DeFi
-  holdings: the human's private financial data, not the agent's proposal.
-  Before `auth` they → `unauthorized`, the same code `approve`/`deny` already
-  use. Future read-ops in this family (`activity`, §3.9) follow the same
-  default — auth-gated unless a specific op's data is, like the queue,
-  inherently not secret.
+- **`context`, `positions` and `activity` (proto 2+, §3.7/§3.8/§3.9) are
+  auth-gated — deliberately NOT the same pre-auth treatment as `list`/`get`.**
+  Unlike the queue card, they answer with the wallet's own address, balances,
+  DeFi holdings, and decision history: the human's private financial data,
+  not the agent's proposal. Before `auth` they → `unauthorized`, the same
+  code `approve`/`deny` already use.
 - **Default-deny**: a malformed line, unknown `op`, a missing or mistyped field, or
   an oversized message (> 64 KiB, code `oversize`) yields a single `error` response
   and **no state change**. The server never executes anything as a result of an
@@ -327,11 +325,55 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   client scheduler must also prioritize `list` over `positions`/`activity`:
   `list` is the only source of a NEW pending item with a ticking deadline.
 
-### 3.9 `activity` — reserved (proto 2, lands with core PR 3/3)
+### 3.9 `activity` (proto 2+) — recent terminal outcomes
 
-Recent terminal outcomes (`executed` / `denied` / `expired` / `failed`). This
-anchor is reserved so the op's arrival does not renumber §3.10/§3.11 again;
-until that PR lands, `activity` is an unknown op → `protocol_error`.
+```json
+→ {"op":"activity"}
+← {"ok":true,"outcomes":[
+     {"id":"<uuid>","state":"executed","tx_hash":"0x…","age_secs":42},
+     {"id":"<uuid>","state":"denied","age_secs":120},
+     {"id":"<uuid>","state":"expired","age_secs":1800},
+     {"id":"<uuid>","state":"failed","reason":"…operator-masked…","age_secs":3599}]}
+← {"ok":false,"error":"unauthorized"}     // no auth on this connection
+← {"ok":false,"error":"protocol_error"}   // session negotiated proto:1 (§3.1)
+```
+
+- **Auth-gated and proto-gated exactly like `context`/`positions`** (§2,
+  §3.7): the wallet's decision history is the human's private data —
+  `unauthorized` before `auth`, `protocol_error` on a session that
+  negotiated `proto:1`.
+- **No `wallet_locked` here — deliberately.** The op reads only the
+  retained-outcome store (§5), never the keyring or an address, so the
+  §3.11 `wallet_locked` row stays `context, positions`. The error set is
+  `unauthorized` | `protocol_error`, nothing else.
+- Outcome field wire-forms (normative):
+
+| Field | Wire form | Notes |
+|---|---|---|
+| `id` | UUID string, hyphenated lowercase | the resolved item's preview id — stable across polls (the dedup key for the console's local log) |
+| `state` | string enum: `"executed"` \| `"denied"` \| `"expired"` \| `"failed"` | the same words as `approve`'s terminal answers (§3.5); never `"pending"` — only terminal outcomes are retained |
+| `tx_hash` | `0x`+lowercase hex, 32 bytes | **only** on `executed` — absent otherwise, never `null` |
+| `reason` | string (operator-masked upstream) | **only** on `failed` — absent otherwise, never `null` |
+| `age_secs` | number (u64 seconds) | seconds SINCE the resolution — a relative age, not a timestamp (below) |
+
+- **`age_secs` is a relative age, deliberately not an absolute time.** The
+  store keeps a monotonic resolve instant; a console needing an absolute
+  time derives it locally (answer arrival − age) when writing its local
+  log. For an `expired` outcome the resolve instant is backdated to the
+  real deadline — the age is honest even though expiry is observed lazily
+  (§5) — and an id is stable across polls while the age keeps growing, so
+  a log dedups by id, never by time.
+- **Ordering: newest first** (equal ages fall back to id order — the answer
+  is deterministic). An empty `outcomes` array is a valid `ok:true` answer,
+  indistinguishable on the wire from "nothing resolved in the last hour".
+- **Cap: at most 100 outcomes per answer — the newest 100.** The console
+  transport mirrors the server's 64 KiB line limit (§2) on the response
+  lines it reads; an uncapped answer after a lockout avalanche (§4 resolves
+  the WHOLE pending queue to `denied` — ~600 outcomes would clear 64 KiB)
+  would blow that mirror and kill the human channel. The cap protects the
+  channel from self-poisoning; it is not pagination. History deeper than
+  the cap or the 60-min retention window (§5) is the console's local log,
+  written at decision time (Stage 7).
 
 ### 3.10 Field wire-formats (normative — the console's serde types mirror these)
 
@@ -431,7 +473,7 @@ until that PR lands, `activity` is an unknown op → `protocol_error`.
 | proto | core (server) | console (client) |
 |-------|---------------|------------------|
 | 1     | shipped as `0.1.0`; freezes at `v0.2.0` | ≥ `v0.1.0` |
-| 2     | DRAFT — adds `context` (§3.7) + `positions` (§3.8) + `wallet_locked` (§3.11); freezes alongside its own console/core release pair (TBD) | a `proto:1` client is unaffected — it never sends `context`/`positions` and the server still answers its `hello` with `proto:1` (§3.1) |
+| 2     | DRAFT — adds `context` (§3.7) + `positions` (§3.8) + `activity` (§3.9) + `wallet_locked` (§3.11); freezes alongside its own console/core release pair (TBD) | a `proto:1` client is unaffected — it never sends `context`/`positions`/`activity` and the server still answers its `hello` with `proto:1` (§3.1) |
 
 - **`proto` is the only compatibility gate.** The `server` version string is
   informational (§3.1) — a client must never gate on it. The shipped server reports
