@@ -15,8 +15,8 @@
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    AuthOutcome, Card, ContextOutcome, GetOutcome, ResolveOutcome, Summary, TerminalState,
-    WalletContext,
+    AuthOutcome, Card, ContextOutcome, GetOutcome, PositionsOutcome, ResolveOutcome, Summary,
+    TerminalState, WalletContext,
 };
 use crate::transport::{self, Reply, TransportError};
 use crate::ui;
@@ -165,10 +165,13 @@ pub enum Phase {
     Fatal(TransportError),
 }
 
-/// The resident console's screens (nav-shell). Both are real views — no
+/// The resident console's screens (nav-shell). All are real views — no
 /// placeholder tabs are registered (Gate-1, Stage 2 ratification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// Balance, DeFi positions, and the "waiting for you" count — the home
+    /// view after auth (Gate-1 Stage 5, plan Фазы 2: PIN-unlock → Dashboard).
+    Dashboard,
     /// The queue and its card — the approve surface, and the only view that
     /// may open one.
     Queue,
@@ -176,6 +179,33 @@ pub enum View {
     /// nothing, adds no socket op.
     Receive,
 }
+
+/// The dashboard's positions block — a tri-state, so "still loading" never
+/// reads as "unavailable" (spec /check-4).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Positions {
+    /// No `positions` reply has landed yet this session.
+    #[default]
+    NotYet,
+    /// The wallet's positions, verbatim from the last reply.
+    Loaded(Vec<crate::protocol::Position>),
+    /// The read degraded (`wallet_locked`) — distinct from an empty list.
+    Unavailable,
+}
+
+/// Which read-op the scheduler sends next — `context` (balance refresh) and
+/// `positions` alternate on the same list-first slot (Gate-1 decision №2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReadOp {
+    #[default]
+    Positions,
+    Context,
+}
+
+/// Read-data staleness threshold, in `Msg::Tick` units (~2.5 s each): ~30 s.
+/// Positions/balances are live on-chain reads — not something to hammer on
+/// every poll tick (Gate-1 decision №3).
+const STALE_TICKS: u32 = 12;
 
 /// The one transient notice slot of the watch screen. A resident console keeps
 /// living after a decision — the notice is how the human sees what just
@@ -391,6 +421,18 @@ pub struct Model {
     /// The last terminal decision, waiting for the run loop to drain it into
     /// the machine decision line ([`Self::take_decision`]).
     decision: Option<Decision>,
+    /// The dashboard's positions block (tri-state; see [`Positions`]).
+    positions: Positions,
+    /// Ticks since the last completed read-op — the scheduler's staleness
+    /// clock (the pure model has no wall clock; Stage-2 lesson).
+    read_age: u32,
+    /// Which read-op goes out next (context/positions alternate).
+    next_read: ReadOp,
+    /// The last `context` REFRESH answered `wallet_locked`: the old data is
+    /// kept (the card's From→To keeps working) but the dashboard's balance
+    /// block is flagged stale (Gate-1: named mechanism, not derived from
+    /// `read_age`). Cleared by a successful refresh.
+    context_stale: bool,
 }
 
 /// A parked user intent (no `List` — the poll is suppressed, not queued).
@@ -430,6 +472,12 @@ impl Default for Model {
             quit: false,
             wallet: None,
             decision: None,
+            positions: Positions::default(),
+            // Born stale: the first list reply after auth dispatches the
+            // first positions read immediately, not ~30 s later.
+            read_age: STALE_TICKS,
+            next_read: ReadOp::default(),
+            context_stale: false,
         }
     }
 }
@@ -459,6 +507,26 @@ impl Model {
     #[must_use]
     pub fn wallet_address(&self) -> Option<&str> {
         self.wallet.as_ref().map(|w| w.address.as_str())
+    }
+
+    /// The wallet's full context (address, balances, allowed chains), when
+    /// the read-op has landed — feeds the dashboard's balance block.
+    #[must_use]
+    pub fn wallet_context(&self) -> Option<&WalletContext> {
+        self.wallet.as_ref()
+    }
+
+    /// The dashboard's positions block (tri-state).
+    #[must_use]
+    pub fn positions(&self) -> &Positions {
+        &self.positions
+    }
+
+    /// Whether the last balance refresh failed while old data is still shown
+    /// (the dashboard says "may be stale" instead of lying by omission).
+    #[must_use]
+    pub fn context_stale(&self) -> bool {
+        self.context_stale
     }
 
     /// Drain the last terminal decision (for the machine decision line — one
@@ -539,6 +607,12 @@ impl Model {
         } = &mut self.phase
         {
             *current = view;
+            if view == View::Dashboard {
+                // Entering the dashboard marks the read data stale: the next
+                // list reply refreshes it. Bounded structurally — at most one
+                // read-op per list reply (spec /check-5).
+                self.read_age = self.read_age.max(STALE_TICKS);
+            }
         }
     }
 
@@ -558,6 +632,11 @@ impl Model {
     /// Periodic tick: poll `list` in the watch phase — but only when nothing is in
     /// flight (the poll is suppressed, never queued, so stale polls do not pile up).
     fn on_tick(&mut self) -> Option<transport::Request> {
+        if matches!(self.phase, Phase::Watching { .. }) {
+            // The staleness clock of the read-op scheduler — ticks, not a
+            // wall clock (the model stays pure).
+            self.read_age = self.read_age.saturating_add(1);
+        }
         if matches!(self.phase, Phase::Watching { .. }) && !self.in_flight {
             self.in_flight = true;
             Some(transport::Request::List)
@@ -752,6 +831,9 @@ impl Model {
 
     fn on_reply(&mut self, reply: Reply) -> Option<transport::Request> {
         self.in_flight = false;
+        // Only a fresh `list` answer may be followed by a read-op (the
+        // list-first policy) — remembered before the reply is consumed.
+        let was_list = matches!(reply, Reply::List(_));
         match reply {
             Reply::Hello { .. } => {
                 self.phase = Phase::Authing {
@@ -778,6 +860,7 @@ impl Model {
                 }
             }
             Reply::Context(outcome) => self.apply_context(outcome),
+            Reply::Positions(outcome) => self.apply_positions(outcome),
             Reply::List(items) => self.apply_list(items),
             Reply::Get(outcome) => self.apply_get(outcome),
             Reply::Resolve(outcome) => self.apply_resolve(outcome),
@@ -792,7 +875,72 @@ impl Model {
             self.pending = None;
             return None;
         }
-        self.flush_pending()
+        // Dispatch order is normative (spec /check-1): the parked USER intent
+        // first — a read-op is considered only when nothing human is waiting.
+        if let Some(req) = self.flush_pending() {
+            return Some(req);
+        }
+        if was_list {
+            return self.dispatch_read_op();
+        }
+        None
+    }
+
+    /// The read-op scheduler (list-first policy, canon §3.8 + the Reviewer's
+    /// Gate-1 flag): a read-op (`positions` | `context` refresh, alternating)
+    /// goes out ONLY right after a fresh `list` reply — never from a tick
+    /// (the tick belongs to `list`), never ahead of a parked user intent
+    /// (`flush_pending` ran first), never with a card open or a card request
+    /// anywhere in flight, and only when the read data has gone stale.
+    ///
+    /// Guaranteed and tested: the ORDER OF ORIGINATION — a read-op never cuts
+    /// ahead of a due `list`. Honest limit (Gate-1): once a read-op is on the
+    /// wire and the server does not answer (no server-side timeout by canon),
+    /// list polling stalls with it — the same risk class as the post-auth
+    /// `context` fetch accepted since Stage 2, occurring more often here.
+    fn dispatch_read_op(&mut self) -> Option<transport::Request> {
+        if !matches!(
+            self.phase,
+            Phase::Watching {
+                confirm: None,
+                view: View::Dashboard,
+                ..
+            }
+        ) {
+            return None;
+        }
+        // `pending` is None here (flush_pending ran first and found nothing)
+        // and `awaiting_card` cannot coexist with a just-answered list on the
+        // single slot — both checked anyway: the model is the boundary.
+        if self.awaiting_card || self.pending.is_some() || self.read_age < STALE_TICKS {
+            return None;
+        }
+        self.read_age = 0; // the cadence counts from dispatch
+        self.in_flight = true;
+        let req = match self.next_read {
+            ReadOp::Positions => transport::Request::Positions,
+            ReadOp::Context => transport::Request::Context,
+        };
+        self.next_read = match self.next_read {
+            ReadOp::Positions => ReadOp::Context,
+            ReadOp::Context => ReadOp::Positions,
+        };
+        Some(req)
+    }
+
+    /// Fold a `positions` answer — feeds the dashboard block only, gates
+    /// nothing. Deliberately simpler than [`Self::apply_context`]: a
+    /// `wallet_locked` here REPLACES `Loaded` with `Unavailable` instead of
+    /// keeping-and-flagging, because unlike the balance block nothing else
+    /// feeds off old positions (the card's From→To feeds off `wallet`) —
+    /// and the state is unreachable today anyway (the shipped core never
+    /// re-locks at runtime, canon §3.7). Revisit if positions grow a second
+    /// consumer (Gate-2 NIT).
+    fn apply_positions(&mut self, outcome: PositionsOutcome) {
+        self.positions = match outcome {
+            PositionsOutcome::Ok(list) => Positions::Loaded(list),
+            PositionsOutcome::WalletLocked => Positions::Unavailable,
+        };
     }
 
     fn apply_auth(&mut self, outcome: AuthOutcome) {
@@ -803,7 +951,9 @@ impl Model {
                     selected: 0,
                     confirm: None,
                     notice: None,
-                    view: View::Queue,
+                    // Home is the Dashboard (Gate-1 Stage 5: PIN-unlock →
+                    // Dashboard, the letter of the Phase-2 plan).
+                    view: View::Dashboard,
                 };
             }
             other => {
@@ -837,11 +987,21 @@ impl Model {
         }
     }
 
-    /// Fold the once-per-session `context` answer. Both failure shapes only
-    /// degrade the display (To-only card) — approve is never gated on them.
+    /// Fold a `context` answer — the post-auth fetch or a scheduler refresh.
+    /// Both failure shapes only degrade the display — approve is never gated
+    /// on them. A REFRESH that answers `wallet_locked` keeps the old data
+    /// (the card's From→To keeps working) but flags the dashboard's balance
+    /// block stale (Gate-1: `context_stale`, a named mechanism).
     fn apply_context(&mut self, outcome: ContextOutcome) {
         match outcome {
-            ContextOutcome::Ok(ctx) => self.wallet = Some(*ctx),
+            ContextOutcome::Ok(ctx) => {
+                self.wallet = Some(*ctx);
+                self.context_stale = false;
+            }
+            ContextOutcome::WalletLocked if self.wallet.is_some() => {
+                // A refresh failed: keep what we have, say it may be stale.
+                self.context_stale = true;
+            }
             ContextOutcome::WalletLocked => {
                 if let Phase::Watching { notice, .. } = &mut self.phase
                     && notice.is_none()
@@ -1198,6 +1358,10 @@ mod tests {
                 allowed_chains: vec![1],
             },
         )))));
+        // Home is the Dashboard since Stage 5 — these tests exercise the
+        // queue, so they step onto it explicitly (spec: 5 helpers, 0
+        // rewritten tests).
+        m.update(Msg::View(View::Queue));
         // deliver the first list
         assert!(matches!(
             m.update(Msg::Tick),
@@ -2539,5 +2703,226 @@ mod tests {
             panic!("watching");
         };
         assert_eq!(*selected, items.len() - 1);
+    }
+
+    // ── Stage 5: the Dashboard + the read-op scheduler (list-first) ──
+
+    /// Drive a fresh session to the watch phase WITHOUT leaving the home
+    /// view — the dashboard scheduler flows live here.
+    fn on_dashboard() -> Model {
+        let mut m = Model::new();
+        m.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        m.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        m.update(Msg::PinDigit('1'));
+        m.update(Msg::PinSubmit);
+        assert!(matches!(
+            m.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok))),
+            Some(transport::Request::Context)
+        ));
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+            },
+        )))));
+        m
+    }
+
+    /// One poll round: tick (must yield `List` — the tick belongs to list)
+    /// and the reply; returns what the model wants to send AFTER the reply.
+    fn poll_round(m: &mut Model) -> Option<transport::Request> {
+        assert!(
+            matches!(m.update(Msg::Tick), Some(transport::Request::List)),
+            "a tick with a free slot always originates a List, never a read-op"
+        );
+        m.update(Msg::Reply(Reply::List(vec![])))
+    }
+
+    #[test]
+    fn the_home_view_after_auth_is_the_dashboard() {
+        let m = on_dashboard();
+        assert_eq!(view_of(&m), View::Dashboard, "PIN-unlock lands on the pult");
+    }
+
+    #[test]
+    fn the_first_list_reply_on_the_dashboard_dispatches_positions() {
+        // Born stale: the human sees positions right away, not ~30 s later.
+        let mut m = on_dashboard();
+        assert!(
+            matches!(poll_round(&mut m), Some(transport::Request::Positions)),
+            "the first list reply hands the slot to the first positions read"
+        );
+    }
+
+    #[test]
+    fn read_ops_wait_out_the_staleness_window() {
+        let mut m = on_dashboard();
+        assert!(matches!(
+            poll_round(&mut m),
+            Some(transport::Request::Positions)
+        ));
+        m.update(Msg::Reply(Reply::Positions(PositionsOutcome::Ok(vec![]))));
+        // Fresh data: the following rounds are pure list polling…
+        for _ in 0..(STALE_TICKS - 1) {
+            assert!(
+                poll_round(&mut m).is_none(),
+                "no read-op before the staleness window elapses"
+            );
+        }
+        // …until the window elapses — then the ALTERNATE op goes out.
+        assert!(
+            matches!(poll_round(&mut m), Some(transport::Request::Context)),
+            "context (balance refresh) alternates with positions"
+        );
+    }
+
+    #[test]
+    fn a_read_op_is_refused_off_the_dashboard() {
+        let mut m = on_dashboard();
+        m.update(Msg::View(View::Queue));
+        assert!(
+            poll_round(&mut m).is_none(),
+            "stale data does not fetch while the dashboard is not on top"
+        );
+    }
+
+    #[test]
+    fn a_parked_user_intent_outranks_everything_after_a_list_reply() {
+        // Pins ONLY that a parked get goes out right after the list reply on
+        // the queue view. It does NOT witness the flush-vs-read-op order:
+        // here dispatch_read_op is already cut by its view check, and the
+        // state "parked intent + active dashboard" is unreachable through
+        // the public API (Gate-2 МИНОР — the dispatcher's own guard is
+        // pinned separately in `the_dispatcher_itself_refuses_a_parked_intent`).
+        let mut m = on_dashboard();
+        m.update(Msg::View(View::Queue));
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        m.update(Msg::Reply(Reply::List(vec![summary("a")])));
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        assert!(
+            m.update(Msg::Open).is_none(),
+            "the get parks behind the poll"
+        );
+        assert!(
+            matches!(
+                m.update(Msg::Reply(Reply::List(vec![summary("a")]))),
+                Some(transport::Request::Get(_))
+            ),
+            "after the list reply the parked get goes out — nothing else"
+        );
+    }
+
+    #[test]
+    fn entering_the_dashboard_marks_the_data_stale() {
+        let mut m = on_dashboard();
+        assert!(matches!(
+            poll_round(&mut m),
+            Some(transport::Request::Positions)
+        ));
+        m.update(Msg::Reply(Reply::Positions(PositionsOutcome::Ok(vec![]))));
+        assert!(poll_round(&mut m).is_none(), "fresh right after the reply");
+        // Leave and come back: the re-entry marks the read data stale.
+        m.update(Msg::View(View::Receive));
+        m.update(Msg::View(View::Dashboard));
+        assert!(
+            poll_round(&mut m).is_some(),
+            "re-entering the dashboard refreshes at the next list reply"
+        );
+    }
+
+    #[test]
+    fn a_positions_reply_feeds_the_tristate() {
+        let mut m = on_dashboard();
+        assert!(matches!(m.positions(), Positions::NotYet));
+        assert!(matches!(
+            poll_round(&mut m),
+            Some(transport::Request::Positions)
+        ));
+        m.update(Msg::Reply(Reply::Positions(PositionsOutcome::WalletLocked)));
+        assert!(
+            matches!(m.positions(), Positions::Unavailable),
+            "wallet_locked degrades, distinct from an empty list"
+        );
+    }
+
+    #[test]
+    fn a_failed_balance_refresh_keeps_the_data_and_flags_it() {
+        let mut m = on_dashboard();
+        assert!(m.wallet_context().is_some());
+        assert!(!m.context_stale());
+        // A later refresh answers wallet_locked: the data survives, flagged.
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        assert!(
+            m.wallet_context().is_some(),
+            "old data is kept — the card's From→To keeps working"
+        );
+        assert!(m.context_stale(), "…but the dashboard says it may be stale");
+        // A successful refresh clears the flag.
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+            },
+        )))));
+        assert!(!m.context_stale());
+    }
+
+    #[test]
+    fn the_dispatcher_itself_refuses_a_parked_intent() {
+        // "Parked intent + active dashboard" is unreachable through the
+        // public API today (the switch gate refuses on a parked get) — build
+        // the state by hand to pin dispatch_read_op's OWN guard, so a future
+        // view that can park while the dashboard is up inherits the refusal
+        // (Gate-2 МИНОР: the model is the boundary, not the reachability of
+        // today's key map).
+        let mut m = on_dashboard();
+        m.pending = Some(PendingIntent::Get("x".to_owned()));
+        assert!(
+            m.dispatch_read_op().is_none(),
+            "a parked human intent starves the read-op, never the reverse"
+        );
+        m.pending = None;
+        assert!(
+            m.dispatch_read_op().is_some(),
+            "…and with the intent gone the read-op flows"
+        );
+    }
+
+    #[test]
+    fn a_dashboard_switch_is_refused_while_a_get_is_parked() {
+        // The direct twin of the Receive-era test, for the third view.
+        let mut m = on_dashboard();
+        m.update(Msg::View(View::Queue));
+        m.update(Msg::Tick);
+        m.update(Msg::Reply(Reply::List(vec![summary("a")])));
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        assert!(m.update(Msg::Open).is_none(), "the get parks");
+        m.update(Msg::View(View::Dashboard));
+        assert_eq!(view_of(&m), View::Queue, "a parked get pins the queue");
+    }
+
+    #[test]
+    fn the_dashboard_switch_obeys_the_same_triple_gate() {
+        // The switch gate is one code path for every view — pin Dashboard to
+        // it explicitly: an open card refuses the tab.
+        let mut m = confirming("a", false);
+        m.update(Msg::View(View::Dashboard));
+        assert_eq!(view_of(&m), View::Queue, "the card pins the queue view");
     }
 }
