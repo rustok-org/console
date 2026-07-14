@@ -559,10 +559,15 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             theme::label_style(),
         ),
         Positions::Loaded(list) => {
-            // The budget guards against a silent clip: rows that do not fit
-            // are replaced by an explicit "+N more" marker (raw_data pattern).
-            let budget = height.saturating_sub(lines.len() + 1);
-            let mut shown = 0usize;
+            // Rows still available for position lines: the panel height
+            // minus what the blocks above already used. Inside the loop only
+            // `used` — rows added BY THIS LOOP — is compared against it: the
+            // Gate-2 blocker compared the ever-growing `lines.len()`, which
+            // still contains the header rows the budget had already
+            // subtracted, so the header was counted twice and the marker cut
+            // positions that actually fit.
+            let budget = height.saturating_sub(lines.len());
+            let mut used = 0usize;
             for (i, p) in list.iter().enumerate() {
                 let extra: String = p
                     .extra
@@ -581,7 +586,11 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
                 let mut rendered = Vec::new();
                 push_wrapped(&mut rendered, width, row, theme::value_style());
                 let remaining = list.len() - i;
-                if lines.len() + rendered.len() > budget + if remaining == 1 { 1 } else { 0 } {
+                // Reserve one row for the "+N more" marker — except for the
+                // last position, which may take the final row itself (an
+                // exact fit shows everything, no marker).
+                let reserve = usize::from(remaining > 1);
+                if used + rendered.len() + reserve > budget {
                     push_wrapped(
                         &mut lines,
                         width,
@@ -590,10 +599,9 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
                     );
                     break;
                 }
+                used += rendered.len();
                 lines.append(&mut rendered);
-                shown += 1;
             }
-            let _ = shown;
         }
     }
 
@@ -2077,6 +2085,64 @@ mod tests {
         assert!(
             rows.join("\n").contains("more — terminal too small"),
             "clipped positions say so out loud (raw_data honesty pattern)"
+        );
+    }
+
+    /// Positions with distinct symbols, one render row each at width 100.
+    fn many_positions(n: usize) -> Vec<Position> {
+        (0..n)
+            .map(|i| {
+                let mut p = aave_position();
+                p.asset_symbol = format!("TOK{i}");
+                p.extra.clear(); // keep each row single-line at this width
+                p
+            })
+            .collect()
+    }
+
+    fn position_rows(rows: &[String]) -> usize {
+        rows.iter().filter(|r| r.contains("TOK")).count()
+    }
+
+    #[test]
+    fn the_positions_budget_sits_exactly_on_its_boundary() {
+        // Geometry at 100×24, empty balances: tab(1)+borders(2) → inner 21;
+        // header = waiting(1)+blank(1)+"balance"(1)+"no balances"(1)+blank(1)
+        // +"positions"(1) = 6 → budget 15. The Gate-2 blocker subtracted the
+        // header TWICE and cut positions that fit — this pins both edges.
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(15)));
+        let rows = draw_rows(&m, 100, 24);
+        assert_eq!(
+            position_rows(&rows),
+            15,
+            "an exact fit shows every position, no marker"
+        );
+        assert!(!rows.join("\n").contains("more — terminal too small"));
+
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(16)));
+        let rows = draw_rows(&m, 100, 24);
+        assert_eq!(
+            position_rows(&rows),
+            14,
+            "one over: 14 positions + the marker fill the budget exactly — \
+             nothing that fits is hidden (the blocker cut at 11 here)"
+        );
+        assert!(rows.join("\n").contains("+2 more — terminal too small"));
+    }
+
+    #[test]
+    fn the_waiting_block_counts_pending_items() {
+        // The non-empty branch never rendered in any test (Gate-2 NIT).
+        let mut m = to_dashboard(vec![], PositionsOutcome::Ok(vec![]));
+        m.update(Msg::Tick);
+        m.update(Msg::Reply(Reply::List(vec![
+            summary("a1", "0xabc", "0", false),
+            summary("a2", "0xdef", "0", false),
+        ])));
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["Waiting for you: 2 pending", "press a"]),
+            "the human is told how many decisions wait and how to get there"
         );
     }
 

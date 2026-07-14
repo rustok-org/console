@@ -929,7 +929,13 @@ impl Model {
     }
 
     /// Fold a `positions` answer — feeds the dashboard block only, gates
-    /// nothing.
+    /// nothing. Deliberately simpler than [`Self::apply_context`]: a
+    /// `wallet_locked` here REPLACES `Loaded` with `Unavailable` instead of
+    /// keeping-and-flagging, because unlike the balance block nothing else
+    /// feeds off old positions (the card's From→To feeds off `wallet`) —
+    /// and the state is unreachable today anyway (the shipped core never
+    /// re-locks at runtime, canon §3.7). Revisit if positions grow a second
+    /// consumer (Gate-2 NIT).
     fn apply_positions(&mut self, outcome: PositionsOutcome) {
         self.positions = match outcome {
             PositionsOutcome::Ok(list) => Positions::Loaded(list),
@@ -2788,10 +2794,12 @@ mod tests {
 
     #[test]
     fn a_parked_user_intent_outranks_everything_after_a_list_reply() {
-        // The normative dispatch order (spec /check-1): the parked HUMAN
-        // intent first. (A parked get and an active dashboard cannot coexist
-        // today — the switch gate refuses on a parked get — so this pins the
-        // order on the queue view, where parking is possible.)
+        // Pins ONLY that a parked get goes out right after the list reply on
+        // the queue view. It does NOT witness the flush-vs-read-op order:
+        // here dispatch_read_op is already cut by its view check, and the
+        // state "parked intent + active dashboard" is unreachable through
+        // the public API (Gate-2 МИНОР — the dispatcher's own guard is
+        // pinned separately in `the_dispatcher_itself_refuses_a_parked_intent`).
         let mut m = on_dashboard();
         m.update(Msg::View(View::Queue));
         assert!(matches!(
@@ -2870,6 +2878,43 @@ mod tests {
             },
         )))));
         assert!(!m.context_stale());
+    }
+
+    #[test]
+    fn the_dispatcher_itself_refuses_a_parked_intent() {
+        // "Parked intent + active dashboard" is unreachable through the
+        // public API today (the switch gate refuses on a parked get) — build
+        // the state by hand to pin dispatch_read_op's OWN guard, so a future
+        // view that can park while the dashboard is up inherits the refusal
+        // (Gate-2 МИНОР: the model is the boundary, not the reachability of
+        // today's key map).
+        let mut m = on_dashboard();
+        m.pending = Some(PendingIntent::Get("x".to_owned()));
+        assert!(
+            m.dispatch_read_op().is_none(),
+            "a parked human intent starves the read-op, never the reverse"
+        );
+        m.pending = None;
+        assert!(
+            m.dispatch_read_op().is_some(),
+            "…and with the intent gone the read-op flows"
+        );
+    }
+
+    #[test]
+    fn a_dashboard_switch_is_refused_while_a_get_is_parked() {
+        // The direct twin of the Receive-era test, for the third view.
+        let mut m = on_dashboard();
+        m.update(Msg::View(View::Queue));
+        m.update(Msg::Tick);
+        m.update(Msg::Reply(Reply::List(vec![summary("a")])));
+        assert!(matches!(
+            m.update(Msg::Tick),
+            Some(transport::Request::List)
+        ));
+        assert!(m.update(Msg::Open).is_none(), "the get parks");
+        m.update(Msg::View(View::Dashboard));
+        assert_eq!(view_of(&m), View::Queue, "a parked get pins the queue");
     }
 
     #[test]
