@@ -1,6 +1,6 @@
 {
-  "state": "planning",
-  "task": "Console v2 Фаза 2, core PR 3/3 activity-op: спека написана (core/.claude/specs/2026-07-14-console-v2-phase2-p3-activity-op.md), /check пройден (5 находок вшиты: reuse state_word — слова состояний в одной функции; кап внутри тестируемого шва outcomes_json; saturating_duration_since явно; 2 nit), ЖДЁТ ГЕЙТА-1. Ключевые факты: Entry::Resolved хранит ТОЛЬКО state+resolved_at:Instant (превью сброшено — single-use по форме) → op несёт id/state/tx_hash/reason/age_secs, богатая история = локальный лог Этапа 7 по ТЗ; нужен НОВЫЙ метод recent_outcomes() в PendingStore (list_live фильтрует Resolved — /check-финдинг 12.07 подтверждён); §3.9 канона зарезервирован — ренумбера НЕ будет. 4 решения предрешены: age_secs не unix (без правки 3 записи-сайтов store) · кап 100 (защита 64KiB-зеркала клиента: ~600 исходов после lockout-лавины порвали бы канал → Fatal) · без wallet_locked (op не трогает keyring) · без нового gRPC RPC. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 5 Dashboard ЗАКРЫТ (console#13 → 7415239).",
+  "state": "idle",
+  "task": "Console v2 Фаза 2: 6 из 7 этапов ЗАКРЫТЫ — core PR3 activity СМЕРЖЕН 2026-07-14 (core#93 → dd72cbd сквошем, канон console#14 → 1b7a16e, пара core-первым, CI зелёный до мержа на обоих). ТЗ §9.5+§3 отмечены (meta bf59cf2). NEXT = Этап 7 console Activity — ПОСЛЕДНИЙ этап Фазы 2 (вид Activity + Request::Activity/парс в клиенте + локальный лог переживает 60-мин retention, пишет карточку в момент решения — to/amount оттуда + фильтры + возврат short_addr ТОЛЬКО для дисплей-списков, бэклог Фазы 1; шедулер: activity в list-first чередование по канону §3.8) — свой круг, спека → /check → Гейт-1. ⚠️ хэндофф-фраза Капитана про Этап 7 оборвалась на «Учти…» — спросить при спеке. После Этапа 7: релизный поезд §8 (console 0.1.0→0.2.0 + тег → CONSOLE_IMAGE-пин → mcp e2e на новые exit-коды (ADR #7!) → rustok-wallet-tui 0.6→0.7 → листинги).",
   "fast": false,
   "history": [
     {
@@ -260,7 +260,37 @@
       "to": "planning",
       "at": "2026-07-14T02:10:00+05:00",
       "gate": "core PR3 activity, спека к Гейту-1. Blast radius ДО спеки (core main a505fe1): одна содержательная точка — approval.rs (+OutcomeItem, +recent_outcomes; существующие методы/sweep/Entry НЕ меняются — age выводится из resolved_at:Instant, записи-сайты не трогаются); approver.rs аддитивно; gRPC/gateway/console-src — ноль; канон §3.9 заполняется В резерв (якоря неизменны — payoff одноразового ренумбера PR2). Ключевой факт: резолв сбрасывает превью → op зеркалит хранимую истину (id/state/tx_hash/reason/age), реконструкции нет. /check: 5 находок (1 important — reuse существующего state_word approver.rs:582, второго маппинга слов не появляется; 2 sug — кап внутри шва outcomes_json (тест на синтетике без 101 park'ов), saturating_duration_since явно; 2 nit — :265, заголовок без выдуманного «Этапа 6») — все вшиты. 4 решения предрешены (age_secs · кап 100 из-за 64KiB-зеркала transport.rs:333 — lockout-лавина ~600 denied порвала бы человеческий канал · без wallet_locked · без нового gRPC). Кода нет до «го»."
+    },
+    {
+      "from": "planning",
+      "to": "coding",
+      "at": "2026-07-14T09:25:00+05:00",
+      "gate": "Гейт-1 core PR3 ПРОЙДЕН, обе подписи: Ревьюер перепроверил ключевые факты хранилища по коду дословно (Entry::Resolved{state,resolved_at:Instant} approval.rs:100-103 — ровно 2 поля; list_live фильтрует Resolved=>None approval.rs:335; sweep-бэкдейт Expired к дедлайну approval.rs:404-407; state_word существует approver.rs:581 — спека сослалась на 582, на единицу, не критично; MAX_LINE_BYTES=64*1024 approver.rs:48 — кап посчитан против реальной константы) — БЛОКЕРов нет, все 4 предрешённых решения ратифицированы без возражений (age_secs · кап 100 · без wallet_locked · без нового gRPC); Капитан «Го на код». Порядок кодинга: approval.rs OutcomeItem+recent_outcomes+store-тесты red→green → approver.rs Req::Activity+activity()+шов outcomes_json (reuse state_word, кап внутри шва, синтетика 101) → канон §3.9 companion в console-ветке (мерж core первым). Ветка feat/console-v2-phase2-p3-activity."
+    },
+    {
+      "from": "coding",
+      "to": "reviewing",
+      "at": "2026-07-14T10:20:00+05:00",
+      "gate": "core PR3 activity код-готов (core ветка feat/console-v2-phase2-p3-activity: 13f5ed4 approval.rs OutcomeItem+recent_outcomes — lock→sweep→collect Resolved→saturating age→sort age asc+id-tiebreak, записи-сайты/Entry не тронуты; d34909f approver.rs Req::Activity+activity() proto→auth→шов, sync-handler как list; шов outcomes_json отдаёт полный ответ, take(ACTIVITY_CAP=100)+state_word внутри, tx_hash/reason = отсутствие а не null. Console ветка docs/console-v2-phase2-p3-activity: §3.9 полный+§2 строка/family+§6+преамбула — якоря неизменны, reserved 0). Гейты (мои, дешёвые — все 7 CI-команд дословно): fmt чисто · clippy -D warnings чисто · test --workspace ok · features 125 (+9 к 116) +2 · deny advisories ok · deny licenses/bans/sources ok · release-GUARD OK+анти-вакуум OK; console fmt/clippy/тесты 184+19+1. Red→green: 9 новых тестов, 10 мутаций — каждая роняла ровно свой (вкл. свап tx_hash↔reason — урок PR2, и кап — 1 из 32 суиты). Отчёт core/.claude/reports/2026-07-14-console-v2-phase2-p3-activity-op.md (untracked — reports гитигнорены). Отклонение в плюс (1): преамбула канона +activity (класс «future→действующие», прецедент PR2). Вопросы Ревьюеру: (1) §3.11 unauthorized/protocol_error не перечисляют positions ещё с PR2, теперь и activity — рекомендую 2 строки в этом console-PR, но спека сказала §3.11 не трогать; (2) флоу-тест порядка denied(0s)/expired(≥1s) — флейк-риска не вижу. ⛔ Флот-5 (sonnet)+/rust-review+/security-review — Ревьюеру в свежем контексте; push/PR ждут «чисто»."
+    },
+    {
+      "from": "reviewing",
+      "to": "reviewing",
+      "at": "2026-07-14T11:10:00+05:00",
+      "gate": "Гейт-2 вердикт Ревьюера: 1 БЛОКЕР (сортировка по age_secs — целые секунды — суб-секундные резолвы падали в uuid-лотерею; ровно сценарий lockout-лавины, тест-сьют не ловил структурно) + 3 МИНОРа + 4 НИТа; оба вопроса Инженера закрыты (§3.11 — дописать сейчас; тайминг — часть фикса). РАУНД ФИКСОВ (core 848a993 + console f21af9a): БЛОКЕР — recent_outcomes сортирует по сырому resolved_at:Instant ДО усечения, age_secs после (отображение), id-tiebreak только для истинно одновременных; TRUE-RED пруф — regression-тест (2 реальных deny через 10мс, id подобраны под неверный порядок age-tiebreak'а) FAILED на нефиксённом коде, ok после. МИНОР-1 — кап в store: recent_outcomes(cap), drop(entries) до сортировки (лок не держится), шов = чистый verbatim-маппинг, store-тест капа (cap 2 из 3, старейший выпал; мутация truncate-снят роняет ровно его) — осознанное отклонение от буквы Гейта-1 «кап в шве», предписано Ревьюером. МИНОР-2 — флейк-механизм устранён самим фиксом (порядок = сырая хронология, не разность возрастов). МИНОР-3 — §3.11 unauthorized/protocol_error дописаны (+positions стейл с PR2, +activity), §3.9-порядок переформулирован под новую семантику, якоря неизменны. НИТы: ~16KiB в док капа ✅, expired-absence в шов-тесте ✅ (свап-мутация роняет), тройной дубль гейтов — отклонён (Ревьюер не настаивал, смерженный код), executed/failed по живому пути — остаточный риск принят. Гейты финала: все 7 зелёные, workspace 30 suites, features 127 (+2). Дельта в отчёте (низ). Ждём ре-проверку дельты Ревьюером → «чисто» → «добро» Капитана → push+PR-пара, core первым."
+    },
+    {
+      "from": "reviewing",
+      "to": "shipped",
+      "at": "2026-07-14T11:40:00+05:00",
+      "gate": "Гейт-2 «чисто» (Ревьюер: 6 агентов, /rust-review нашёл БЛОКЕР — перепроверил лично; дельта ре-проверена) + «добро» Капитана → push + PR-пара: core#93 (13f5ed4+d34909f+848a993) + console#14 (b2e2aee+f21af9a). CI до мержа: core 6/6 pass (Format 23s · Clippy 45s · Test 10m15s · Approval Acceptor Guard 3m56s · Security Audit 6m20s · License/Bans 33s; Release Build skipping — тег-only), console 4/4 pass."
+    },
+    {
+      "from": "shipped",
+      "to": "idle",
+      "at": "2026-07-14T11:55:00+05:00",
+      "gate": "Круг закрыт: «мержи по зеленому» — core#93 смержен сквошем ПЕРВЫМ (main dd72cbd), затем console#14 (main 1b7a16e); порядок пары соблюдён, ветки удалены локально и на remote (prune чист, 0 activity-веток). Гейты на смерженных main: core fmt/clippy чисто + features 127 ok; console fmt чисто + 4 суиты ok. ТЗ отмечено и запушено (meta bf59cf2: §3-таблица activity DONE + §9.5 полная запись с уроком БЛОКЕРа). Фаза 2: 6 из 7 этапов закрыты. NEXT = Этап 7 console Activity (последний), затем релизный поезд §8."
     }
   ],
-  "updated": "2026-07-14T02:10:00+05:00"
+  "updated": "2026-07-14T11:55:00+05:00"
 }
