@@ -363,9 +363,13 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   real deadline — the age is honest even though expiry is observed lazily
   (§5) — and an id is stable across polls while the age keeps growing, so
   a log dedups by id, never by time.
-- **Ordering: newest first** (equal ages fall back to id order — the answer
-  is deterministic). An empty `outcomes` array is a valid `ok:true` answer,
-  indistinguishable on the wire from "nothing resolved in the last hour".
+- **Ordering: newest first, by the raw resolve instant.** Two outcomes
+  resolved within the same second keep their true order — `age_secs` is
+  truncated for display only, after ordering (equal ages do NOT imply an
+  arbitrary order). Truly simultaneous resolutions (one lockout sweep, §4)
+  fall back to id order, so the answer is deterministic. An empty
+  `outcomes` array is a valid `ok:true` answer, indistinguishable on the
+  wire from "nothing resolved in the last hour".
 - **Cap: at most 100 outcomes per answer — the newest 100.** The console
   transport mirrors the server's 64 KiB line limit (§2) on the response
   lines it reads; an uncapped answer after a lockout avalanche (§4 resolves
@@ -420,10 +424,10 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 
 | Code | Op(s) | Meaning |
 |---|---|---|
-| `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello`, or `context` on a `proto:1` session (§3.7) |
+| `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello`, or a proto-2 read-op (`context`/`positions`/`activity`, §3.7–§3.9) on a `proto:1` session |
 | `oversize` | any | request line > 64 KiB; the connection is then closed (§2) |
 | `unsupported_proto` | hello | major `proto` mismatch; server then closes |
-| `unauthorized` | approve, deny, context | no successful `auth` on this connection |
+| `unauthorized` | approve, deny, context, positions, activity | no successful `auth` on this connection |
 | `bad_pin` | auth, approve | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
 | `locked` | auth, approve | lockout active; carries `retry_after_s` |
 | `pin_not_set` | auth, approve | wallet has no PIN record; run `set-pin` |
