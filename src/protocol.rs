@@ -68,6 +68,10 @@ pub enum Request<'a> {
     /// protocol §3.8). Dispatched by the read-op scheduler only right after
     /// a `list` reply, never ahead of one (the §3.8 client rule).
     Positions,
+    /// Ask for the recent terminal outcomes (proto 2+, auth-gated — protocol
+    /// §3.9): newest first, server-capped at 100. Same scheduler discipline
+    /// as [`Request::Positions`] — only right after a `list` reply.
+    Activity,
 }
 
 /// Serialize a request to a single JSON line (no trailing `\n`; the transport adds
@@ -302,6 +306,45 @@ pub enum PositionsOutcome {
     Ok(Vec<Position>),
     /// The core's own keyring isn't unlocked (§3.11).
     WalletLocked,
+}
+
+/// The four terminal words an `activity` outcome may carry (protocol §3.9).
+/// Deliberately NOT [`TerminalState`]: that enum includes `Pending` for
+/// `already_resolved` (§3.5), which §3.9 promises never to send — a reply
+/// carrying `"pending"` here must FAIL the parse (default-deny), not slip
+/// through. `Serialize` is derived so the console's local activity log stores
+/// exactly these protocol words (one vocabulary end to end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeState {
+    /// Signed and broadcast.
+    Executed,
+    /// Rejected by the human.
+    Denied,
+    /// Expired before a decision.
+    Expired,
+    /// Approved, but signing/broadcast failed.
+    Failed,
+}
+
+/// One retained terminal outcome from `activity` (protocol §3.9), verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OutcomeEntry {
+    /// The resolved item's preview id — stable across polls; the dedup key
+    /// for the console's local log (§3.9).
+    pub id: String,
+    /// Terminal state word (§3.9 — never `"pending"`; see [`OutcomeState`]).
+    pub state: OutcomeState,
+    /// The executed transaction's hash (`0x…`) — executed only; on every
+    /// other state the field is absent on the wire (§3.9) and `None` here.
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    /// Operator-masked failure reason — failed only; absent otherwise.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Seconds since the resolution — a relative age, not a timestamp; the
+    /// console derives an absolute time locally at arrival (§3.9).
+    pub age_secs: u64,
 }
 
 /// The terminal state carried by an `already_resolved` reply (protocol §3.5).
@@ -569,6 +612,35 @@ pub fn parse_positions(line: &str) -> Result<PositionsOutcome, ProtocolError> {
     } else {
         Err(ProtocolError::Unexpected(raw.error.unwrap_or_else(|| {
             "positions without ok or error".to_owned()
+        })))
+    }
+}
+
+/// Parse an `activity` reply (§3.9). Unlike `context`/`positions` there is NO
+/// degradable answer: the op reads only the outcome store — `wallet_locked`
+/// is not in its vocabulary (§3.9). We only send `activity` post-auth on a
+/// proto-2 session, so `unauthorized`/`protocol_error` (or any other code)
+/// mean the channel is not what we negotiated — the same fail-closed class
+/// as an unexpected resolve code.
+///
+/// # Errors
+/// [`ProtocolError::Malformed`] on a wrong shape (including a `"pending"`
+/// state — see [`OutcomeState`]); [`ProtocolError::Unexpected`] on `ok:false`.
+pub fn parse_activity(line: &str) -> Result<Vec<OutcomeEntry>, ProtocolError> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ok: bool,
+        outcomes: Option<Vec<OutcomeEntry>>,
+        error: Option<String>,
+    }
+    let raw: Raw = parse_line(line)?;
+    if raw.ok {
+        raw.outcomes.ok_or_else(|| {
+            ProtocolError::Malformed("ok activity without an outcomes array".to_owned())
+        })
+    } else {
+        Err(ProtocolError::Unexpected(raw.error.unwrap_or_else(|| {
+            "activity without ok or error".to_owned()
         })))
     }
 }
@@ -1163,6 +1235,85 @@ mod tests {
         assert_eq!(
             encode_request(&Request::Positions).unwrap(),
             r#"{"op":"positions"}"#
+        );
+    }
+
+    // ── activity (§3.9, Stage 7) — mirrors the positions parse suite ──
+
+    #[test]
+    fn parse_activity_carries_all_four_states_verbatim() {
+        let line = r#"{"ok":true,"outcomes":[
+            {"id":"e1","state":"executed","tx_hash":"0xfeed","age_secs":42},
+            {"id":"d1","state":"denied","age_secs":120},
+            {"id":"x1","state":"expired","age_secs":1800},
+            {"id":"f1","state":"failed","reason":"broadcast failed","age_secs":3599}]}"#
+            .replace('\n', "");
+        let outcomes = parse_activity(&line).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0].id, "e1");
+        assert_eq!(outcomes[0].state, OutcomeState::Executed);
+        assert_eq!(outcomes[0].tx_hash.as_deref(), Some("0xfeed"));
+        assert_eq!(outcomes[0].reason, None);
+        assert_eq!(outcomes[0].age_secs, 42);
+        assert_eq!(outcomes[1].state, OutcomeState::Denied);
+        assert_eq!(
+            (outcomes[1].tx_hash.as_deref(), outcomes[1].reason.as_deref()),
+            (None, None),
+            "absent wire fields read as None, never a fabricated value"
+        );
+        assert_eq!(outcomes[2].state, OutcomeState::Expired);
+        assert_eq!(outcomes[3].state, OutcomeState::Failed);
+        assert_eq!(outcomes[3].reason.as_deref(), Some("broadcast failed"));
+        assert_eq!(outcomes[3].tx_hash, None);
+    }
+
+    #[test]
+    fn parse_activity_accepts_an_empty_history() {
+        let line = r#"{"ok":true,"outcomes":[]}"#;
+        assert_eq!(parse_activity(line).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_activity_never_accepts_a_pending_state() {
+        // §3.9: only terminal words; "pending" is not in the vocabulary and
+        // must fail the parse (default-deny), not slip through as data.
+        let line = r#"{"ok":true,"outcomes":[{"id":"p1","state":"pending","age_secs":1}]}"#;
+        assert!(matches!(
+            parse_activity(line),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_activity_unexpected_errors_fail_closed() {
+        // §3.9 has no degradable answer (no wallet_locked): any error code
+        // means the channel is not what we negotiated.
+        for code in ["unauthorized", "protocol_error", "wallet_locked"] {
+            let line = format!(r#"{{"ok":false,"error":"{code}"}}"#);
+            assert!(matches!(
+                parse_activity(&line),
+                Err(ProtocolError::Unexpected(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_activity_ok_without_array_is_malformed() {
+        assert!(matches!(
+            parse_activity(r#"{"ok":true}"#),
+            Err(ProtocolError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_activity("not json"),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn activity_request_encodes_the_documented_op() {
+        assert_eq!(
+            encode_request(&Request::Activity).unwrap(),
+            r#"{"op":"activity"}"#
         );
     }
 }
