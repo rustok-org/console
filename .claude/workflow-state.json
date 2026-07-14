@@ -1,6 +1,6 @@
 {
-  "state": "idle",
-  "task": "Console v2 Фаза 2, Этап 5 Dashboard ЗАКРЫТ (PR console#13 → main 7415239, смержен по «мержи по зеленому», CI 4/4): третий вид + home после PIN (ратиф. Капитана), read-op шедулер list-first (нормативная политика канона §3.8 + флаг Ревьюера: только из on_reply(List), flush_pending первым, тройная чистота, чередование Context/Positions ~30 c, честная граница гарантии в док-комменте), тристейт positions, context_stale (упавший рефреш метит, не выкидывает), overflow-бюджет честным счётчиком строк цикла (блокер Гейта-2 закрыт с red-proof на точной границе). Гейты на main: 184+19+1, fmt/clippy чисто. Из 7 этапов Фазы 2 закрыто 5. NEXT по §9.5: core PR3 activity (канон-резерв §3.9 готов — ренумбера не будет; вес: НОВЫЙ метод перечисления в PendingStore, не бесплатная обёртка — /check-финдинг от 2026-07-12) → Этап 7 Activity (вид + локальный лог переживающий 60-мин retention) → релизный поезд §8 (v0.2.0 одним пакетом: бамп, тег, Dockerfile.wallet пин, mcp e2e на новые exit-коды, листинги).",
+  "state": "planning",
+  "task": "Console v2 Фаза 2, core PR 3/3 activity-op: спека написана (core/.claude/specs/2026-07-14-console-v2-phase2-p3-activity-op.md), /check пройден (5 находок вшиты: reuse state_word — слова состояний в одной функции; кап внутри тестируемого шва outcomes_json; saturating_duration_since явно; 2 nit), ЖДЁТ ГЕЙТА-1. Ключевые факты: Entry::Resolved хранит ТОЛЬКО state+resolved_at:Instant (превью сброшено — single-use по форме) → op несёт id/state/tx_hash/reason/age_secs, богатая история = локальный лог Этапа 7 по ТЗ; нужен НОВЫЙ метод recent_outcomes() в PendingStore (list_live фильтрует Resolved — /check-финдинг 12.07 подтверждён); §3.9 канона зарезервирован — ренумбера НЕ будет. 4 решения предрешены: age_secs не unix (без правки 3 записи-сайтов store) · кап 100 (защита 64KiB-зеркала клиента: ~600 исходов после lockout-лавины порвали бы канал → Fatal) · без wallet_locked (op не трогает keyring) · без нового gRPC RPC. Кода нет до «го». ПРЕДЫДУЩЕЕ: Этап 5 Dashboard ЗАКРЫТ (console#13 → 7415239).",
   "fast": false,
   "history": [
     {
@@ -254,7 +254,13 @@
       "to": "idle",
       "at": "2026-07-14T01:30:00+05:00",
       "gate": "Круг закрыт: PR #13 смержен сквошем (main 7415239, CI 4/4 до мержа), ветки удалены локально и на remote. Гейты на смерженном main: 184+19+1, fmt/clippy чисто. Смоук-скрипт этапа сохранён в .claude/reports/2026-07-13-smoke-dashboard.py. NEXT = core PR3 activity, новый круг по «го» Капитана."
+    },
+    {
+      "from": "idle",
+      "to": "planning",
+      "at": "2026-07-14T02:10:00+05:00",
+      "gate": "core PR3 activity, спека к Гейту-1. Blast radius ДО спеки (core main a505fe1): одна содержательная точка — approval.rs (+OutcomeItem, +recent_outcomes; существующие методы/sweep/Entry НЕ меняются — age выводится из resolved_at:Instant, записи-сайты не трогаются); approver.rs аддитивно; gRPC/gateway/console-src — ноль; канон §3.9 заполняется В резерв (якоря неизменны — payoff одноразового ренумбера PR2). Ключевой факт: резолв сбрасывает превью → op зеркалит хранимую истину (id/state/tx_hash/reason/age), реконструкции нет. /check: 5 находок (1 important — reuse существующего state_word approver.rs:582, второго маппинга слов не появляется; 2 sug — кап внутри шва outcomes_json (тест на синтетике без 101 park'ов), saturating_duration_since явно; 2 nit — :265, заголовок без выдуманного «Этапа 6») — все вшиты. 4 решения предрешены (age_secs · кап 100 из-за 64KiB-зеркала transport.rs:333 — lockout-лавина ~600 denied порвала бы человеческий канал · без wallet_locked · без нового gRPC). Кода нет до «го»."
     }
   ],
-  "updated": "2026-07-14T01:30:00+05:00"
+  "updated": "2026-07-14T02:10:00+05:00"
 }
