@@ -2369,26 +2369,39 @@ mod tests {
     }
 
     #[test]
-    fn the_outcome_word_carries_its_semantic_color() {
+    fn every_outcome_word_carries_its_semantic_color() {
+        // Gate-2 НИТ: all four states, not just Denied.
         use ratatui::backend::TestBackend;
-        let m = on_activity(vec![history("d1", NOW - 5, OutcomeState::Denied)]);
+        let m = on_activity(vec![
+            history("e1", NOW - 2, OutcomeState::Executed),
+            history("d1", NOW - 5, OutcomeState::Denied),
+            history("x1", NOW - 9, OutcomeState::Expired),
+            history("f1", NOW - 13, OutcomeState::Failed),
+        ]);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &m, NOW)).unwrap();
         let buffer = terminal.backend().buffer();
-        let mut found = false;
-        for y in 0..24u16 {
-            let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
-            if let Some(at) = row.find("rejected") {
-                assert_eq!(
-                    buffer[(u16::try_from(at).unwrap(), y)].style().fg,
-                    Some(theme::reject()),
-                    "a rejection reads in the reject color"
-                );
-                found = true;
+        for (word, color) in [
+            ("approved", theme::approve()),
+            ("rejected", theme::reject()),
+            ("expired", theme::high_risk()),
+            ("failed", theme::reject()),
+        ] {
+            let mut found = false;
+            for y in 0..24u16 {
+                let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+                if let Some(at) = row.find(word) {
+                    assert_eq!(
+                        buffer[(u16::try_from(at).unwrap(), y)].style().fg,
+                        Some(color),
+                        "{word} reads in its semantic color"
+                    );
+                    found = true;
+                }
             }
+            assert!(found, "the {word} row renders");
         }
-        assert!(found, "the rejected row renders");
     }
 
     #[test]
@@ -2436,6 +2449,27 @@ mod tests {
         assert!(
             has_line_with(&rows, &["session-only"]),
             "log degradation is visible on the view: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_note_and_the_overflow_marker_share_the_budget() {
+        // Gate-2 НИТ: the note reserves its row BEFORE the budget is spent —
+        // 21 inner rows − header − note = 19 → 18 rows + "+3 more", and the
+        // note still visible under the marker.
+        let over: Vec<HistoryEntry> = (0u64..21)
+            .map(|i| history(&format!("e{i:02}"), NOW - i, OutcomeState::Denied))
+            .collect();
+        let mut m = on_activity(over);
+        m.set_history_note("history is session-only".to_owned());
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["+3 more"]),
+            "the note's reserved row shrinks the list budget by one: {rows:?}"
+        );
+        assert!(
+            has_line_with(&rows, &["session-only"]),
+            "the note survives an overflowing list: {rows:?}"
         );
     }
 }

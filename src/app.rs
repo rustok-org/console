@@ -304,6 +304,33 @@ pub struct HistoryEntry {
     pub reason: Option<String>,
 }
 
+impl HistoryEntry {
+    /// Fill this entry's MISSING fields from another record of the same
+    /// outcome — present fields are never overwritten. The ONE merge seam
+    /// for every duplicate-id path: the in-session fill
+    /// ([`Model::fill_history_detail`]) and the load-time dedup (Gate-2
+    /// BLOCKER-1: a whole-record replace by timestamp traded a rich record
+    /// for a poor one written by a second console — the stamps come from
+    /// different formulas and are not comparable).
+    pub fn fill_missing_from(&mut self, other: &HistoryEntry) {
+        if self.to.is_none() {
+            self.to.clone_from(&other.to);
+        }
+        if self.amount_wei.is_none() {
+            self.amount_wei.clone_from(&other.amount_wei);
+        }
+        if self.chain_id.is_none() {
+            self.chain_id = other.chain_id;
+        }
+        if self.tx_hash.is_none() {
+            self.tx_hash.clone_from(&other.tx_hash);
+        }
+        if self.reason.is_none() {
+            self.reason.clone_from(&other.reason);
+        }
+    }
+}
+
 /// A decision made on THIS console, drained by the run loop
 /// ([`Model::take_decided_outcome`]) to be stamped (unix = now), appended to
 /// the local log, and pushed back via [`Model::push_history`]. The timestamp
@@ -731,38 +758,18 @@ impl Model {
         self.sort_and_cap_history();
     }
 
-    /// Fill MISSING detail on a known entry (spec /check-2), both ways: an
-    /// item resolved by another connection leaves our rich record without
-    /// tx_hash/reason (the server window carries them); a server-only record
-    /// gains to/amount/chain when the same id is later decided here. Present
-    /// fields are never overwritten; the file keeps its first record
-    /// (append-only) — this enriches the session view only.
-    pub fn fill_history_detail(
-        &mut self,
-        id: &str,
-        to: Option<&str>,
-        amount_wei: Option<&str>,
-        chain_id: Option<u64>,
-        tx_hash: Option<&str>,
-        reason: Option<&str>,
-    ) {
-        let Some(entry) = self.history.iter_mut().find(|e| e.id == id) else {
-            return;
-        };
-        if entry.to.is_none() {
-            entry.to = to.map(str::to_owned);
-        }
-        if entry.amount_wei.is_none() {
-            entry.amount_wei = amount_wei.map(str::to_owned);
-        }
-        if entry.chain_id.is_none() {
-            entry.chain_id = chain_id;
-        }
-        if entry.tx_hash.is_none() {
-            entry.tx_hash = tx_hash.map(str::to_owned);
-        }
-        if entry.reason.is_none() {
-            entry.reason = reason.map(str::to_owned);
+    /// Fill MISSING detail on the known entry with `from.id` (spec /check-2),
+    /// both ways: an item resolved by another connection leaves our rich
+    /// record without tx_hash/reason (the server window carries them); a
+    /// server-only record gains to/amount/chain when the same id is later
+    /// decided here. Present fields are never overwritten (the shared
+    /// [`HistoryEntry::fill_missing_from`] seam); the file keeps its first
+    /// record (append-only) — this enriches the session view only. Takes the
+    /// whole record, not positional Options — five same-typed parameters
+    /// were a silent-swap hazard (Gate-2 МИНОР-9).
+    pub fn fill_history_detail(&mut self, from: &HistoryEntry) {
+        if let Some(entry) = self.history.iter_mut().find(|e| e.id == from.id) {
+            entry.fill_missing_from(from);
         }
     }
 
@@ -3401,29 +3408,49 @@ mod tests {
 
     #[test]
     fn fill_history_detail_fills_only_the_missing_fields() {
+        // Gate-2 МИНОР-6: every one of the five fields is exercised in BOTH
+        // directions — present (never overwritten) and missing (filled),
+        // reason included with a real value.
         let mut m = Model::new();
-        let mut rich = history_entry("a", 10, OutcomeState::Executed);
-        rich.to = Some("0xTO".to_owned());
-        m.set_history(vec![rich]);
+        let mut base = history_entry("a", 10, OutcomeState::Failed);
+        base.to = Some("0xTO".to_owned());
+        base.reason = Some("broadcast failed".to_owned());
+        m.set_history(vec![base]);
 
-        m.fill_history_detail(
-            "a",
-            Some("0xEVIL"),
-            Some("5"),
-            Some(1),
-            Some("0xfeed"),
-            None,
-        );
+        let mut from = history_entry("a", 99, OutcomeState::Failed);
+        from.to = Some("0xEVIL".to_owned());
+        from.amount_wei = Some("5".to_owned());
+        from.chain_id = Some(1);
+        from.tx_hash = Some("0xfeed".to_owned());
+        from.reason = Some("a different story".to_owned());
+        m.fill_history_detail(&from);
+
         let e = &m.history()[0];
         assert_eq!(
             e.to.as_deref(),
             Some("0xTO"),
             "a present field is never overwritten"
         );
+        assert_eq!(
+            e.reason.as_deref(),
+            Some("broadcast failed"),
+            "a present reason is never overwritten"
+        );
         assert_eq!(e.amount_wei.as_deref(), Some("5"), "a missing field fills");
         assert_eq!(e.chain_id, Some(1));
         assert_eq!(e.tx_hash.as_deref(), Some("0xfeed"));
-        assert_eq!(e.reason, None);
+
+        // And the reverse direction: a poor base gains a real reason.
+        let mut m = Model::new();
+        m.set_history(vec![history_entry("b", 10, OutcomeState::Failed)]);
+        let mut from = history_entry("b", 99, OutcomeState::Failed);
+        from.reason = Some("broadcast failed".to_owned());
+        m.fill_history_detail(&from);
+        assert_eq!(
+            m.history()[0].reason.as_deref(),
+            Some("broadcast failed"),
+            "a missing reason fills with the real value"
+        );
     }
 
     #[test]
