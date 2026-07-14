@@ -122,14 +122,26 @@ mod tests {
 
     #[test]
     fn short_addr_returns_unshortenable_input_verbatim() {
-        assert_eq!(short_addr("0x1234567890ab"), "0x1234567890ab", "12 hex: nothing saved");
-        assert_eq!(short_addr("not-an-address"), "not-an-address", "no 0x prefix");
+        assert_eq!(
+            short_addr("0x1234567890ab"),
+            "0x1234567890ab",
+            "12 hex: nothing saved"
+        );
+        assert_eq!(
+            short_addr("not-an-address"),
+            "not-an-address",
+            "no 0x prefix"
+        );
         assert_eq!(short_addr(""), "");
     }
 
     #[test]
     fn short_addr_never_panics_on_non_ascii() {
         let hostile = "0xдлинная-не-ascii-строка-длиннее-двенадцати";
-        assert_eq!(short_addr(hostile), hostile, "non-ASCII input is returned verbatim");
+        assert_eq!(
+            short_addr(hostile),
+            hostile,
+            "non-ASCII input is returned verbatim"
+        );
     }
 }

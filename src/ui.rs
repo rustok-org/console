@@ -10,9 +10,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{
-    AuthError, Confirm, DecisionKind, Model, Notice, Phase, Positions, ResolveError, View,
+    AuthError, Confirm, DecisionKind, HistoryEntry, Model, Notice, Phase, Positions, ResolveError,
+    View,
 };
-use crate::protocol::{Card, Summary};
+use crate::protocol::{Card, OutcomeState, Summary};
 use crate::{format, qr, theme};
 
 /// Render the whole screen for the current model.
@@ -43,6 +44,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
             ),
             View::Receive => render_receive(frame, items.len(), model.wallet_address()),
             View::Dashboard => render_dashboard(frame, items.len(), model),
+            View::Activity => render_activity(frame, items.len(), model, now_unix),
         },
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
@@ -73,6 +75,8 @@ fn tab_line(active: View, pending: usize) -> Line<'static> {
         tab(format!(" Queue·{pending} [a] "), active == View::Queue),
         Span::raw(" "),
         tab(" Receive [r] ".to_owned(), active == View::Receive),
+        Span::raw(" "),
+        tab(" Activity [h] ".to_owned(), active == View::Activity),
     ])
 }
 
@@ -448,6 +452,120 @@ fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
         lines = banner;
     }
     frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+}
+
+/// The Activity view: terminal outcomes newest-first — the local log merged
+/// with the server's retained window (Stage 7). Pure display: nothing here
+/// signs or gates. Addresses are SHORTENED (`format::short_addr`) — the one
+/// display list ТЗ §4.1 allows it on; signing surfaces render in full. Rows
+/// that do not fit end with an explicit "+N more" marker, never a silent
+/// clip (the Stage-5 budget lesson: exact-fit vs marker split, one budget).
+fn render_activity(frame: &mut Frame, pending: usize, model: &Model, now_unix: u64) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
+    frame.render_widget(Paragraph::new(tab_line(View::Activity, pending)), chunks[0]);
+
+    let block = themed_block(" Activity ");
+    let inner = block.inner(chunks[1]);
+    let height = usize::from(inner.height);
+
+    let filter = model.history_filter();
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        format!("filter: {}  [f cycles]", filter.label()),
+        theme::label_style(),
+    ))];
+    let note_lines = usize::from(model.history_note().is_some());
+
+    let rows: Vec<&HistoryEntry> = model
+        .history()
+        .iter()
+        .filter(|e| filter.admits(e.state))
+        .collect();
+    if rows.is_empty() {
+        let text = if model.history().is_empty() {
+            "no activity yet".to_owned()
+        } else {
+            format!("no {} outcomes under this filter", filter.label())
+        };
+        lines.push(Line::from(Span::styled(text, theme::label_style())));
+    } else {
+        // The budget is computed ONCE from what is already reserved (header +
+        // footer note); the loop below never re-subtracts it. Exact fit shows
+        // everything; one over shows budget−1 rows + an honest marker.
+        let budget = height.saturating_sub(lines.len() + note_lines);
+        let total = rows.len();
+        if total <= budget {
+            lines.extend(rows.iter().map(|e| activity_line(e, now_unix)));
+        } else if let Some(kept) = budget.checked_sub(1) {
+            lines.extend(rows[..kept].iter().map(|e| activity_line(e, now_unix)));
+            lines.push(Line::from(Span::styled(
+                format!("+{} more (history lives in the local log)", total - kept),
+                theme::label_style(),
+            )));
+        }
+        // budget == 0: the block has no visible rows at all — nothing is
+        // being clipped in silence, the whole list is out of view.
+    }
+    if let Some(note) = model.history_note() {
+        lines.push(Line::from(Span::styled(
+            note.to_owned(),
+            theme::high_risk_style(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+}
+
+/// One outcome row. A rich record carries the card data written at decision
+/// time; a server-only record renders an honest "(details not recorded)"
+/// instead of fabricated columns.
+fn activity_line(entry: &HistoryEntry, now_unix: u64) -> Line<'static> {
+    let (word, color) = match entry.state {
+        OutcomeState::Executed => ("approved", theme::approve()),
+        OutcomeState::Denied => ("rejected", theme::reject()),
+        OutcomeState::Expired => ("expired", theme::high_risk()),
+        OutcomeState::Failed => ("failed", theme::reject()),
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("{:>7}  ", age_label(now_unix, entry.unix)),
+            theme::label_style(),
+        ),
+        Span::styled(format!("{word:<8}"), Style::new().fg(color)),
+    ];
+    match (&entry.to, &entry.amount_wei) {
+        (Some(to), Some(amount)) => spans.push(Span::raw(format!(
+            " {} → {}",
+            format::wei_to_eth(amount),
+            format::short_addr(to)
+        ))),
+        _ => spans.push(Span::styled(
+            " (details not recorded)".to_owned(),
+            theme::label_style(),
+        )),
+    }
+    if let Some(tx) = &entry.tx_hash {
+        spans.push(Span::styled(
+            format!("  tx {}", format::short_addr(tx)),
+            theme::label_style(),
+        ));
+    }
+    if let Some(reason) = &entry.reason {
+        spans.push(Span::styled(format!("  {reason}"), theme::label_style()));
+    }
+    Line::from(spans)
+}
+
+/// Compact "how long ago" for a history row (whole units, floor).
+fn age_label(now_unix: u64, unix: u64) -> String {
+    let s = now_unix.saturating_sub(unix);
+    if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
 }
 
 /// The Dashboard: per-chain balance (from `context`), DeFi positions (the
@@ -2167,6 +2285,157 @@ mod tests {
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED),
             "the active (home) tab is the Dashboard"
+        );
+    }
+
+    // ── Stage 7: the Activity view ──
+
+    fn history(id: &str, unix: u64, state: OutcomeState) -> HistoryEntry {
+        HistoryEntry {
+            unix,
+            id: id.to_owned(),
+            state,
+            to: None,
+            amount_wei: None,
+            chain_id: None,
+            tx_hash: None,
+            reason: None,
+        }
+    }
+
+    fn on_activity(entries: Vec<HistoryEntry>) -> Model {
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        m.set_history(entries);
+        m.update(Msg::View(View::Activity));
+        m
+    }
+
+    #[test]
+    fn a_rich_row_shows_age_outcome_amount_and_a_shortened_address() {
+        let mut rich = history("r1", NOW - 120, OutcomeState::Executed);
+        rich.to = Some("0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb".to_owned());
+        rich.amount_wei = Some("10000000000000000".to_owned());
+        rich.tx_hash = Some("0xfeedfeedfeedfeed".to_owned());
+        let m = on_activity(vec![rich]);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(
+                &rows,
+                &[
+                    "2m ago",
+                    "approved",
+                    "0.01 ETH",
+                    "0x489Fe0…bbbb",
+                    "tx 0xfeedfe…feed"
+                ]
+            ),
+            "age, outcome, human amount, SHORTENED address and tx on one row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("0x489Fe09Fbb489Fe09Fbb")),
+            "the Activity list never carries the full address — display, not signing"
+        );
+    }
+
+    #[test]
+    fn a_server_only_row_admits_it_has_no_details() {
+        let m = on_activity(vec![history("s1", NOW - 3600, OutcomeState::Expired)]);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["1h ago", "expired", "(details not recorded)"]),
+            "a poor record renders honestly, no fabricated columns: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_history_and_an_empty_filter_speak_up() {
+        let mut m = on_activity(vec![]);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(has_line_with(&rows, &["no activity yet"]));
+        assert!(
+            has_line_with(&rows, &["filter: all", "[f cycles]"]),
+            "the filter header names the active filter: {rows:?}"
+        );
+
+        // One denied entry, filter cycled to `executed`: nothing matches.
+        m.set_history(vec![history("d1", NOW - 5, OutcomeState::Denied)]);
+        m.update(Msg::Filter);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["no executed outcomes under this filter"]),
+            "an empty filtered view says which filter hides the rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_outcome_word_carries_its_semantic_color() {
+        use ratatui::backend::TestBackend;
+        let m = on_activity(vec![history("d1", NOW - 5, OutcomeState::Denied)]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &m, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..24u16 {
+            let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+            if let Some(at) = row.find("rejected") {
+                assert_eq!(
+                    buffer[(u16::try_from(at).unwrap(), y)].style().fg,
+                    Some(theme::reject()),
+                    "a rejection reads in the reject color"
+                );
+                found = true;
+            }
+        }
+        assert!(found, "the rejected row renders");
+    }
+
+    #[test]
+    fn overflowing_history_ends_with_an_honest_marker() {
+        // 80×24: 1 tab row + 2 borders leave 21 inner rows; the filter header
+        // takes 1 → a 20-row budget. Exactly 20 entries fit without a marker;
+        // 21 show 19 + "+2 more" (the Stage-5 exact-fit/marker split).
+        let exact: Vec<HistoryEntry> = (0u64..20)
+            .map(|i| history(&format!("e{i:02}"), NOW - i, OutcomeState::Denied))
+            .collect();
+        let m = on_activity(exact);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            !rows.iter().any(|r| r.contains("more")),
+            "an exact fit needs no marker: {rows:?}"
+        );
+
+        let over: Vec<HistoryEntry> = (0u64..21)
+            .map(|i| history(&format!("e{i:02}"), NOW - i, OutcomeState::Denied))
+            .collect();
+        let m = on_activity(over);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["+2 more"]),
+            "one over budget keeps budget−1 rows and says what is hidden: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_tab_bar_carries_the_activity_tab() {
+        let mut m = Model::new();
+        to_watching(&mut m, vec![]);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["Queue·0 [a]", "Receive [r]", "Activity [h]"]),
+            "all four tabs share the 80-column header row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_history_note_renders_as_a_footer() {
+        let mut m = on_activity(vec![]);
+        m.set_history_note("history is session-only — set RUSTOK_CONSOLE_LOG".to_owned());
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["session-only"]),
+            "log degradation is visible on the view: {rows:?}"
         );
     }
 }

@@ -9,7 +9,9 @@
 //! `2026-07-12-invariant-7-decision-stream`); the exit code reports how the
 //! session ended (aborted / no-tty / fatal / upgrade).
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Stderr, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +25,9 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use rustok_console::app::{Decision, DecisionKind, Model, Msg, Phase, View};
+use rustok_console::app::{
+    Decision, DecisionKind, HISTORY_CAP, HistoryEntry, Model, Msg, Phase, View,
+};
 use rustok_console::transport::{Transport, TransportError};
 use rustok_console::ui;
 
@@ -112,12 +116,164 @@ fn set_panic_hook() {
     }));
 }
 
+/// The run loop's side of the history pipeline (Stage 7): the model has no
+/// clock and no filesystem, so stamping, persistence and the id-dedup set
+/// (§3.9) live here.
+struct HistoryLog {
+    /// Append target; `None` = session-only (no path configured, or a write
+    /// failed and persistence was honestly switched off).
+    path: Option<PathBuf>,
+    /// Every id in the log or recorded this session — the dedup set.
+    seen: HashSet<String>,
+}
+
+impl HistoryLog {
+    /// Resolve the path cascade (`RUSTOK_CONSOLE_LOG` →
+    /// `$RUSTOK_DATA_DIR/console-activity.jsonl` → session-only), load and
+    /// dedup the file, compact it when oversized (best-effort), and seed the
+    /// model with the entries and a degradation note when there is one.
+    fn open(model: &mut Model) -> Self {
+        let Some(path) = history_log_path() else {
+            model.set_history_note(
+                "history is session-only — set RUSTOK_CONSOLE_LOG or RUSTOK_DATA_DIR to persist"
+                    .to_owned(),
+            );
+            return Self {
+                path: None,
+                seen: HashSet::new(),
+            };
+        };
+        let (entries, skipped) = load_history(&path);
+        if skipped > 0 {
+            model.set_history_note(format!(
+                "activity log partially unreadable — {skipped} line(s) skipped"
+            ));
+        }
+        if entries.len() > 2 * HISTORY_CAP {
+            compact_history(&path, &entries);
+        }
+        let seen = entries.iter().map(|e| e.id.clone()).collect();
+        model.set_history(entries);
+        Self {
+            path: Some(path),
+            seen,
+        }
+    }
+
+    /// Record one stamped entry: a NEW id is appended to the file (when
+    /// persisting) and pushed into the model; a known id only fills the
+    /// missing fields of its existing row (fill-missing merge, spec /check-2
+    /// — the file keeps its first record, append-only). A failed write
+    /// switches persistence off with a visible note — never a crash, never
+    /// silence.
+    fn record(&mut self, model: &mut Model, entry: HistoryEntry) {
+        if !self.seen.insert(entry.id.clone()) {
+            model.fill_history_detail(
+                &entry.id,
+                entry.to.as_deref(),
+                entry.amount_wei.as_deref(),
+                entry.chain_id,
+                entry.tx_hash.as_deref(),
+                entry.reason.as_deref(),
+            );
+            return;
+        }
+        if let Some(path) = &self.path
+            && append_history_line(path, &entry).is_err()
+        {
+            self.path = None;
+            model.set_history_note(
+                "history is not being persisted — the activity log write failed".to_owned(),
+            );
+        }
+        model.push_history(entry);
+    }
+}
+
+/// The local log's path cascade: an explicit override, else the wallet
+/// image's persistent volume (`RUSTOK_DATA_DIR=/data`, Dockerfile.wallet),
+/// else nowhere (session-only).
+fn history_log_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("RUSTOK_CONSOLE_LOG") {
+        return Some(PathBuf::from(explicit));
+    }
+    std::env::var("RUSTOK_DATA_DIR")
+        .ok()
+        .map(|dir| Path::new(&dir).join("console-activity.jsonl"))
+}
+
+/// Load the JSONL log: corrupt lines are skipped (counted, never fatal), and
+/// entries are deduped by id — two consoles may have appended the same server
+/// outcome concurrently (spec /check-3); the newest stamp wins. A missing
+/// file is an empty history, not an error.
+fn load_history(path: &Path) -> (Vec<HistoryEntry>, usize) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (Vec::new(), 0);
+    };
+    let mut skipped = 0usize;
+    let mut by_id: HashMap<String, HistoryEntry> = HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<HistoryEntry>(line) {
+            Ok(entry) => match by_id.entry(entry.id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if entry.unix > slot.get().unix {
+                        slot.insert(entry);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+            },
+            Err(_) => skipped += 1,
+        }
+    }
+    (by_id.into_values().collect(), skipped)
+}
+
+/// Append one entry as a JSONL line.
+fn append_history_line(path: &Path, entry: &HistoryEntry) -> io::Result<()> {
+    let mut line =
+        serde_json::to_string(entry).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())
+}
+
+/// Best-effort compaction: rewrite the newest [`HISTORY_CAP`] entries
+/// atomically (tmp beside the file + rename, same filesystem) — corrupt and
+/// duplicate lines are dropped with the rest (the file heals itself). Called
+/// only when the loaded file carried more than 2× the cap; any failure
+/// leaves the file exactly as it was.
+fn compact_history(path: &Path, entries: &[HistoryEntry]) {
+    let mut newest: Vec<&HistoryEntry> = entries.iter().collect();
+    newest.sort_unstable_by(|a, b| b.unix.cmp(&a.unix).then_with(|| a.id.cmp(&b.id)));
+    newest.truncate(HISTORY_CAP);
+    let mut body = String::new();
+    for entry in newest {
+        match serde_json::to_string(entry) {
+            Ok(line) => {
+                body.push_str(&line);
+                body.push('\n');
+            }
+            Err(_) => return,
+        }
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// The event loop: draw, read input, drain worker replies, tick the poll. The
 /// resident console leaves only on quit or a dead connection; each terminal
 /// decision is streamed to stdout as it happens (when stdout is not a TTY).
 /// A `Fatal` phase is shown until a keypress, then exits.
 fn run(mut terminal: Tui, transport: &Transport, stream_decisions: bool) -> u8 {
     let mut model = Model::new();
+    let mut history = HistoryLog::open(&mut model);
     let mut last_tick = Instant::now();
 
     // Report the terminal size before anything else: the model approves only a
@@ -190,6 +346,40 @@ fn run(mut terminal: Tui, transport: &Transport, stream_decisions: bool) -> u8 {
                 && stream_decisions
             {
                 let _ = writeln!(io::stdout(), "{}", decision_line(&decision));
+            }
+            // History pipeline (Stage 7): stamp → persist → push back, in the
+            // SAME pass, before the next render (the order is normative). A
+            // decision made here is stamped `now`; a server outcome is
+            // stamped `arrival − age` (§3.9).
+            if let Some(d) = model.take_decided_outcome() {
+                history.record(
+                    &mut model,
+                    HistoryEntry {
+                        unix: now_unix(),
+                        id: d.id,
+                        state: d.state,
+                        to: Some(d.to),
+                        amount_wei: Some(d.amount_wei),
+                        chain_id: Some(d.chain_id),
+                        tx_hash: d.tx_hash,
+                        reason: d.reason,
+                    },
+                );
+            }
+            for outcome in model.take_server_outcomes() {
+                history.record(
+                    &mut model,
+                    HistoryEntry {
+                        unix: now_unix().saturating_sub(outcome.age_secs),
+                        id: outcome.id,
+                        state: outcome.state,
+                        to: None,
+                        amount_wei: None,
+                        chain_id: None,
+                        tx_hash: outcome.tx_hash,
+                        reason: outcome.reason,
+                    },
+                );
             }
         }
 
@@ -321,6 +511,7 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Enter => Some(Msg::Open),
             KeyCode::Char('d') => Some(Msg::View(View::Dashboard)),
             KeyCode::Char('r') => Some(Msg::View(View::Receive)),
+            KeyCode::Char('h') => Some(Msg::View(View::Activity)),
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
@@ -334,6 +525,7 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
         } => match key.code {
             KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
             KeyCode::Char('d') => Some(Msg::View(View::Dashboard)),
+            KeyCode::Char('h') => Some(Msg::View(View::Activity)),
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
@@ -345,6 +537,20 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
         } => match key.code {
             KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
             KeyCode::Char('r') => Some(Msg::View(View::Receive)),
+            KeyCode::Char('h') => Some(Msg::View(View::Activity)),
+            KeyCode::Char('q') => Some(Msg::Quit),
+            _ => None,
+        },
+        // Activity is display-only: navigation, the outcome filter, quit.
+        Phase::Watching {
+            confirm: None,
+            view: View::Activity,
+            ..
+        } => match key.code {
+            KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
+            KeyCode::Char('d') => Some(Msg::View(View::Dashboard)),
+            KeyCode::Char('r') => Some(Msg::View(View::Receive)),
+            KeyCode::Char('f') => Some(Msg::Filter),
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
@@ -841,5 +1047,181 @@ mod tests {
             map_key(&key(KeyCode::Char('r')), &dashboarding()),
             Some(Msg::View(View::Receive))
         ));
+    }
+
+    // ── Stage 7: the Activity view's keys and the history log's file side ──
+
+    fn activitying() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Activity,
+        }
+    }
+
+    #[test]
+    fn h_reaches_activity_from_every_display_view_and_f_cycles_there() {
+        for phase in [watching(), receiving(), dashboarding()] {
+            assert!(
+                matches!(
+                    map_key(&key(KeyCode::Char('h')), &phase),
+                    Some(Msg::View(View::Activity))
+                ),
+                "h opens the Activity view"
+            );
+        }
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('f')), &activitying()),
+            Some(Msg::Filter)
+        ));
+        assert!(
+            map_key(&key(KeyCode::Char('f')), &watching()).is_none(),
+            "the filter key exists only on the Activity view"
+        );
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('a')), &activitying()),
+            Some(Msg::View(View::Queue))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('q')), &activitying()),
+            Some(Msg::Quit)
+        ));
+    }
+
+    use rustok_console::protocol::OutcomeState;
+
+    fn tmp_log(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustok_console_hist_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir.join("log.jsonl")
+    }
+
+    fn hist(id: &str, unix: u64) -> HistoryEntry {
+        HistoryEntry {
+            unix,
+            id: id.to_owned(),
+            state: OutcomeState::Denied,
+            to: None,
+            amount_wei: None,
+            chain_id: None,
+            tx_hash: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn the_log_roundtrips_and_a_duplicate_id_keeps_the_newest_stamp() {
+        let path = tmp_log("roundtrip");
+        append_history_line(&path, &hist("a", 10)).expect("append");
+        append_history_line(&path, &hist("b", 20)).expect("append");
+        // The same id again — a second console appended the same server
+        // outcome with a newer stamp (spec /check-3).
+        append_history_line(&path, &hist("a", 30)).expect("append");
+
+        let (entries, skipped) = load_history(&path);
+        assert_eq!(skipped, 0);
+        assert_eq!(entries.len(), 2, "load dedups by id");
+        let a = entries.iter().find(|e| e.id == "a").expect("a survives");
+        assert_eq!(a.unix, 30, "the newest stamp wins the dedup");
+    }
+
+    #[test]
+    fn corrupt_lines_are_skipped_and_counted_never_fatal() {
+        let path = tmp_log("corrupt");
+        append_history_line(&path, &hist("good", 10)).expect("append");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(b"{not json\ntail-without-brace"))
+            .expect("hostile bytes");
+
+        let (entries, skipped) = load_history(&path);
+        assert_eq!(entries.len(), 1, "the good line survives");
+        assert_eq!(skipped, 2, "both hostile lines are counted, not fatal");
+        // A missing file is an empty history, not an error.
+        assert_eq!(load_history(Path::new("/nonexistent/x.jsonl")), (vec![], 0));
+    }
+
+    #[test]
+    fn compaction_keeps_the_newest_cap_and_heals_the_file() {
+        let path = tmp_log("compact");
+        let total = 2 * HISTORY_CAP + 1;
+        let mut body = String::new();
+        for i in 0..total {
+            body.push_str(&serde_json::to_string(&hist(&format!("id{i:05}"), i as u64)).unwrap());
+            body.push('\n');
+        }
+        body.push_str("{corrupt line\n");
+        std::fs::write(&path, body).expect("seed file");
+
+        let (entries, skipped) = load_history(&path);
+        assert_eq!(entries.len(), total);
+        assert_eq!(skipped, 1);
+        compact_history(&path, &entries);
+
+        let (after, skipped_after) = load_history(&path);
+        assert_eq!(after.len(), HISTORY_CAP, "compaction keeps exactly the cap");
+        assert_eq!(
+            skipped_after, 0,
+            "the corrupt line is gone — the file healed"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|e| e.unix > (total - 1 - HISTORY_CAP) as u64),
+            "what was dropped is exactly the oldest tail"
+        );
+    }
+
+    #[test]
+    fn record_appends_new_ids_and_fills_missing_on_known_ones() {
+        let path = tmp_log("record");
+        let mut model = Model::new();
+        let mut log = HistoryLog {
+            path: Some(path.clone()),
+            seen: HashSet::new(),
+        };
+
+        log.record(&mut model, hist("a", 10));
+        assert_eq!(model.history().len(), 1);
+        // The same id again, now carrying a tx hash: fill-missing in memory,
+        // NO second file line (append-only keeps the first record).
+        let mut richer = hist("a", 11);
+        richer.tx_hash = Some("0xfeed".to_owned());
+        log.record(&mut model, richer);
+        assert_eq!(model.history().len(), 1, "no duplicate row in the model");
+        assert_eq!(
+            model.history()[0].tx_hash.as_deref(),
+            Some("0xfeed"),
+            "the missing detail filled in memory"
+        );
+        let (on_disk, _) = load_history(&path);
+        assert_eq!(on_disk.len(), 1, "the file keeps its first record only");
+        assert_eq!(on_disk[0].tx_hash, None);
+    }
+
+    #[test]
+    fn a_failed_write_switches_to_session_only_with_a_visible_note() {
+        let mut model = Model::new();
+        let mut log = HistoryLog {
+            path: Some(PathBuf::from("/nonexistent-dir/x.jsonl")),
+            seen: HashSet::new(),
+        };
+        log.record(&mut model, hist("a", 10));
+        assert!(
+            log.path.is_none(),
+            "persistence switched off after the failure"
+        );
+        assert_eq!(model.history().len(), 1, "the session view still works");
+        assert!(
+            model
+                .history_note()
+                .is_some_and(|n| n.contains("not being persisted")),
+            "the degradation is visible, not silent"
+        );
     }
 }

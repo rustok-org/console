@@ -1257,7 +1257,10 @@ mod tests {
         assert_eq!(outcomes[0].age_secs, 42);
         assert_eq!(outcomes[1].state, OutcomeState::Denied);
         assert_eq!(
-            (outcomes[1].tx_hash.as_deref(), outcomes[1].reason.as_deref()),
+            (
+                outcomes[1].tx_hash.as_deref(),
+                outcomes[1].reason.as_deref()
+            ),
             (None, None),
             "absent wire fields read as None, never a fabricated value"
         );

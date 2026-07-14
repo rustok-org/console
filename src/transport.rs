@@ -24,9 +24,9 @@ use std::thread::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, PROTO_VERSION, PositionsOutcome,
-    ResolveOutcome, Summary, encode_request, parse_approve, parse_auth, parse_context, parse_deny,
-    parse_get, parse_hello, parse_list, parse_positions,
+    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, OutcomeEntry, PROTO_VERSION,
+    PositionsOutcome, ResolveOutcome, Summary, encode_request, parse_activity, parse_approve,
+    parse_auth, parse_context, parse_deny, parse_get, parse_hello, parse_list, parse_positions,
 };
 
 /// Informational client id sent in `hello` (the server does not validate it).
@@ -56,6 +56,8 @@ pub enum Request {
     Context,
     /// Ask for the wallet's own DeFi positions (proto 2+, auth-gated).
     Positions,
+    /// Ask for the recent terminal outcomes (proto 2+, auth-gated, §3.9).
+    Activity,
 }
 
 /// A message from the worker to the MVU layer.
@@ -78,6 +80,10 @@ pub enum Reply {
     Context(ContextOutcome),
     /// Result of a `positions` (proto 2+).
     Positions(PositionsOutcome),
+    /// Result of an `activity` (proto 2+): the retained window, newest first,
+    /// server-capped at 100 (§3.9). No degradable variant — any error code
+    /// fails the parse and ends the worker (see `parse_activity`).
+    Activity(Vec<OutcomeEntry>),
     /// The connection is finished and unusable — the worker has exited.
     Fatal(TransportError),
 }
@@ -294,6 +300,11 @@ fn serve_one(
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
             exchange(writer, reader, &line)?
         }
+        Request::Activity => {
+            let line = encode_request(&protocol::Request::Activity)
+                .map_err(|e| TransportError::Protocol(e.to_string()))?;
+            exchange(writer, reader, &line)?
+        }
     };
     let parsed = match req {
         Request::Auth(_) => parse_auth(&resp).map(Reply::Auth),
@@ -303,6 +314,7 @@ fn serve_one(
         Request::Deny(_) => parse_deny(&resp).map(Reply::Resolve),
         Request::Context => parse_context(&resp).map(Reply::Context),
         Request::Positions => parse_positions(&resp).map(Reply::Positions),
+        Request::Activity => parse_activity(&resp).map(Reply::Activity),
     };
     parsed.map_err(|e| TransportError::Protocol(e.to_string()))
 }
