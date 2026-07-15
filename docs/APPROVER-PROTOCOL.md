@@ -13,7 +13,8 @@
 > is documented as-is and cross-referenced to a tracked follow-up rather than
 > silently "corrected" here.
 >
-> **proto 2 — DRAFT** (Console v2 Фаза 2) — additive over proto 1: the read-ops
+> **proto 2 — FROZEN** with the `console v0.2.0` / `core v0.3.0` release pair
+> (2026-07-15) — additive over proto 1: the read-ops
 > `context` (§3.7), `positions` (§3.8) and `activity` (§3.9), gated behind `auth`
 > unlike `list`/`get` (§2), plus the `wallet_locked` error code (§3.11). A
 > `proto: 1` session negotiated by an already-shipped `console v0.1.0` continues
@@ -477,7 +478,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | proto | core (server) | console (client) |
 |-------|---------------|------------------|
 | 1     | shipped as `0.1.0`; freezes at `v0.2.0` | ≥ `v0.1.0` |
-| 2     | DRAFT — adds `context` (§3.7) + `positions` (§3.8) + `activity` (§3.9) + `wallet_locked` (§3.11); freezes alongside its own console/core release pair (TBD) | a `proto:1` client is unaffected — it never sends `context`/`positions`/`activity` and the server still answers its `hello` with `proto:1` (§3.1) |
+| 2     | frozen at `core v0.3.0` (adds `context` §3.7 + `positions` §3.8 + `activity` §3.9 + `wallet_locked` §3.11) | frozen at `console v0.2.0`; a `proto:1` client is unaffected — it never sends `context`/`positions`/`activity` and the server still answers its `hello` with `proto:1` (§3.1) |
 
 - **`proto` is the only compatibility gate.** The `server` version string is
   informational (§3.1) — a client must never gate on it. The shipped server reports
