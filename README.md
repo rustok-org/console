@@ -13,10 +13,10 @@ core itself, never by the agent. You read what is actually being signed and pres
 ┌ window 1 ─────────────────┐   ┌ window 2 ──────────────────────┐
 │ you ↔ agent (chat / MCP)  │   │ $ docker exec -it rustok-wallet \
 │                           │   │       rustok-console            │
-│ agent: "payment is parked │   │ 🔔 PENDING  swap 0.1 ETH → USDT │
+│ agent: "payment is parked │   │ 🔔 PENDING  send 0.1 ETH        │
 │  — please approve in your │   │    to 0x7a25…c488 (full addr)   │
-│  wallet window"           │   │    simulation: ok · risk: low   │
-│                           │   │    [y] approve   [N] reject     │
+│  wallet window"           │   │    From: your wallet → To: …    │
+│                           │   │    [y] approve   [n] reject     │
 └───────────────────────────┘   └────────────────────────────────┘
 ```
 
@@ -36,8 +36,7 @@ repo's published image at wallet-image build time). With the wallet container
 running under its fixed name:
 
 ```bash
-docker exec -it rustok-wallet rustok-console          # watch mode (default)
-docker exec -it rustok-wallet rustok-console approve  # one-shot: approve/deny and exit
+docker exec -it rustok-wallet rustok-console   # the resident wallet console
 ```
 
 Run this in **your own terminal window** — never through the agent session
@@ -45,18 +44,21 @@ Run this in **your own terminal window** — never through the agent session
 
 ## Status
 
-**v0.1 in development.** This repository currently pins the crate/CI skeleton and
-the canonical core↔console protocol contract: [`docs/APPROVER-PROTOCOL.md`](docs/APPROVER-PROTOCOL.md).
-The wallet core implements the server side of that contract; compatibility is
-negotiated with a `hello` version handshake.
+**v0.2 — the resident wallet console.** PIN-unlock opens a Dashboard (per-chain
+balances, DeFi positions, "waiting for you" count); the queue view carries
+clear-signing cards with a full From→To block (complete EIP-55 addresses, literal
+**UNLIMITED** for infinite approvals, raw calldata); Receive shows the wallet's
+address with a QR of the exact same string; Activity keeps a decision history that
+outlives the core's retention window (a local journal, written the moment you
+decide). The console no longer exits per decision: outcomes stream as one JSON
+line each to a **non-TTY stdout** for machine callers, and exit codes report only
+how the *session* ended. The canonical core↔console contract lives in
+[`docs/APPROVER-PROTOCOL.md`](docs/APPROVER-PROTOCOL.md) (proto 2), negotiated
+with a `hello` version handshake — a v0.1 client keeps working unchanged.
 
-Planned for v0.1: single-screen watch mode (pending queue + card), one-shot approve,
-session PIN (`auth` once per session, per-transaction PIN only for high-risk items),
-clear-signing cards (full EIP-55 addresses, literal **UNLIMITED** for infinite
-approvals, raw calldata behind a scroll).
-
-Out of scope by design: balances, history, dashboards — that is the agent's job in
-chat. The console does exactly one thing: it lets a human say no.
+Still out of scope by design: originating transactions. Every surface here is
+display or approval — the console lets a human say no; it never lets anyone
+(including the human) bypass the agent-proposed, core-decoded flow.
 
 ## Related
 
