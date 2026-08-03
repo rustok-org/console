@@ -1,1 +1,7 @@
 /target
+
+# Workflow artifacts — internal working notes: specs, decisions, reports, the
+# state file, and the throwaway smoke scripts that live next to the reports.
+# They are written for us, not for a reader of this repository, and they are
+# kept outside the published tree.
+.claude/
