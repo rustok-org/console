@@ -1939,8 +1939,51 @@ mod tests {
         assert_eq!(items.len(), 2, "both stay for the human to decide");
     }
 
+    /// The race the guard in `flush_pending` exists for: a confirmation parks
+    /// behind another request, the human cancels before the answer lands, and
+    /// the parked line must NOT go out behind them.
+    ///
+    /// Red-first is impossible — the guard is already there. The proof is the
+    /// mutation (remove the guard → this fails), shown in the report. Without
+    /// this test the removal passed 243 green tests, found independently twice.
+    #[test]
+    fn a_cancelled_confirmation_never_goes_out_from_the_parking_lot() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::Tick);
+        // A read-op goes on the wire; until its answer lands the channel is busy.
+        let busy = m.update(Msg::Reply(Reply::List(vec![])));
+        assert!(
+            busy.is_some(),
+            "a request must be in flight for this test to mean anything"
+        );
+
+        m.update(Msg::AckStart);
+        m.update(Msg::PinDigit('1'));
+        let parked = m.update(Msg::PinSubmit);
+        assert!(
+            parked.is_none(),
+            "the confirmation parks behind the busy channel"
+        );
+
+        m.update(Msg::AckCancel);
+        // The answer to the ORIGINAL request arrives and flushes what was parked.
+        let flushed = m.update(Msg::Reply(Reply::Positions(PositionsOutcome::Ok(vec![]))));
+        assert!(
+            !matches!(flushed, Some(transport::Request::Ack(_))),
+            "a confirmation the human walked away from must not be sent behind them"
+        );
+        assert!(
+            m.policy().awaits_acknowledgment(),
+            "and nothing was confirmed"
+        );
+    }
+
     /// Every refusal says what happened — a prompt that just closes leaves the
     /// human guessing whether the gate moved.
+    ///
+    /// It asserts WHICH message, not merely that one exists: `notice.is_some()`
+    /// alone is blind to a wrong reply, and that blindness is exactly what let
+    /// the lockout case go unnoticed.
     #[test]
     fn each_confirmation_failure_is_reported() {
         for outcome in [
@@ -1963,7 +2006,27 @@ mod tests {
             let Phase::Watching { notice, .. } = m.phase() else {
                 panic!("still watching");
             };
-            assert!(notice.is_some(), "{outcome:?}: the human is told");
+            let notice = notice.as_ref().expect("the human is told");
+            match (outcome, notice) {
+                (AckOutcome::Locked { retry_after_s }, Notice::Locked { retry_after_s: got }) => {
+                    assert_eq!(*got, Some(retry_after_s), "the wait is carried through");
+                }
+                (outcome, Notice::Note(text)) => {
+                    let expected = match outcome {
+                        AckOutcome::BadPin { .. } => "wrong PIN",
+                        AckOutcome::PinNotSet => "no PIN",
+                        AckOutcome::PinUnavailable => "unavailable",
+                        AckOutcome::NotAutonomous => "not autonomous",
+                        AckOutcome::StoreFailed => "could not save",
+                        other => panic!("{other:?} must not land in a plain note"),
+                    };
+                    assert!(
+                        text.contains(expected),
+                        "{outcome:?} must say {expected:?}, said: {text}"
+                    );
+                }
+                (outcome, other) => panic!("{outcome:?} produced the wrong notice: {other:?}"),
+            }
         }
     }
 

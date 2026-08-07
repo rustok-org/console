@@ -1778,7 +1778,69 @@ mod tests {
         }
     }
 
-    /// The column the mockup called AGE shows time LEFT instead — the wire
+    /// The approve gate's boundary, pinned from BOTH sides in one test — the
+    /// device `the_positions_budget_sits_exactly_on_its_boundary` already uses
+    /// for the positions panel.
+    ///
+    /// **Red-first is impossible here by construction:** the code is already
+    /// correct, so there is no state in which this test fails before a fix —
+    /// there is no fix. The falsifiability proof is the mutation, shown in the
+    /// report: `<= height` → `<= height + 1` breaks the tight side, and
+    /// `<= height` → `< height` breaks the exact-fit side.
+    ///
+    /// This is the boundary a stray `+ 1` walked past 243 green tests.
+    #[test]
+    fn the_approve_gate_sits_exactly_on_its_boundary() {
+        const W: u16 = 100;
+        let mut m = Model::default();
+        to_watching(
+            &mut m,
+            vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )],
+        );
+        m.update(Msg::Open);
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+            "00000000-0000-0000-0000-000000000000",
+            NOW + 300,
+            false,
+        )))));
+        let policy = m.policy();
+        let from = m.wallet_address();
+        let Phase::Watching {
+            confirm: Some(c), ..
+        } = m.phase()
+        else {
+            panic!("a card is open");
+        };
+
+        // Found by construction, not by hand arithmetic: the test survives a
+        // layout change and still pins the edge it is about.
+        let tight = (6u16..80)
+            .find(|h| priority_fields_fit(c, from, policy, W, *h))
+            .expect("some height arms approve");
+        assert!(
+            !priority_fields_fit(c, from, policy, W, tight - 1),
+            "one row less than the exact fit must NOT arm approve (height {tight})"
+        );
+
+        // And what is drawn agrees with the gate on both sides.
+        let at_fit = draw_rows(&m, W, tight).join("\n");
+        assert!(
+            !at_fit.contains("TERMINAL TOO SMALL"),
+            "an exact fit shows the card, no banner:\n{at_fit}"
+        );
+        let one_short = draw_rows(&m, W, tight - 1).join("\n");
+        assert!(
+            one_short.contains("TERMINAL TOO SMALL"),
+            "one row short must say so and disable approve:\n{one_short}"
+        );
+    }
+
+    /// The column the mockup called AGE shows time LEFT instead    /// The column the mockup called AGE shows time LEFT instead — the wire
     /// carries no creation time, and what matters for triage is how long the
     /// human has, not how long it has sat (Reviewer, round 10).
     #[test]
