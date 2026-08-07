@@ -744,6 +744,7 @@ mod tests {
                 address: "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb".to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         m.update(Msg::View(View::Queue)); // Stage-5 home is Dashboard

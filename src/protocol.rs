@@ -253,6 +253,83 @@ pub struct WalletContext {
     pub balances: Vec<ChainBalance>,
     /// The server's configured chain allow-list, in order.
     pub allowed_chains: Vec<u64>,
+    /// The autonomy ceiling and how the core arrived at it (§3.7, proto 3+).
+    ///
+    /// Skipped by serde on purpose: the wire path goes through `parse_context`'s
+    /// private `Raw`, which is the ONE place the pair is interpreted — including
+    /// its safe readings for absent/unknown words. A second derive-driven path
+    /// would be a second interpretation, free to drift from the first.
+    #[serde(skip)]
+    pub policy: Policy,
+}
+
+/// The wallet's autonomy as the core reports it — **mode and origin together**.
+///
+/// They are one statement, not two fields (§3.7): `Autonomous` +
+/// `Provisioned` still parks every send, so anything rendering the mode alone
+/// tells the human this wallet sends when it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Policy {
+    /// The ceiling itself.
+    pub mode: PolicyMode,
+    /// How the core arrived at it.
+    pub origin: PolicyOrigin,
+}
+
+/// The autonomy ceiling (§3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyMode {
+    /// Writes denied outright.
+    ReadOnly,
+    /// Every write parks for the human.
+    Supervised,
+    /// Sends on its own — **only once [`PolicyOrigin::Acknowledged`]**.
+    Autonomous,
+    /// Absent or a word this build does not know.
+    ///
+    /// Reachable without any exotic scenario: a `proto:2` core carries no
+    /// policy fields at all, which is exactly the degraded session §3.1's
+    /// fallback lands in. The default is this rather than a real mode because
+    /// a guess here is a claim about whether the wallet spends money by itself.
+    #[default]
+    Unknown,
+}
+
+/// How the mode was set (§3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyOrigin {
+    /// Assigned by the core's volume-shape heuristic — nobody was asked.
+    ///
+    /// Normative default for an absent or unrecognised value: erring here costs
+    /// one extra confirmation, erring the other way misinforms the human.
+    #[default]
+    Provisioned,
+    /// A human confirmed it (`ack`, §3.10).
+    Acknowledged,
+}
+
+impl Policy {
+    /// Whether this wallet parks a send instead of making it.
+    ///
+    /// The single place the pair is interpreted, so no caller re-derives it and
+    /// gets it subtly wrong.
+    #[must_use]
+    pub fn parks_sends(self) -> bool {
+        !matches!(
+            (self.mode, self.origin),
+            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged)
+        )
+    }
+
+    /// Whether there is autonomy here awaiting a human's confirmation — the one
+    /// state that asks something of the human.
+    #[must_use]
+    pub fn awaits_acknowledgment(self) -> bool {
+        matches!(
+            (self.mode, self.origin),
+            (PolicyMode::Autonomous, PolicyOrigin::Provisioned)
+        )
+    }
 }
 
 /// Outcome of `context`. Both non-`Ok` variants degrade the UI (the card falls
@@ -565,6 +642,8 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
         address: Option<String>,
         balances: Option<Vec<ChainBalance>>,
         allowed_chains: Option<Vec<u64>>,
+        policy_mode: Option<String>,
+        policy_origin: Option<String>,
         error: Option<String>,
     }
     let raw: Raw = parse_line(line)?;
@@ -572,10 +651,27 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
         let address = raw
             .address
             .ok_or_else(|| ProtocolError::Malformed("ok context without address".to_owned()))?;
+        // Absent or unrecognised words fall to the safe reading rather than a
+        // parse error: a proto-2 core sends neither field, and refusing the
+        // whole context would cost the human the screen over a field that is
+        // not signing-critical (§3.7).
+        let policy = Policy {
+            mode: match raw.policy_mode.as_deref() {
+                Some("read_only") => PolicyMode::ReadOnly,
+                Some("supervised") => PolicyMode::Supervised,
+                Some("autonomous") => PolicyMode::Autonomous,
+                _ => PolicyMode::Unknown,
+            },
+            origin: match raw.policy_origin.as_deref() {
+                Some("acknowledged") => PolicyOrigin::Acknowledged,
+                _ => PolicyOrigin::Provisioned,
+            },
+        };
         Ok(ContextOutcome::Ok(Box::new(WalletContext {
             address,
             balances: raw.balances.unwrap_or_default(),
             allowed_chains: raw.allowed_chains.unwrap_or_default(),
+            policy,
         })))
     } else if raw.error.as_deref() == Some("wallet_locked") {
         Ok(ContextOutcome::WalletLocked)
@@ -796,6 +892,84 @@ mod tests {
         // decimal wei string, verbatim — never re-based here
         assert_eq!(ctx.balances[0].balance, "1000000000000000000");
         assert_eq!(ctx.allowed_chains, vec![1, 8453]);
+    }
+
+    /// §3.7: the mode and its origin are ONE statement. A wallet reported as
+    /// `autonomous` + `provisioned` still parks every send.
+    #[test]
+    fn parse_context_carries_the_policy_pair() {
+        for (mode_wire, origin_wire, mode, origin) in [
+            (
+                "autonomous",
+                "acknowledged",
+                PolicyMode::Autonomous,
+                PolicyOrigin::Acknowledged,
+            ),
+            (
+                "autonomous",
+                "provisioned",
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+            ),
+            (
+                "supervised",
+                "provisioned",
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+            ),
+            (
+                "read_only",
+                "provisioned",
+                PolicyMode::ReadOnly,
+                PolicyOrigin::Provisioned,
+            ),
+        ] {
+            let line = format!(
+                r#"{{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"{mode_wire}","policy_origin":"{origin_wire}"}}"#
+            );
+            let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+                panic!("ok context");
+            };
+            assert_eq!(ctx.policy.mode, mode, "mode {mode_wire}");
+            assert_eq!(ctx.policy.origin, origin, "origin {origin_wire}");
+        }
+    }
+
+    /// Normative (§3.7): an absent or unrecognised origin reads as
+    /// `provisioned`. Reachable for real — a proto-2 core carries no policy
+    /// fields at all. Erring this way costs one extra confirmation; erring the
+    /// other way tells the human the wallet sends when it does not.
+    #[test]
+    fn an_absent_or_unknown_policy_origin_reads_as_provisioned() {
+        for line in [
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"autonomous"}"#,
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"autonomous","policy_origin":"something_new"}"#,
+        ] {
+            let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
+                panic!("ok context");
+            };
+            assert_eq!(
+                ctx.policy.origin,
+                PolicyOrigin::Provisioned,
+                "unconfirmed is the safe reading: {line}"
+            );
+        }
+    }
+
+    /// A mode word we do not know must never render as autonomy. Also reachable:
+    /// against a proto-2 core the field is absent entirely.
+    #[test]
+    fn an_absent_or_unknown_policy_mode_is_not_autonomous() {
+        for line in [
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1]}"#,
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"turbo"}"#,
+        ] {
+            let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
+                panic!("ok context");
+            };
+            assert_eq!(ctx.policy.mode, PolicyMode::Unknown, "line: {line}");
+            assert_ne!(ctx.policy.mode, PolicyMode::Autonomous);
+        }
     }
 
     #[test]

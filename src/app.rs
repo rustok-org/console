@@ -1657,6 +1657,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         // Home is the Dashboard since Stage 5 — these tests exercise the
@@ -3030,6 +3031,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         m
@@ -3176,6 +3178,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         assert!(!m.context_stale());

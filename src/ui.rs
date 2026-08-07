@@ -1162,6 +1162,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
@@ -1188,6 +1189,7 @@ mod tests {
                 address: String::new(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
@@ -2091,6 +2093,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances,
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         m.update(Msg::Tick);
