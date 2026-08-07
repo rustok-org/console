@@ -24,9 +24,10 @@ use std::thread::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, OutcomeEntry, PROTO_VERSION,
-    PositionsOutcome, ResolveOutcome, Summary, encode_request, parse_activity, parse_approve,
-    parse_auth, parse_context, parse_deny, parse_get, parse_hello, parse_list, parse_positions,
+    self, AckOutcome, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, OutcomeEntry,
+    PROTO_VERSION, PositionsOutcome, ResolveOutcome, Summary, encode_request, parse_ack,
+    parse_activity, parse_approve, parse_auth, parse_context, parse_deny, parse_get, parse_hello,
+    parse_list, parse_positions,
 };
 
 /// Informational client id sent in `hello` (the server does not validate it).
@@ -52,6 +53,9 @@ pub enum Request {
     ApprovePin(Zeroizing<String>),
     /// Deny an item by id.
     Deny(String),
+    /// Confirm this wallet's autonomous mode: a pre-serialized `ack` line with
+    /// the PIN inside a [`Zeroizing`] buffer (protocol §3.10).
+    Ack(Zeroizing<String>),
     /// Ask for the wallet's own context (proto 2+, auth-gated).
     Context,
     /// Ask for the wallet's own DeFi positions (proto 2+, auth-gated).
@@ -70,6 +74,8 @@ pub enum Reply {
     },
     /// Result of an `auth`.
     Auth(AuthOutcome),
+    /// Result of an `ack` (proto 3+, §3.10).
+    Ack(AckOutcome),
     /// Result of a `list`.
     List(Vec<Summary>),
     /// Result of a `get`.
@@ -268,7 +274,7 @@ fn serve_one(
     req: &Request,
 ) -> Result<Reply, TransportError> {
     let resp = match req {
-        Request::Auth(line) => exchange(writer, reader, line)?,
+        Request::Auth(line) | Request::Ack(line) => exchange(writer, reader, line)?,
         Request::List => {
             let line = encode_request(&protocol::Request::List)
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
@@ -308,6 +314,7 @@ fn serve_one(
     };
     let parsed = match req {
         Request::Auth(_) => parse_auth(&resp).map(Reply::Auth),
+        Request::Ack(_) => parse_ack(&resp).map(Reply::Ack),
         Request::List => parse_list(&resp).map(Reply::List),
         Request::Get(_) => parse_get(&resp).map(Reply::Get),
         Request::Approve(_) | Request::ApprovePin(_) => parse_approve(&resp).map(Reply::Resolve),

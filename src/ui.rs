@@ -32,6 +32,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
             confirm,
             notice,
             view,
+            ack,
         } => match view {
             View::Queue => render_watch(
                 frame,
@@ -48,7 +49,12 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
             View::Receive => {
                 render_receive(frame, items.len(), model.wallet_address(), model.policy())
             }
-            View::Dashboard => render_dashboard(frame, items.len(), model),
+            View::Dashboard => {
+                render_dashboard(frame, items.len(), model);
+                if let Some(a) = ack {
+                    render_ack_prompt(frame, a.pin_len());
+                }
+            }
             View::Activity => render_activity(frame, items.len(), model, now_unix),
         },
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
@@ -785,6 +791,41 @@ fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
     ])
     .block(block);
     frame.render_widget(body, area);
+}
+
+/// The autonomy-confirmation PIN prompt, centred over the screen.
+///
+/// Same behaviour as the card's high-risk prompt — on top, masked, nothing
+/// stored — and deliberately not the same state: that one belongs to an item,
+/// this one to the wallet (design §3, correction of 2026-08-07).
+fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
+    let area = frame.area();
+    let width = 44.min(area.width);
+    let height = 4.min(area.height);
+    let rect = ratatui::layout::Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(theme::high_risk()))
+        .title(Line::from(Span::styled(
+            " Confirm autonomy ",
+            Style::new()
+                .fg(theme::high_risk())
+                .add_modifier(Modifier::BOLD),
+        )));
+    let body = Paragraph::new(vec![
+        Line::from(format!("PIN: {}", "●".repeat(pin_len))),
+        Line::from(Span::styled(
+            "enter — confirm · esc — cancel",
+            Style::new().fg(theme::faint()),
+        )),
+    ])
+    .block(block);
+    frame.render_widget(body, rect);
 }
 
 fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {

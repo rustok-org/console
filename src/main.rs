@@ -599,6 +599,17 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Esc => Some(Msg::Quit),
             _ => None,
         },
+        // The confirmation prompt owns the keyboard while it is up — it is a
+        // PIN entry, so a stray `d` must not navigate away mid-typing. Esc
+        // cancels the attempt; it is NOT a reject, because there is nothing to
+        // reject (design §3).
+        Phase::Watching { ack: Some(_), .. } => match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() => Some(Msg::PinDigit(c)),
+            KeyCode::Backspace => Some(Msg::PinBackspace),
+            KeyCode::Enter => Some(Msg::PinSubmit),
+            KeyCode::Esc => Some(Msg::AckCancel),
+            _ => None,
+        },
         // The queue: no decision is pending, so quitting is free.
         Phase::Watching {
             confirm: None,
@@ -628,12 +639,15 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
-        // The Dashboard is display-only: navigation and quit, nothing else.
+        // The Dashboard is display-only except for one action: confirming
+        // autonomy, which only exists while there is autonomy to confirm (the
+        // model refuses `c` otherwise — the key map is not the boundary).
         Phase::Watching {
             confirm: None,
             view: View::Dashboard,
             ..
         } => match key.code {
+            KeyCode::Char('c') => Some(Msg::AckStart),
             KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
             KeyCode::Char('r') => Some(Msg::View(View::Receive)),
             KeyCode::Char('h') => Some(Msg::View(View::Activity)),
@@ -704,6 +718,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Queue,
+            ack: None,
         }
     }
 
@@ -714,6 +729,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Receive,
+            ack: None,
         }
     }
 
@@ -1095,6 +1111,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Dashboard,
+            ack: None,
         }
     }
 
@@ -1158,6 +1175,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Activity,
+            ack: None,
         }
     }
 

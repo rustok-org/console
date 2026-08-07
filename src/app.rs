@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, Policy,
-    PositionsOutcome, ResolveOutcome, Summary, TerminalState, WalletContext,
+    AckOutcome, AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, Policy,
+    PolicyOrigin, PositionsOutcome, ResolveOutcome, Summary, TerminalState, WalletContext,
 };
 use crate::transport::{self, Reply, TransportError};
 use crate::ui;
@@ -180,6 +180,15 @@ pub enum Phase {
         /// Which screen is on top (nav-shell). Lives here, not on the
         /// [`Model`]: a view before auth is unrepresentable.
         view: View,
+        /// The autonomy-confirmation prompt, while one is up.
+        ///
+        /// A third PIN entry beside the session `auth` and the card's
+        /// high-risk prompt — not instead of either. Design §3 asks for the
+        /// existing overlay's *behaviour* (on top, masked, never stored), and
+        /// that is a contract about behaviour, not a shared piece of state:
+        /// the card's prompt belongs to an item, and this one belongs to the
+        /// wallet, which has no item.
+        ack: Option<AckPrompt>,
     },
     /// The connection is finished — render the reason and exit.
     Fatal(TransportError),
@@ -459,6 +468,23 @@ pub struct Confirm {
     timed_out: bool,
 }
 
+/// The autonomy-confirmation prompt (design §3).
+#[derive(Debug, Default)]
+pub struct AckPrompt {
+    /// Digits so far; only its length ever leaves this struct.
+    pin: Pin,
+    /// True while an `ack` is on the wire — a second Enter must not send twice.
+    sent: bool,
+}
+
+impl AckPrompt {
+    /// Digits typed so far — the length only, never the digits (invariant 6).
+    #[must_use]
+    pub fn pin_len(&self) -> usize {
+        self.pin.len()
+    }
+}
+
 /// The decision the console put on the wire for the open card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SentDecision {
@@ -552,6 +578,11 @@ pub enum Msg {
     MoveDown,
     /// Open the selected item's card — which opens the confirmation.
     Open,
+    /// Open the autonomy-confirmation prompt (design §3, key `c`).
+    AckStart,
+    /// Close it without sending anything. **Not a reject** — there is nothing
+    /// to reject; the wallet's state is untouched and the invitation remains.
+    AckCancel,
     /// Approve the open card (`y`). A high-risk card asks for the PIN first.
     Approve,
     /// Reject the open card — `n`, Esc or Ctrl-C (`AGENTS.md` #5).
@@ -645,6 +676,7 @@ enum PendingIntent {
     Approve(String),
     ApprovePin(Zeroizing<String>),
     Deny(String),
+    Ack(Zeroizing<String>),
 }
 
 impl std::fmt::Debug for PendingIntent {
@@ -654,6 +686,7 @@ impl std::fmt::Debug for PendingIntent {
             Self::Auth => f.write_str("Auth"),
             Self::Approve(id) => write!(f, "Approve({id})"),
             // The line carries the PIN — never its contents.
+            Self::Ack(_) => f.write_str("Ack(<pin>)"),
             Self::ApprovePin(_) => f.write_str("ApprovePin(<redacted>)"),
             Self::Deny(id) => write!(f, "Deny({id})"),
         }
@@ -718,6 +751,63 @@ impl Model {
     #[must_use]
     pub fn wallet_context(&self) -> Option<&WalletContext> {
         self.wallet.as_ref()
+    }
+
+    /// Digits typed into the autonomy-confirmation prompt, or `None` when none
+    /// is up. The **length only** — invariant 6: the PIN is never echoed.
+    #[must_use]
+    pub fn ack_pin_len(&self) -> Option<usize> {
+        match &self.phase {
+            Phase::Watching { ack: Some(a), .. } => Some(a.pin.len()),
+            _ => None,
+        }
+    }
+
+    /// Apply an `ack` answer (§3.10).
+    ///
+    /// The prompt closes on every answer, success or not: a prompt left open
+    /// after `locked` invites typing into a channel that cannot accept it.
+    /// Retrying is pressing the key again, which is one keystroke and states
+    /// plainly that the previous attempt is over.
+    ///
+    /// On success the local policy takes the origin the core just reported —
+    /// transcribing the core's own answer, not deciding anything here. The
+    /// banner and the header follow from that pair, so both change with it.
+    fn apply_ack(&mut self, outcome: AckOutcome) {
+        let note = match outcome {
+            AckOutcome::Confirmed => {
+                if let Some(w) = self.wallet.as_mut() {
+                    w.policy.origin = PolicyOrigin::Acknowledged;
+                }
+                Notice::Note("autonomous mode confirmed — sends no longer wait".to_owned())
+            }
+            AckOutcome::BadPin { attempts_left } => Notice::Note(format!(
+                "wrong PIN — {attempts_left} attempts left; press c to try again"
+            )),
+            // The core drops the pending queue on this lockout exactly as it
+            // does for auth and approve (protocol §4), so this is the same
+            // notice, not a lookalike.
+            AckOutcome::Locked { retry_after_s } => Notice::Locked {
+                retry_after_s: Some(retry_after_s),
+            },
+            AckOutcome::PinNotSet => {
+                Notice::Note("this wallet has no PIN — run set-pin, then press c".to_owned())
+            }
+            AckOutcome::PinUnavailable => {
+                Notice::Note("the PIN check is unavailable — press c to try again".to_owned())
+            }
+            AckOutcome::NotAutonomous => {
+                Notice::Note("this wallet is not autonomous — nothing to confirm".to_owned())
+            }
+            AckOutcome::StoreFailed => Notice::Note(
+                "the wallet could not save the confirmation — nothing changed, press c to try again"
+                    .to_owned(),
+            ),
+        };
+        if let Phase::Watching { ack, notice, .. } = &mut self.phase {
+            *ack = None;
+            *notice = Some(note);
+        }
     }
 
     /// The wallet's autonomy — mode and origin as one value (§3.7).
@@ -849,6 +939,20 @@ impl Model {
                 }
                 None
             }
+            Msg::AckStart => {
+                if self.policy().awaits_acknowledgment()
+                    && let Phase::Watching { ack, .. } = &mut self.phase
+                {
+                    *ack = Some(AckPrompt::default());
+                }
+                None
+            }
+            Msg::AckCancel => {
+                if let Phase::Watching { ack, .. } = &mut self.phase {
+                    *ack = None;
+                }
+                None
+            }
             Msg::PinSubmit => self.on_pin_submit(),
             Msg::Approve => self.on_approve(),
             Msg::Reject => self.on_reject(false),
@@ -929,6 +1033,7 @@ impl Model {
             Phase::Watching {
                 confirm: Some(c), ..
             } if c.sent.is_none() => c.pin.as_mut(),
+            Phase::Watching { ack: Some(a), .. } if !a.sent => Some(&mut a.pin),
             _ => None,
         }
     }
@@ -950,6 +1055,9 @@ impl Model {
     }
 
     fn on_pin_submit(&mut self) -> Option<transport::Request> {
+        if matches!(self.phase, Phase::Watching { ack: Some(_), .. }) {
+            return self.on_ack_submit();
+        }
         if matches!(
             self.phase,
             Phase::Watching {
@@ -967,6 +1075,21 @@ impl Model {
         }
         let line = pin.auth_line();
         self.dispatch_user(PendingIntent::Auth, || transport::Request::Auth(line))
+    }
+
+    /// Submit the autonomy confirmation (§3.10): the PIN rides the operation,
+    /// so the session `auth` does not stand in for it.
+    fn on_ack_submit(&mut self) -> Option<transport::Request> {
+        let Phase::Watching { ack: Some(a), .. } = &mut self.phase else {
+            return None;
+        };
+        if a.sent || a.pin.is_empty() {
+            return None;
+        }
+        a.sent = true;
+        let line = a.pin.ack_line();
+        let parked = line.clone();
+        self.dispatch_user(PendingIntent::Ack(parked), || transport::Request::Ack(line))
     }
 
     /// Submit the per-request PIN of a high-risk approval.
@@ -1164,6 +1287,7 @@ impl Model {
                 }
             }
             Reply::Context(outcome) => self.apply_context(outcome),
+            Reply::Ack(outcome) => self.apply_ack(outcome),
             Reply::Positions(outcome) => self.apply_positions(outcome),
             Reply::Activity(outcomes) => self.apply_activity(outcomes),
             Reply::List(items) => self.apply_list(items),
@@ -1272,6 +1396,7 @@ impl Model {
                     // Home is the Dashboard (Gate-1 Stage 5: PIN-unlock →
                     // Dashboard, the letter of the Phase-2 plan).
                     view: View::Dashboard,
+                    ack: None,
                 };
             }
             other => {
@@ -1533,6 +1658,18 @@ impl Model {
                 self.in_flight = true;
                 Some(transport::Request::Deny(id))
             }
+            // The parked line already carries the PIN, so it is replayed as
+            // it is — but only while the prompt that produced it is still up.
+            // If the human cancelled meanwhile, the confirmation they walked
+            // away from must not go out behind them.
+            Some(PendingIntent::Ack(line)) => {
+                if matches!(self.phase, Phase::Watching { ack: Some(_), .. }) {
+                    self.in_flight = true;
+                    Some(transport::Request::Ack(line))
+                } else {
+                    None
+                }
+            }
             Some(PendingIntent::Auth) => {
                 // Re-derive the auth line from the (now cleared-on-failure) pin only
                 // if we are still on the auth screen with digits; otherwise drop it.
@@ -1594,7 +1731,7 @@ fn decision_kind(outcome: &ResolveOutcome, timed_out: bool) -> Option<DecisionKi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{GetOutcome, Kind, Risk};
+    use crate::protocol::{AckOutcome, GetOutcome, Kind, PolicyMode, PolicyOrigin, Risk};
 
     fn summary(id: &str) -> Summary {
         Summary {
@@ -1660,6 +1797,145 @@ mod tests {
     /// The wallet's own address in tests — full-length, so the From block
     /// exercises real wrapping (never a shortened stand-in).
     const WALLET: &str = "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb";
+
+    /// A model in `Watching` whose wallet reports the given policy.
+    fn watching_with_policy(mode: PolicyMode, origin: PolicyOrigin) -> Model {
+        let mut m = watching(vec![]);
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+                policy: Policy { mode, origin },
+            },
+        )))));
+        m.update(Msg::View(View::Dashboard));
+        m
+    }
+
+    /// Design §3: the invitation exists only where there is something to
+    /// confirm, so the key that answers it does too.
+    #[test]
+    fn the_confirmation_prompt_opens_only_where_there_is_something_to_confirm() {
+        for (mode, origin, expected) in [
+            (PolicyMode::Autonomous, PolicyOrigin::Provisioned, true),
+            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged, false),
+            (PolicyMode::Supervised, PolicyOrigin::Provisioned, false),
+            (PolicyMode::ReadOnly, PolicyOrigin::Provisioned, false),
+        ] {
+            let mut m = watching_with_policy(mode, origin);
+            m.update(Msg::AckStart);
+            assert_eq!(
+                m.ack_pin_len().is_some(),
+                expected,
+                "{mode:?}/{origin:?}: prompt open? expected {expected}"
+            );
+        }
+    }
+
+    /// The PIN rides the operation (§3.10), so submitting sends `ack` — and the
+    /// buffer reports only its length, never its digits (invariant 6).
+    #[test]
+    fn the_confirmation_pin_is_counted_not_shown_and_submits_an_ack() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::AckStart);
+        assert_eq!(m.ack_pin_len(), Some(0));
+        for c in "483920".chars() {
+            m.update(Msg::PinDigit(c));
+        }
+        assert_eq!(m.ack_pin_len(), Some(6), "length only, never the digits");
+        let req = m.update(Msg::PinSubmit);
+        assert!(
+            matches!(req, Some(transport::Request::Ack(_))),
+            "submitting the confirmation sends `ack`"
+        );
+    }
+
+    /// Design §3 (correction 2026-08-07): cancelling this prompt is NOT a
+    /// reject — there is nothing to reject. Nothing goes on the wire and the
+    /// wallet's state is untouched, so the invitation is still there after.
+    #[test]
+    fn cancelling_the_confirmation_sends_nothing_and_changes_nothing() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::AckStart);
+        for c in "4839".chars() {
+            m.update(Msg::PinDigit(c));
+        }
+        let req = m.update(Msg::AckCancel);
+        assert!(req.is_none(), "cancelling puts nothing on the wire");
+        assert_eq!(m.ack_pin_len(), None, "the prompt is closed");
+        assert!(
+            m.policy().awaits_acknowledgment(),
+            "and the wallet still waits for the same confirmation"
+        );
+    }
+
+    /// The whole point: after the core confirms, the wallet stops waiting.
+    #[test]
+    fn a_confirmed_mode_stops_asking() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::AckStart);
+        m.update(Msg::PinDigit('1'));
+        let _ = m.update(Msg::PinSubmit);
+        m.update(Msg::Reply(Reply::Ack(AckOutcome::Confirmed)));
+        assert_eq!(m.ack_pin_len(), None, "the prompt is done");
+        assert!(
+            !m.policy().awaits_acknowledgment(),
+            "nothing left to confirm"
+        );
+        assert_eq!(m.policy().origin, PolicyOrigin::Acknowledged);
+    }
+
+    /// Ratified rule (design §3): confirming the mode does NOT release what is
+    /// already parked. While the wallet was unconfirmed an agent may have
+    /// retried, so the queue can hold duplicates of one payment; they are
+    /// decided one by one.
+    #[test]
+    fn confirming_does_not_release_the_queue() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::Reply(Reply::List(vec![summary("a1"), summary("a2")])));
+        m.update(Msg::AckStart);
+        m.update(Msg::PinDigit('1'));
+        let _ = m.update(Msg::PinSubmit);
+        let after = m.update(Msg::Reply(Reply::Ack(AckOutcome::Confirmed)));
+        assert!(
+            !matches!(after, Some(transport::Request::Approve(_)))
+                && !matches!(after, Some(transport::Request::ApprovePin(_))),
+            "a confirmation must not approve anything"
+        );
+        let Phase::Watching { items, .. } = m.phase() else {
+            panic!("still watching");
+        };
+        assert_eq!(items.len(), 2, "both stay for the human to decide");
+    }
+
+    /// Every refusal says what happened — a prompt that just closes leaves the
+    /// human guessing whether the gate moved.
+    #[test]
+    fn each_confirmation_failure_is_reported() {
+        for outcome in [
+            AckOutcome::BadPin { attempts_left: 2 },
+            AckOutcome::Locked { retry_after_s: 30 },
+            AckOutcome::PinNotSet,
+            AckOutcome::PinUnavailable,
+            AckOutcome::NotAutonomous,
+            AckOutcome::StoreFailed,
+        ] {
+            let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+            m.update(Msg::AckStart);
+            m.update(Msg::PinDigit('1'));
+            let _ = m.update(Msg::PinSubmit);
+            m.update(Msg::Reply(Reply::Ack(outcome)));
+            assert!(
+                m.policy().awaits_acknowledgment(),
+                "{outcome:?}: a failure never confirms"
+            );
+            let Phase::Watching { notice, .. } = m.phase() else {
+                panic!("still watching");
+            };
+            assert!(notice.is_some(), "{outcome:?}: the human is told");
+        }
+    }
 
     fn watching(items: Vec<Summary>) -> Model {
         let mut m = Model::new();
