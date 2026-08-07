@@ -16,9 +16,18 @@
 > **proto 2 — FROZEN** with the `console v0.2.0` / `core v0.3.0` release pair
 > (2026-07-15) — additive over proto 1: the read-ops
 > `context` (§3.7), `positions` (§3.8) and `activity` (§3.9), gated behind `auth`
-> unlike `list`/`get` (§2), plus the `wallet_locked` error code (§3.11). A
+> unlike `list`/`get` (§2), plus the `wallet_locked` error code (§3.12). A
 > `proto: 1` session negotiated by an already-shipped `console v0.1.0` continues
 > to work unchanged — see §3.1 and §6.
+>
+> **proto 3 — CURRENT**, additive over proto 2: the `ack` op (§3.10), by which a
+> human confirms this wallet's autonomous mode, plus the `policy_mode` /
+> `policy_origin` pair on `context` (§3.7) and the `not_autonomous` /
+> `policy_store_failed` error codes (§3.12). The server half shipped in
+> `core main e9315c9` (increment 2); this section was written **against that
+> merged code**, handler by handler, not against an intention. Sessions
+> negotiated at `proto: 1` or `proto: 2` keep working unchanged — the new op is
+> proto-gated (§3.10) and the new `context` fields are additive (§2).
 
 ## 1. Transport
 
@@ -44,7 +53,7 @@
 ## 2. Session
 
 ```
-connect → hello → { list | get }* → auth → { list | get | approve | deny | context | positions | activity }* → disconnect
+connect → hello → { list | get }* → auth → { list | get | approve | deny | context | positions | activity | ack }* → disconnect
 ```
 
 - A **session is one connection**. `auth` authorizes that connection only;
@@ -79,7 +88,7 @@ connect → hello → { list | get }* → auth → { list | get | approve | deny
 
 ## 3. Messages
 
-Field wire-formats are normative and listed in **§3.10** — the console's serde types
+Field wire-formats are normative and listed in **§3.11** — the console's serde types
 must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 `decoded_call.amount` is a `0x`-hex string; they are **not** interchangeable).
 
@@ -90,6 +99,8 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 ← {"ok":true,"proto":1,"server":"core-server/0.1.0"}
 → {"op":"hello","proto":2,"client":"rustok-console/0.2.0"}
 ← {"ok":true,"proto":2,"server":"core-server/0.2.0"}
+→ {"op":"hello","proto":3,"client":"rustok-console/0.3.0"}
+← {"ok":true,"proto":3,"server":"core-server/0.3.2"}
 ← {"ok":false,"error":"unsupported_proto","supported":[1,2]}   // then server closes
 ```
 
@@ -101,7 +112,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   `0.1.0`). **The client gates compatibility on `proto` alone** — never by parsing
   the `server` string. A major `proto` mismatch is fatal: the server replies
   `unsupported_proto` and closes; the client prints an upgrade hint and exits.
-- **The server accepts `proto ∈ {1, 2}` and echoes back exactly the value the
+- **The server accepts `proto ∈ {1, 2, 3}` and echoes back exactly the value the
   client declared** — never the highest it supports. This is what keeps an
   already-shipped `console v0.1.0` (which always sends `proto:1`) working
   unchanged against a `core` that has since gained proto 2's `context` op: the
@@ -244,10 +255,12 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 → {"op":"context"}
 ← {"ok":true,"address":"0x…full-EIP55…",
    "balances":[{"chain_id":1,"symbol":"ETH","balance":"…decimal…"}],
-   "allowed_chains":[1,8453]}
+   "allowed_chains":[1,8453],
+   "policy_mode":"read_only|supervised|autonomous",
+   "policy_origin":"provisioned|acknowledged"}
 ← {"ok":false,"error":"unauthorized"}     // no auth on this connection
 ← {"ok":false,"error":"protocol_error"}   // session negotiated proto:1 (§3.1)
-← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.11
+← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.12
 ```
 
 - **Auth-gated, unlike `list`/`get`** (§2): before `auth` → `unauthorized`, same
@@ -257,7 +270,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   decorative. The shipped `console v0.1.0` never sends this op, so this path is
   defensive rather than an everyday client interaction.
 - `address` is the same **Address via Display → EIP-55 mixed-case** convention as
-  the top-level `to` (§3.10) — a console rendering a From→To block can place both
+  the top-level `to` (§3.11) — a console rendering a From→To block can place both
   side by side without re-casing either.
 - `balances` mirrors `list`'s `amount_wei` convention: **U256 via Display →
   decimal string**, at most one entry per chain in `allowed_chains`. A chain with
@@ -267,7 +280,19 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   this op reuses).
 - `allowed_chains` is the server's configured chain allow-list, in order — the
   same list `list`/`get` implicitly operate within.
-- **`wallet_locked`** (§3.11) answers if the core's own keyring isn't unlocked —
+- **`policy_mode` + `policy_origin` (proto 2+ wire, meaning since core increment 2)
+  are ONE statement, and a client must render them as one.** `policy_mode` is the
+  autonomy ceiling; `policy_origin` says how the core arrived at it —
+  `provisioned` (assigned by the volume-shape heuristic, nobody was asked) or
+  `acknowledged` (a human confirmed it via §3.10). **`autonomous` +
+  `provisioned` still parks every send.** A client that shows the mode without
+  the origin tells the human "this wallet sends on its own" about a wallet that
+  does not — the human then waits for a transaction that is not coming.
+  An absent or unrecognised `policy_origin` must be read as `provisioned`: that
+  errs toward one extra confirmation, the opposite errs toward misinforming.
+  Both fields are **additive** — a `proto:2` session receives them too and, per
+  §2, ignores what it does not know.
+- **`wallet_locked`** (§3.12) answers if the core's own keyring isn't unlocked —
   a state distinct from PIN `auth` above: this socket's `auth` gates *deciding*
   (§1), the core-level lock gates *having a signing key at all*. Today nothing
   in the shipped server re-locks an already-unlocked core at runtime, so this is
@@ -285,7 +310,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
       "extra":{"available_borrows_usd":"250","health_factor":"∞","ltv":"80%","total_debt_usd":"0"}}]}
 ← {"ok":false,"error":"unauthorized"}     // no auth on this connection
 ← {"ok":false,"error":"protocol_error"}   // session negotiated proto:1 (§3.1)
-← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.11
+← {"ok":false,"error":"wallet_locked"}    // core-level keyring lock — §3.12
 ```
 
 - **Auth-gated and proto-gated exactly like `context`** (§2, §3.7): private
@@ -345,7 +370,7 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   negotiated `proto:1`.
 - **No `wallet_locked` here — deliberately.** The op reads only the
   retained-outcome store (§5), never the keyring or an address, so the
-  §3.11 `wallet_locked` row stays `context, positions`. The error set is
+  §3.12 `wallet_locked` row stays `context, positions`. The error set is
   `unauthorized` | `protocol_error`, nothing else.
 - Outcome field wire-forms (normative):
 
@@ -380,12 +405,62 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   the cap or the 60-min retention window (§5) is the console's local log,
   written at decision time (Stage 7).
 
-### 3.10 Field wire-formats (normative — the console's serde types mirror these)
+### 3.10 `ack` (proto 3+) — confirm this wallet's autonomous mode
+
+```json
+→ {"op":"ack","pin":"483920"}
+← {"ok":true,"mode":"autonomous","origin":"acknowledged"}
+← {"ok":false,"error":"unauthorized"}         // no auth on this connection
+← {"ok":false,"error":"protocol_error"}       // session negotiated proto < 3 (§3.1)
+← {"ok":false,"error":"pin_required"}         // `pin` present but empty
+← {"ok":false,"error":"bad_pin","attempts_left":2}
+← {"ok":false,"error":"locked","retry_after_s":287}
+← {"ok":false,"error":"pin_not_set"}
+← {"ok":false,"error":"pin_unavailable"}
+← {"ok":false,"error":"not_autonomous"}       // nothing to confirm — see below
+← {"ok":false,"error":"policy_store_failed"}  // not persisted; memory left unchanged
+```
+
+Turns a mode the core's volume-shape heuristic handed out into one a human stands
+behind. Until it lands, an `autonomous` wallet still parks every send (§3.7).
+
+- **`pin` is REQUIRED, not optional** (unlike `approve`, where it depends on
+  risk). A line without the field does not deserialize → `protocol_error`; an
+  empty string → `pin_required`, checked **before** the verifier so it does not
+  burn one of the three attempts. The session `auth` does **not** substitute for
+  it: the stake is higher than a single release — one `ack` lifts the parking
+  gate for good, while an `approve` releases one transaction.
+- **Proto-gated at 3**, like the proto-2 read-ops are gated at 2 (§3.7): a
+  session negotiated below 3 gets `protocol_error`. This is what makes a new
+  console against an old core answer `unsupported_proto` with the list the core
+  does support (§3.1) instead of a mute refusal.
+- **It confirms; it never switches.** A `supervised` or `read_only` wallet
+  answers `not_autonomous` — there is no autonomy to acknowledge, and this op is
+  deliberately not a back door into mode changes. Changing the mode is not in
+  this protocol at all.
+- **Idempotent**: acknowledging an already-acknowledged wallet answers the same
+  `ok` — the server maps "just acknowledged" and "already was" to one response.
+- **`policy_store_failed`** means the policy could not be persisted, and the
+  in-memory policy was therefore left **unchanged on purpose**: a confirmation
+  that survives only until the next restart would be worse than a visible
+  failure — the human would believe the gate is lifted while the wallet quietly
+  goes back to parking. A client surfaces it as an error and lets the human retry.
+- **Check order is normative** (it decides what a client sees first):
+  proto → auth → empty `pin` → PIN verify → policy.
+- **Lockout**: `ack` counts into the same cumulative PIN ladder as `auth` and
+  `approve` (§4) — `attempts_left: 0` drops the pending queue exactly like the
+  other PIN paths.
+- **It does not release the queue.** `ack` changes what the wallet does with
+  *future* requests. Entries already parked stay parked and are decided one by
+  one — while the wallet was unacknowledged an agent may have retried, so the
+  queue can hold duplicates of one payment under different nonces.
+
+### 3.11 Field wire-formats (normative — the console's serde types mirror these)
 
 | Field | Where | Wire form | Example |
 |---|---|---|---|
 | `ok` | every response | bool | `true` |
-| `error` | error responses | string (see §3.11) | `"bad_pin"` |
+| `error` | error responses | string (see §3.12) | `"bad_pin"` |
 | `proto` | `hello` | number | `1` |
 | `supported` | `unsupported_proto` | array of number | `[1,2]` |
 | `server` | `hello` | string, informational | `"core-server/0.1.0"` |
@@ -421,38 +496,40 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 > bignum-safe type (not `u64`/`usize`): a truncated unlimited-approval would defeat
 > the very reason the console exists.
 
-### 3.11 Error-code vocabulary (every code the server emits)
+### 3.12 Error-code vocabulary (every code the server emits)
 
 | Code | Op(s) | Meaning |
 |---|---|---|
-| `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello`, or a proto-2 read-op (`context`/`positions`/`activity`, §3.7–§3.9) on a `proto:1` session |
+| `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello`, a proto-2 read-op (`context`/`positions`/`activity`, §3.7–§3.9) on a `proto:1` session, or `ack` (§3.10) on a session below `proto:3` — including an `ack` line with no `pin` field at all, which does not deserialize |
 | `oversize` | any | request line > 64 KiB; the connection is then closed (§2) |
 | `unsupported_proto` | hello | major `proto` mismatch; server then closes |
-| `unauthorized` | approve, deny, context, positions, activity | no successful `auth` on this connection |
-| `bad_pin` | auth, approve | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
-| `locked` | auth, approve | lockout active; carries `retry_after_s` |
-| `pin_not_set` | auth, approve | wallet has no PIN record; run `set-pin` |
-| `pin_unavailable` | auth, approve | Argon2 backend failure (transient; never an accept) |
-| `pin_required` | approve | high-risk item approved without a `pin` |
+| `unauthorized` | approve, deny, context, positions, activity, ack | no successful `auth` on this connection |
+| `bad_pin` | auth, approve, ack | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
+| `locked` | auth, approve, ack | lockout active; carries `retry_after_s` |
+| `pin_not_set` | auth, approve, ack | wallet has no PIN record; run `set-pin` |
+| `pin_unavailable` | auth, approve, ack | Argon2 backend failure (transient; never an accept) |
+| `pin_required` | approve, ack | high-risk item approved without a `pin`; or `ack` with an empty `pin` (§3.10) |
 | `unknown_id` | get, approve, deny | id is not a live item (never parked, resolved+swept, or bad UUID) |
 | `already_resolved` | approve, deny | id already terminal (or in-flight); carries `state` |
 | `internal` | approve | unreachable post-execute inconsistency (defensive) |
 | `wallet_locked` | context, positions | the core's own keyring isn't unlocked — distinct from PIN `auth` (§3.7) |
+| `not_autonomous` | ack | the wallet is not autonomous — nothing to confirm, and `ack` never switches modes (§3.10) |
+| `policy_store_failed` | ack | the policy could not be persisted; the in-memory policy was deliberately left unchanged (§3.10) |
 
 ## 4. PIN & lockout semantics (server-side, normative)
 
-- PIN failures are counted **cumulatively across `auth` and `approve.pin`** for the
-  wallet, not per connection. **3 consecutive failures** trip the lockout: the
+- PIN failures are counted **cumulatively across `auth`, `approve.pin` and
+  `ack.pin`** (§3.10, proto 3+) for the wallet, not per connection. **3 consecutive failures** trip the lockout: the
   third failure answers `bad_pin` + `attempts_left: 0` (the arming response), and
-  the channel then refuses `auth` / high-risk `approve` with `locked` for
+  the channel then refuses `auth` / high-risk `approve` / `ack` with `locked` for
   **5 minutes**. A successful PIN entry before the third resets the counter.
 - On lockout the pending queue is **failed closed**: every *pending* item is
   resolved to `denied` (fail-closed — nothing signable is left behind). Note this is
   a *resolution*, not a deletion: the items stay queryable as `denied` for the
   retention window (§5), and any item already `Executing` (the human already
   approved it, signature in flight) is **left untouched**.
-- A lockout tripped on **either** path — `auth` or high-risk `approve` — drops the
-  queue; both documented lockout paths fail closed identically.
+- A lockout tripped on **any** PIN path — `auth`, high-risk `approve`, or `ack`
+  (§3.10) — drops the queue; all documented lockout paths fail closed identically.
 - Verification uses the wallet's Argon2id parameters; comparison is constant-time.
 - The server never echoes the PIN back in any response or log.
 - **Audit gap (shipped):** a PIN lockout currently emits only a `tracing::warn!`,
@@ -478,7 +555,8 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 | proto | core (server) | console (client) |
 |-------|---------------|------------------|
 | 1     | shipped as `0.1.0`; freezes at `v0.2.0` | ≥ `v0.1.0` |
-| 2     | frozen at `core v0.3.0` (adds `context` §3.7 + `positions` §3.8 + `activity` §3.9 + `wallet_locked` §3.11) | frozen at `console v0.2.0`; a `proto:1` client is unaffected — it never sends `context`/`positions`/`activity` and the server still answers its `hello` with `proto:1` (§3.1) |
+| 2     | frozen at `core v0.3.0` (adds `context` §3.7 + `positions` §3.8 + `activity` §3.9 + `wallet_locked` §3.12) | frozen at `console v0.2.0`; a `proto:1` client is unaffected — it never sends `context`/`positions`/`activity` and the server still answers its `hello` with `proto:1` (§3.1) |
+| 3     | shipped in `core main e9315c9` (adds `ack` §3.10 + `policy_mode`/`policy_origin` on `context` §3.7 + `not_autonomous`/`policy_store_failed` §3.12) | target `console v0.3.0`; a `proto:1`/`proto:2` client is unaffected — it never sends `ack`, and the extra `context` fields are ignored per §2 |
 
 - **`proto` is the only compatibility gate.** The `server` version string is
   informational (§3.1) — a client must never gate on it. The shipped server reports

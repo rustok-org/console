@@ -304,7 +304,7 @@ pub enum PositionsOutcome {
     /// The wallet's positions — an empty list is a valid answer (best-effort:
     /// no positions, or every source skipped on RPC failure; §3.8).
     Ok(Vec<Position>),
-    /// The core's own keyring isn't unlocked (§3.11).
+    /// The core's own keyring isn't unlocked (§3.12).
     WalletLocked,
 }
 
