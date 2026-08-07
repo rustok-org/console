@@ -1034,7 +1034,6 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
     let inner = block.inner(panels[1]);
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
-    let _ = height;
     let mut lines: Vec<Line<'static>> = Vec::new();
     // ── Balance (from `context`; per-chain native ETH).
     match model.wallet_context() {
@@ -1066,7 +1065,26 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             theme::label_style(),
         ),
     }
-    if model.context_stale() {
+    // The staleness line is not a balance row — it is the line that says the
+    // balance rows may be wrong. It outranks them: a reserved row keeps it out
+    // of the truncation, so a wallet with many chains cannot quietly drop the
+    // one line warning that the numbers above it are stale.
+    let stale = model.context_stale();
+    let reserved = usize::from(stale);
+    if lines.len() + reserved > height {
+        // One row goes to the marker, so what was hidden is stated rather than
+        // silently cut — the same contract the positions panel below keeps.
+        let keep = height.saturating_sub(reserved).saturating_sub(1);
+        let hidden = lines.len() - keep;
+        lines.truncate(keep);
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("  +{hidden} more — terminal too small"),
+            theme::label_style(),
+        );
+    }
+    if stale {
         push_wrapped(
             &mut lines,
             width,
@@ -1947,6 +1965,50 @@ mod tests {
         model.update(Msg::View(crate::app::View::Queue));
         let screen = draw_rows(&model, 100, 24).join("\n");
         assert!(screen.contains("expired"), "{screen}");
+    }
+
+    /// Ф-4: the balance panel counted its budget and threw it away
+    /// (`let _ = height;`), so content past the panel vanished with no marker —
+    /// unlike positions right below it, which says what it hid.
+    ///
+    /// And the staleness warning is pushed last, so it was the FIRST thing to
+    /// disappear. It is not data, it is the line that says the data may be
+    /// wrong; it outranks a balance row and survives the truncation.
+    #[test]
+    fn the_balance_panel_says_what_it_hid_and_keeps_the_warning() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: (0..10)
+                    .map(|i| crate::protocol::ChainBalance {
+                        chain_id: i,
+                        symbol: "ETH".to_owned(),
+                        balance: "1000000000000000000".to_owned(),
+                    })
+                    .collect(),
+                allowed_chains: vec![1],
+                policy: policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+            },
+        )))));
+        // A refresh that failed after a good one: the wallet is kept, the data
+        // is flagged as possibly stale.
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        model.update(Msg::View(crate::app::View::Dashboard));
+
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(
+            screen.contains("more — terminal too small"),
+            "the panel must say what it hid:\n{screen}"
+        );
+        assert!(
+            screen.contains("may be stale"),
+            "and the warning must outlive the rows it warns about:\n{screen}"
+        );
     }
 
     /// Б-3: the list must follow the cursor. Kimi walked 39 items down and the
