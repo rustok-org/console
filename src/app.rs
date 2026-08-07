@@ -781,6 +781,15 @@ impl Model {
                 }
                 Notice::Note("autonomous mode confirmed — sends no longer wait".to_owned())
             }
+            // The arming answer is not "one more try": on this same response
+            // the core denied every pending item (protocol §4), and the next
+            // PIN would meet `locked`. Inviting a retry here would point the
+            // human at a closed channel and say nothing about the queue that
+            // was just refused. `apply_resolve` draws the same line on the
+            // card path, for the same reason.
+            AckOutcome::BadPin { attempts_left: 0 } => Notice::Locked {
+                retry_after_s: None, // the arming response carries no delay
+            },
             AckOutcome::BadPin { attempts_left } => Notice::Note(format!(
                 "wrong PIN — {attempts_left} attempts left; press c to try again"
             )),
@@ -1978,7 +1987,43 @@ mod tests {
         );
     }
 
-    /// Every refusal says what happened — a prompt that just closes leaves the
+    /// The third wrong PIN is not "one more try" — it is the lockout arming.
+    ///
+    /// Protocol §4, which this wave wrote: a client MUST read `bad_pin` with
+    /// `attempts_left: 0` as "now locked". The core has just denied **every
+    /// pending item** on that same answer. Telling the human to press `c` again
+    /// points them at a channel that will answer `locked`, and says nothing
+    /// about the queue that was just refused.
+    ///
+    /// `apply_resolve` already distinguishes this on the card path; this is the
+    /// same distinction on the confirmation path.
+    #[test]
+    fn the_arming_wrong_pin_reports_the_lockout_not_another_try() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::AckStart);
+        m.update(Msg::PinDigit('1'));
+        let _ = m.update(Msg::PinSubmit);
+        m.update(Msg::Reply(Reply::Ack(AckOutcome::BadPin {
+            attempts_left: 0,
+        })));
+
+        let Phase::Watching { notice, ack, .. } = m.phase() else {
+            panic!("still watching");
+        };
+        assert!(
+            ack.is_none(),
+            "the prompt closes — the channel will not take a PIN"
+        );
+        match notice {
+            Some(Notice::Locked { retry_after_s }) => assert_eq!(
+                *retry_after_s, None,
+                "the arming answer carries no delay, and none is invented"
+            ),
+            other => panic!("the lockout must be reported as a lockout, got: {other:?}"),
+        }
+    }
+
+    /// Every refusal says what happened — a prompt that just closes leaves the    /// Every refusal says what happened — a prompt that just closes leaves the
     /// human guessing whether the gate moved.
     ///
     /// It asserts WHICH message, not merely that one exists: `notice.is_some()`
