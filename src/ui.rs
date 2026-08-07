@@ -84,19 +84,19 @@ fn mode_phrase(policy: Policy, budget: usize) -> Option<Span<'static>> {
     let (full, short, style) = match (policy.mode, policy.origin) {
         (PolicyMode::Unknown, _) => return None,
         (PolicyMode::ReadOnly, _) => (
-            "только чтение",
-            "только чтение",
+            "read-only",
+            "read-only",
             Style::new().fg(theme::high_risk()),
         ),
-        (PolicyMode::Supervised, _) => ("ручной режим", "ручной", theme::label_style()),
+        (PolicyMode::Supervised, _) => ("manual mode", "manual mode", theme::label_style()),
         (PolicyMode::Autonomous, PolicyOrigin::Acknowledged) => (
-            "автономный · подтверждён",
-            "подтверждён",
+            "autonomous · confirmed",
+            "confirmed",
             Style::new().fg(theme::accent()),
         ),
         (PolicyMode::Autonomous, PolicyOrigin::Provisioned) => (
-            "автономный · не подтверждён — отправки встают в очередь",
-            "не подтверждён",
+            "autonomous · unconfirmed — sends wait for you",
+            "unconfirmed",
             Style::new()
                 .fg(theme::high_risk())
                 .add_modifier(Modifier::BOLD),
@@ -727,17 +727,17 @@ fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
     let block = Block::bordered()
         .border_style(Style::new().fg(theme::high_risk()))
         .title(Line::from(Span::styled(
-            " Автономный режим не подтверждён ",
+            " Autonomous mode unconfirmed ",
             Style::new()
                 .fg(theme::high_risk())
                 .add_modifier(Modifier::BOLD),
         )));
     let body = Paragraph::new(vec![
-        Line::from("Каждая отправка встаёт в очередь и ждёт вас."),
+        Line::from("Every send queues and waits for you."),
         Line::from(vec![
             Span::styled("[c]", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(" — подтвердить автономию "),
-            Span::styled("(потребует PIN)", Style::new().fg(theme::faint())),
+            Span::raw(" — confirm autonomy "),
+            Span::styled("(requires PIN)", Style::new().fg(theme::faint())),
         ]),
     ])
     .block(block);
@@ -1473,7 +1473,7 @@ mod tests {
             model.update(Msg::View(view));
             let header = draw_rows(&model, 80, 24)[0].clone();
             assert!(
-                header.contains("не подтверждён"),
+                header.contains("unconfirmed"),
                 "{view:?} must state it too: {header}"
             );
         }
@@ -1492,19 +1492,19 @@ mod tests {
             (
                 PolicyMode::Autonomous,
                 PolicyOrigin::Provisioned,
-                "не подтверждён",
+                "unconfirmed",
                 true,
             ),
             (
                 PolicyMode::Autonomous,
                 PolicyOrigin::Acknowledged,
-                "подтверждён",
+                "confirmed",
                 false,
             ),
             (
                 PolicyMode::Supervised,
                 PolicyOrigin::Provisioned,
-                "ручной",
+                "manual",
                 false,
             ),
         ] {
@@ -1524,7 +1524,7 @@ mod tests {
     /// card just gave up (design §3).
     #[test]
     fn the_dashboard_offers_confirmation_only_when_there_is_something_to_confirm() {
-        const TITLE: &str = "Автономный режим не подтверждён";
+        const TITLE: &str = "Autonomous mode unconfirmed";
         for (mode, origin, expected) in [
             (PolicyMode::Autonomous, PolicyOrigin::Provisioned, true),
             (PolicyMode::Autonomous, PolicyOrigin::Acknowledged, false),
@@ -1548,8 +1548,8 @@ mod tests {
     /// end, so the banner states what is happening and which key ends it.
     #[test]
     fn the_confirmation_banner_says_what_happens_and_what_to_press() {
-        const WHAT_HAPPENS: &str = "Каждая отправка встаёт в очередь и ждёт вас.";
-        const WHAT_TO_PRESS: &str = "[c] — подтвердить автономию";
+        const WHAT_HAPPENS: &str = "Every send queues and waits for you.";
+        const WHAT_TO_PRESS: &str = "[c] — confirm autonomy";
         let mut model = Model::default();
         to_watching_with_policy(
             &mut model,
@@ -1560,7 +1560,7 @@ mod tests {
         assert!(screen.contains(WHAT_HAPPENS), "what happens:\n{screen}");
         assert!(screen.contains(WHAT_TO_PRESS), "what to press:\n{screen}");
         assert!(
-            screen.contains("потребует PIN"),
+            screen.contains("requires PIN"),
             "and that it will ask for the PIN:\n{screen}"
         );
     }
@@ -1575,7 +1575,7 @@ mod tests {
             policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
         );
         model.update(Msg::View(crate::app::View::Dashboard));
-        let fgs = row_fgs_containing(&model, 100, 24, "Автономный режим не подтверждён");
+        let fgs = row_fgs_containing(&model, 100, 24, "Autonomous mode unconfirmed");
         assert!(
             fgs.contains(&theme::high_risk()),
             "the banner must read as the thing that wants attention"
@@ -1592,7 +1592,7 @@ mod tests {
     /// all.
     #[test]
     fn the_designed_alarm_phrase_renders_verbatim_when_it_fits() {
-        const DESIGNED: &str = "автономный · не подтверждён — отправки встают в очередь";
+        const DESIGNED: &str = "autonomous · unconfirmed — sends wait for you";
         let mut model = Model::default();
         to_watching_with_policy(
             &mut model,
@@ -1626,8 +1626,7 @@ mod tests {
         model.update(Msg::PinSubmit);
         model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
         let header = draw_rows(&model, 80, 24)[0].clone();
-        for word in ["подтверждён", "ручной", "только чтение", "автономный"]
-        {
+        for word in ["confirmed", "manual", "read-only", "autonomous"] {
             assert!(
                 !header.contains(word),
                 "nothing is known yet, so nothing is claimed: {header}"
