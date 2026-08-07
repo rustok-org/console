@@ -456,7 +456,12 @@ fn render_queue(
     let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "  KIND    AMOUNT             RECIPIENT        NETWORK    EXPIRES",
+            // The two leading columns are the ones the selection bar occupies
+            // on every data row; without them the header floats two left.
+            format!(
+                "  {}",
+                queue_row("", "KIND", "AMOUNT", "", "RECIPIENT", "NETWORK", "EXPIRES")
+            ),
             Style::new().fg(theme::faint()),
         )),
         split[0],
@@ -477,12 +482,14 @@ fn render_queue(
             } else {
                 format::wei_to_eth(&s.amount_wei)
             };
-            let text = format!(
-                "{marker} {kind:6}  {amount:<18} → {to:<16} {net:<10} {left}",
-                kind = kind_word(s),
-                to = format::short_addr(&s.to),
-                net = format::network_name(s.chain_id),
-                left = time_left_word(s.not_after_unix, now_unix),
+            let text = queue_row(
+                &marker.to_string(),
+                kind_word(s),
+                &amount,
+                "→",
+                &format::short_addr(&s.to),
+                &format::network_name(s.chain_id),
+                &time_left_word(s.not_after_unix, now_unix),
             );
             (text, s.high_risk)
         })
@@ -831,6 +838,36 @@ fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
     ])
     .block(block);
     frame.render_widget(body, area);
+}
+
+/// Column widths of the queue table — the ONE place they live.
+///
+/// The header and the data rows were two independently hand-built strings and
+/// they drifted: `RECIPIENT` ended up over the arrow, two columns left of the
+/// address it names. Both now go through [`queue_row`], so a width cannot move
+/// in one without moving in the other.
+const Q_MARKER: usize = 2;
+const Q_KIND: usize = 8;
+const Q_AMOUNT: usize = 19;
+const Q_ARROW: usize = 2;
+const Q_RECIPIENT: usize = 15;
+const Q_NETWORK: usize = 11;
+
+/// One line of the queue table, header or data. The arrow has its own cell so
+/// the `RECIPIENT` heading sits over the address rather than over the arrow.
+fn queue_row(
+    marker: &str,
+    kind: &str,
+    amount: &str,
+    arrow: &str,
+    recipient: &str,
+    network: &str,
+    expires: &str,
+) -> String {
+    format!(
+        "{marker:<Q_MARKER$}{kind:<Q_KIND$}{amount:<Q_AMOUNT$}{arrow:<Q_ARROW$}\
+{recipient:<Q_RECIPIENT$}{network:<Q_NETWORK$}{expires}"
+    )
 }
 
 /// How long is left before this item expires, for the queue's last column.
@@ -1878,6 +1915,49 @@ mod tests {
         model.update(Msg::View(crate::app::View::Queue));
         let screen = draw_rows(&model, 100, 24).join("\n");
         assert!(screen.contains("expired"), "{screen}");
+    }
+
+    /// The header and the rows are one table or they are not a table.
+    ///
+    /// `the_queue_names_its_columns` only asks whether the words are present,
+    /// which is true of any two independently hand-built strings — and they
+    /// were two, and they drifted: `RECIPIENT` sat over the arrow, two columns
+    /// left of the address it names. This asserts the column INDEX, so a width
+    /// changed in one place and not the other fails here.
+    #[test]
+    fn the_queue_header_sits_over_the_columns_it_names() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let rows = draw_rows(&model, 100, 24);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("RECIPIENT"))
+            .expect("the header row");
+        let data = rows
+            .iter()
+            .find(|r| r.contains("0x8b3E"))
+            .expect("a data row");
+
+        // Character offsets, not byte offsets: `▌`, `●` and `→` are multi-byte,
+        // so `find` alone would compare two different rulers.
+        let col = |s: &str, needle: &str| s.find(needle).map(|b| s[..b].chars().count());
+        for (word, cell) in [
+            ("RECIPIENT", "0x8b3E"),
+            ("NETWORK", "Base"),
+            // The cell CONTENT, not a fragment of it: "min" also matches
+            // inside "5 min" two columns in, and would compare cell starts
+            // against a position that is not one.
+            ("EXPIRES", "5 min"),
+        ] {
+            assert_eq!(
+                col(header, word),
+                col(data, cell),
+                "column {word} must start where {cell} starts\nheader: {header}\nrow:    {data}"
+            );
+        }
     }
 
     /// Danger reads before the card is opened: a high-risk row carries `◆` and
