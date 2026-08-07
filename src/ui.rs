@@ -711,20 +711,65 @@ fn age_label(now_unix: u64, unix: u64) -> String {
 /// Honesty rules: a failed balance refresh flags the block as possibly stale
 /// (never silently shows old data as fresh); positions that do not fit end
 /// with an explicit "+N more" marker, never a silent clip.
+/// The rows the confirmation banner claims: two borders plus its two lines.
+const ACK_BANNER_ROWS: u16 = 4;
+
+/// The one-time invitation to confirm autonomy (design §3).
+///
+/// It is drawn **only** while there is something to confirm, for the same
+/// reason the card no longer holds rows it is not using: a permanent strip for
+/// a once-in-a-wallet action is a standing reserve. A supervised wallet has no
+/// autonomy to acknowledge, so it is never asked.
+///
+/// The alarm colour is the same one the header spends on this one state — the
+/// banner is where that state says what to do about itself.
+fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let block = Block::bordered()
+        .border_style(Style::new().fg(theme::high_risk()))
+        .title(Line::from(Span::styled(
+            " Автономный режим не подтверждён ",
+            Style::new()
+                .fg(theme::high_risk())
+                .add_modifier(Modifier::BOLD),
+        )));
+    let body = Paragraph::new(vec![
+        Line::from("Каждая отправка встаёт в очередь и ждёт вас."),
+        Line::from(vec![
+            Span::styled("[c]", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(" — подтвердить автономию "),
+            Span::styled("(потребует PIN)", Style::new().fg(theme::faint())),
+        ]),
+    ])
+    .block(block);
+    frame.render_widget(body, area);
+}
+
 fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
+    let policy = model.policy();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
     frame.render_widget(
         Paragraph::new(header_line(
             View::Dashboard,
             pending,
-            model.policy(),
+            policy,
             frame.area().width,
         )),
         chunks[0],
     );
 
+    // The banner takes its rows from the body, not from the header: the mode
+    // phrase must stay on screen in every state, the invitation only in one.
+    let body = if policy.awaits_acknowledgment() {
+        let split = Layout::vertical([Constraint::Length(ACK_BANNER_ROWS), Constraint::Min(0)])
+            .split(chunks[1]);
+        render_ack_banner(frame, split[0]);
+        split[1]
+    } else {
+        chunks[1]
+    };
+
     let block = themed_block(" Dashboard ");
-    let inner = block.inner(chunks[1]);
+    let inner = block.inner(body);
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
 
@@ -863,7 +908,7 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
         }
     }
 
-    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+    frame.render_widget(Paragraph::new(lines).block(block), body);
 }
 
 /// The card's priority lines — every field except `raw_data` — pre-wrapped to
@@ -1472,6 +1517,69 @@ mod tests {
                 "{mode:?}/{origin:?} alarm-coloured? expected {expect_alarm}"
             );
         }
+    }
+
+    /// The banner exists only where there is something to confirm. A permanent
+    /// strip for a once-in-a-wallet action is the same standing reserve the
+    /// card just gave up (design §3).
+    #[test]
+    fn the_dashboard_offers_confirmation_only_when_there_is_something_to_confirm() {
+        const TITLE: &str = "Автономный режим не подтверждён";
+        for (mode, origin, expected) in [
+            (PolicyMode::Autonomous, PolicyOrigin::Provisioned, true),
+            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged, false),
+            (PolicyMode::Supervised, PolicyOrigin::Provisioned, false),
+            (PolicyMode::ReadOnly, PolicyOrigin::Provisioned, false),
+            (PolicyMode::Unknown, PolicyOrigin::Provisioned, false),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            model.update(Msg::View(crate::app::View::Dashboard));
+            let screen = draw_rows(&model, 100, 24).join("\n");
+            assert_eq!(
+                screen.contains(TITLE),
+                expected,
+                "{mode:?}/{origin:?}: banner expected {expected}\n{screen}"
+            );
+        }
+    }
+
+    /// Transcribed from design §3 — a refusal the human cannot act on is a dead
+    /// end, so the banner states what is happening and which key ends it.
+    #[test]
+    fn the_confirmation_banner_says_what_happens_and_what_to_press() {
+        const WHAT_HAPPENS: &str = "Каждая отправка встаёт в очередь и ждёт вас.";
+        const WHAT_TO_PRESS: &str = "[c] — подтвердить автономию";
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains(WHAT_HAPPENS), "what happens:\n{screen}");
+        assert!(screen.contains(WHAT_TO_PRESS), "what to press:\n{screen}");
+        assert!(
+            screen.contains("потребует PIN"),
+            "and that it will ask for the PIN:\n{screen}"
+        );
+    }
+
+    /// The banner is the one framed thing on the Dashboard, and it carries the
+    /// alarm colour — the same signal the header spends on this one state.
+    #[test]
+    fn the_confirmation_banner_is_alarm_coloured() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let fgs = row_fgs_containing(&model, 100, 24, "Автономный режим не подтверждён");
+        assert!(
+            fgs.contains(&theme::high_risk()),
+            "the banner must read as the thing that wants attention"
+        );
     }
 
     /// The ratified phrase, transcribed from the design decision (§2 table) and
