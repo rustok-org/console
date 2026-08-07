@@ -335,7 +335,7 @@ fn render_watch(
     // The card chunk exists only while a confirmation is open, so everything
     // after it shifts by one — see `watch_chunks`.
     let actions_idx = if confirm.is_some() {
-        render_detail(frame, confirm, wallet.address, chunks[2]);
+        render_detail(frame, confirm, wallet.address, wallet.policy, chunks[2]);
         3
     } else {
         2
@@ -343,7 +343,8 @@ fn render_watch(
     // The same fit the model gates approve on (`priority_fields_fit`), taken
     // from the very chunk the card is drawn into. With no card open there is
     // nothing to gate: `is_none_or` answers true and no chunk is consulted.
-    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, wallet.address, chunks[2]));
+    let approve_ok =
+        confirm.is_none_or(|c| card_priority_fits(c, wallet.address, wallet.policy, chunks[2]));
     render_actions(frame, confirm, approve_ok, now_unix, chunks[actions_idx]);
 
     if let Some(notice) = notice {
@@ -793,6 +794,26 @@ fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
     frame.render_widget(body, area);
 }
 
+/// Why this payment is waiting, derived from the pair (mode, origin) — §4.
+///
+/// The wire carries no reason field and does not need one: within a single
+/// wallet the reason is the same for every parked item, so a per-item field
+/// would be the same string repeated. Only the unconfirmed case is
+/// alarm-coloured, the same rule the header follows applied to the same fact.
+fn parking_reason(policy: Policy) -> (&'static str, Style) {
+    match (policy.mode, policy.origin) {
+        (PolicyMode::Autonomous, PolicyOrigin::Provisioned) => (
+            "parked: autonomy unconfirmed — confirm on the Dashboard",
+            Style::new().fg(theme::high_risk()),
+        ),
+        (PolicyMode::Autonomous, PolicyOrigin::Acknowledged) => (
+            "parked until mode confirmation — decided by you",
+            theme::label_style(),
+        ),
+        _ => ("waiting for your decision", theme::label_style()),
+    }
+}
+
 /// The autonomy-confirmation PIN prompt, centred over the screen.
 ///
 /// Same behaviour as the card's high-risk prompt — on top, masked, nothing
@@ -1012,7 +1033,12 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
 /// arithmetic downstream is exact. One source for the renderer AND for
 /// [`priority_fields_fit`]: the approve gate can never disagree with what is
 /// actually drawn.
-fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
+fn priority_lines(
+    confirm: &Confirm,
+    from: Option<&str>,
+    policy: Policy,
+    width: usize,
+) -> Vec<Line<'static>> {
     let card: &Card = confirm.card();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1102,6 +1128,12 @@ fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Li
             );
         }
     }
+    // Why this one is waiting (§4) — after the risk warnings, before the PIN
+    // prompt and the deadline. A priority field on purpose: a human who cannot
+    // see why the payment stopped cannot tell "the wallet is asking me" from
+    // "the wallet is broken".
+    let (reason, reason_style) = parking_reason(policy);
+    push_wrapped(&mut lines, width, reason.to_owned(), reason_style);
     if let Some(pin_len) = confirm.pin_len() {
         lines.push(Line::from(""));
         push_wrapped(
@@ -1131,9 +1163,15 @@ fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Li
 }
 
 /// Whether the card's priority lines fit its inner area.
-fn card_priority_fits(confirm: &Confirm, from: Option<&str>, area: ratatui::layout::Rect) -> bool {
+fn card_priority_fits(
+    confirm: &Confirm,
+    from: Option<&str>,
+    policy: Policy,
+    area: ratatui::layout::Rect,
+) -> bool {
     let inner = Block::bordered().inner(area);
-    priority_lines(confirm, from, usize::from(inner.width)).len() <= usize::from(inner.height)
+    priority_lines(confirm, from, policy, usize::from(inner.width)).len()
+        <= usize::from(inner.height)
 }
 
 /// The approve gate: can a `width`×`height` terminal show every priority field
@@ -1146,10 +1184,16 @@ fn card_priority_fits(confirm: &Confirm, from: Option<&str>, area: ratatui::layo
 /// `has_note` is `false` by construction: a note and an open confirmation never
 /// coexist (`apply_get`/`apply_resolve` set one while clearing the other).
 #[must_use]
-pub fn priority_fields_fit(confirm: &Confirm, from: Option<&str>, width: u16, height: u16) -> bool {
+pub fn priority_fields_fit(
+    confirm: &Confirm,
+    from: Option<&str>,
+    policy: Policy,
+    width: u16,
+    height: u16,
+) -> bool {
     let area = ratatui::layout::Rect::new(0, 0, width, height);
     let chunks = watch_chunks(area, true, false);
-    card_priority_fits(confirm, from, chunks[2])
+    card_priority_fits(confirm, from, policy, chunks[2])
 }
 
 /// Render the open confirmation's card — the core's fields **verbatim**, no
@@ -1166,6 +1210,7 @@ fn render_detail(
     frame: &mut Frame,
     confirm: Option<&Confirm>,
     from: Option<&str>,
+    policy: Policy,
     area: ratatui::layout::Rect,
 ) {
     let block = themed_block(" Card ");
@@ -1180,7 +1225,7 @@ fn render_detail(
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
 
-    let mut lines = priority_lines(confirm, from, width);
+    let mut lines = priority_lines(confirm, from, policy, width);
     if lines.len() > height {
         // The card cannot show what the human must read; approve is gated off
         // (`priority_fields_fit` — the model refuses `y` and PIN submits). The
@@ -1611,6 +1656,93 @@ mod tests {
                 fgs.contains(&alarm),
                 expect_alarm,
                 "{mode:?}/{origin:?} alarm-coloured? expected {expect_alarm}"
+            );
+        }
+    }
+
+    /// §4: the card says why this payment is waiting, and the answer follows
+    /// from the pair (mode, origin) — the wire carries no reason field, and
+    /// within one wallet the reason is the same for every parked item.
+    #[test]
+    fn the_card_says_why_the_payment_is_waiting() {
+        for (mode, origin, reason) in [
+            (
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+                "waiting for your decision",
+            ),
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+                "parked: autonomy unconfirmed — confirm on the Dashboard",
+            ),
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Acknowledged,
+                "parked until mode confirmation — decided by you",
+            ),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            model.update(Msg::Reply(Reply::List(vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )])));
+            model.update(Msg::View(crate::app::View::Queue));
+            model.update(Msg::Open);
+            model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+                "00000000-0000-0000-0000-000000000000",
+                NOW + 300,
+                false,
+            )))));
+            let screen = draw_rows(&model, 100, 24).join("\n");
+            assert!(
+                screen.contains(reason),
+                "{mode:?}/{origin:?} must say why:\n{screen}"
+            );
+        }
+    }
+
+    /// Only the state that asks something of the human is alarm-coloured —
+    /// the same rule the header follows, applied to the same fact.
+    #[test]
+    fn only_the_unconfirmed_reason_is_alarm_coloured() {
+        for (mode, origin, needle, expect_alarm) in [
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+                "confirm on the Dashboard",
+                true,
+            ),
+            (
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+                "waiting for your decision",
+                false,
+            ),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            model.update(Msg::Reply(Reply::List(vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )])));
+            model.update(Msg::View(crate::app::View::Queue));
+            model.update(Msg::Open);
+            model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+                "00000000-0000-0000-0000-000000000000",
+                NOW + 300,
+                false,
+            )))));
+            let fgs = row_fgs_containing(&model, 100, 24, needle);
+            assert_eq!(
+                fgs.contains(&theme::high_risk()),
+                expect_alarm,
+                "{mode:?}/{origin:?}: alarm expected {expect_alarm}"
             );
         }
     }

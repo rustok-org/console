@@ -1111,6 +1111,9 @@ impl Model {
         if !ui::priority_fields_fit(
             c,
             self.wallet.as_ref().map(|w| w.address.as_str()),
+            self.wallet
+                .as_ref()
+                .map_or_else(Policy::default, |w| w.policy),
             self.viewport.0,
             self.viewport.1,
         ) {
@@ -1152,6 +1155,9 @@ impl Model {
         if !ui::priority_fields_fit(
             c,
             self.wallet.as_ref().map(|w| w.address.as_str()),
+            self.wallet
+                .as_ref()
+                .map_or_else(Policy::default, |w| w.policy),
             self.viewport.0,
             self.viewport.1,
         ) {
