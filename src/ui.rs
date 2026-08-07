@@ -330,7 +330,7 @@ fn render_watch(
         chunks[0],
     );
 
-    render_queue(frame, items, selected, chunks[1]);
+    render_queue(frame, items, selected, now_unix, chunks[1]);
 
     // The card chunk exists only while a confirmation is open, so everything
     // after it shifts by one — see `watch_chunks`.
@@ -441,6 +441,7 @@ fn render_queue(
     frame: &mut Frame,
     items: &[Summary],
     selected: usize,
+    now_unix: u64,
     area: ratatui::layout::Rect,
 ) {
     let title = format!(" Queue — {} waiting for your decision ", items.len());
@@ -455,7 +456,7 @@ fn render_queue(
     let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "  KIND    AMOUNT             RECIPIENT        NETWORK",
+            "  KIND    AMOUNT             RECIPIENT        NETWORK    EXPIRES",
             Style::new().fg(theme::faint()),
         )),
         split[0],
@@ -477,10 +478,11 @@ fn render_queue(
                 format::wei_to_eth(&s.amount_wei)
             };
             let text = format!(
-                "{marker} {kind:6}  {amount:<18} → {to:<16} {net}",
+                "{marker} {kind:6}  {amount:<18} → {to:<16} {net:<10} {left}",
                 kind = kind_word(s),
                 to = format::short_addr(&s.to),
                 net = format::network_name(s.chain_id),
+                left = time_left_word(s.not_after_unix, now_unix),
             );
             (text, s.high_risk)
         })
@@ -829,6 +831,21 @@ fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
     ])
     .block(block);
     frame.render_widget(body, area);
+}
+
+/// How long is left before this item expires, for the queue's last column.
+///
+/// The mockup asked for AGE, which the wire cannot produce: a summary carries
+/// its deadline, never its birth. Time LEFT is both derivable and the thing
+/// that matters when triaging a queue — how long the human has, not how long
+/// it has sat (Reviewer, round 10). Saturating like the card's countdown: a
+/// deadline already past reads as expired, never as a wrapped-around eternity.
+fn time_left_word(not_after_unix: u64, now_unix: u64) -> String {
+    match seconds_left(not_after_unix, now_unix) {
+        0 => "expired".to_owned(),
+        s if s < 60 => format!("{s} s"),
+        s => format!("{} min", s / 60),
+    }
 }
 
 /// Why this payment is waiting, derived from the pair (mode, origin) — §4.
@@ -1727,14 +1744,19 @@ mod tests {
                     true,
                 );
                 s.chain_id = 8453;
+                s.not_after_unix = NOW + 300;
                 s
             },
-            summary(
-                "11111111-1111-1111-1111-111111111111",
-                "0x1fA9c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9c4D2",
-                "420000000000000000",
-                false,
-            ),
+            {
+                let mut s = summary(
+                    "11111111-1111-1111-1111-111111111111",
+                    "0x1fA9c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9c4D2",
+                    "420000000000000000",
+                    false,
+                );
+                s.not_after_unix = NOW + 300;
+                s
+            },
         ])));
         model.update(Msg::View(crate::app::View::Queue));
     }
@@ -1756,7 +1778,47 @@ mod tests {
         }
     }
 
-    /// Danger reads before the card is opened: a high-risk row carries `◆` and
+    /// The column the mockup called AGE shows time LEFT instead — the wire
+    /// carries no creation time, and what matters for triage is how long the
+    /// human has, not how long it has sat (Reviewer, round 10).
+    #[test]
+    fn the_queue_shows_how_long_is_left_not_how_long_it_sat() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains("EXPIRES"), "the column is named:\n{screen}");
+        assert!(
+            screen.contains("4 min") || screen.contains("5 min"),
+            "and it counts down:\n{screen}"
+        );
+    }
+
+    /// A deadline already past reads as expired, never as a huge number: the
+    /// countdown saturates rather than wrapping (same rule as the card's).
+    #[test]
+    fn a_passed_deadline_reads_as_expired() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let mut s = summary(
+            "00000000-0000-0000-0000-000000000000",
+            "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+            "1000000000000000000",
+            false,
+        );
+        s.not_after_unix = NOW - 10;
+        model.update(Msg::Reply(Reply::List(vec![s])));
+        model.update(Msg::View(crate::app::View::Queue));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains("expired"), "{screen}");
+    }
+
+    /// Danger reads before the card is opened    /// Danger reads before the card is opened: a high-risk row carries `◆` and
     /// the alarm colour, an ordinary one carries `●`.
     #[test]
     fn risk_is_visible_in_the_list_itself() {
