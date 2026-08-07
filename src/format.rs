@@ -73,10 +73,12 @@ pub fn network_name(chain_id: u64) -> String {
 /// approving surface** — the card, From→To and Receive render addresses in full
 /// (address poisoning; ТЗ §4.1).
 ///
-/// Display lists, as of design §4 (2026-08-07): Activity, and the queue. The
-/// boundary did not move — the queue is scanned, and the decision is made on
-/// the card, which still shows the address in full. What changed is that a
-/// second list exists, not that a decision surface started shortening.
+/// Scan surfaces, as of design §4 (2026-08-07): Activity, the queue, and the
+/// Dashboard's identity panel — which shows WHICH wallet is loaded, not where
+/// money is going. The boundary did not move: every one of them is read, and
+/// the decision is made on the card, which still shows the address in full.
+/// What changed is that the list of scan surfaces grew, not that a decision
+/// surface started shortening.
 /// Input without a `0x` prefix, non-ASCII, or too short to save space is
 /// returned verbatim (display never crashes).
 #[must_use]
@@ -91,6 +93,17 @@ pub fn short_addr(addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The mapping and the fallback: an unknown chain shows its number rather
+    /// than a guessed name — a wrong network on a payment screen is worse than
+    /// a bare id.
+    #[test]
+    fn network_name_maps_what_it_knows_and_shows_the_rest() {
+        assert_eq!(network_name(1), "Ethereum");
+        assert_eq!(network_name(8453), "Base");
+        assert_eq!(network_name(42), "chain 42");
+    }
+
     use super::*;
 
     #[test]

@@ -722,6 +722,61 @@ mod tests {
         }
     }
 
+    fn dashboard_with_prompt() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Dashboard,
+            ack: Some(rustok_console::app::AckPrompt::default()),
+        }
+    }
+
+    fn dashboard() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Dashboard,
+            ack: None,
+        }
+    }
+
+    /// The key map is what this file is for, and the confirmation's keys were
+    /// the one branch in it with no test at all.
+    #[test]
+    fn c_starts_the_confirmation_and_the_prompt_then_owns_the_keyboard() {
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('c')), &dashboard()),
+            Some(Msg::AckStart)
+        ));
+
+        // While it is up, the screen keys are gone: a stray `d` must not walk
+        // away mid-PIN, and Esc cancels the attempt rather than rejecting
+        // anything — there is nothing here to reject.
+        let up = dashboard_with_prompt();
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('1')), &up),
+            Some(Msg::PinDigit('1'))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Enter), &up),
+            Some(Msg::PinSubmit)
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Esc), &up),
+            Some(Msg::AckCancel)
+        ));
+        for dead in ['d', 'a', 'r', 'h', 'q'] {
+            assert!(
+                map_key(&key(KeyCode::Char(dead)), &up).is_none(),
+                "`{dead}` must be dead while the PIN prompt is up"
+            );
+        }
+    }
+
     fn receiving() -> Phase {
         Phase::Watching {
             items: vec![],

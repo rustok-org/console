@@ -949,8 +949,17 @@ impl Model {
                 None
             }
             Msg::AckStart => {
+                // Both guards stated rather than assumed, as for `on_view`: a
+                // card owns the screen while it is the decision surface, and
+                // the prompt is drawn on the Dashboard only — a prompt nobody
+                // can see must not own the keyboard.
                 if self.policy().awaits_acknowledgment()
-                    && let Phase::Watching { ack, .. } = &mut self.phase
+                    && let Phase::Watching {
+                        ack,
+                        confirm: None,
+                        view: View::Dashboard,
+                        ..
+                    } = &mut self.phase
                 {
                     *ack = Some(AckPrompt::default());
                 }
@@ -1946,6 +1955,47 @@ mod tests {
             panic!("still watching");
         };
         assert_eq!(items.len(), 2, "both stay for the human to decide");
+    }
+
+    /// Н-1: the model refuses to open the confirmation where it could not be
+    /// seen or answered — a card is the decision surface and owns the screen,
+    /// and the prompt is drawn on the Dashboard only.
+    ///
+    /// The key map cannot produce this today. The guard is here for the reason
+    /// this wave already wrote next to `on_view`: a message the model accepts
+    /// is a message some future caller will send.
+    #[test]
+    fn the_confirmation_does_not_open_over_a_card_or_off_the_dashboard() {
+        // A card is open: the decision surface owns the screen.
+        let mut m = watching(vec![summary("a1")]);
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+                policy: Policy {
+                    mode: PolicyMode::Autonomous,
+                    origin: PolicyOrigin::Provisioned,
+                },
+            },
+        )))));
+        m.update(Msg::Open);
+        m.update(Msg::AckStart);
+        assert_eq!(
+            m.ack_pin_len(),
+            None,
+            "a confirmation must not open over an open card"
+        );
+
+        // No card, but a screen that does not draw the prompt.
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::View(View::Receive));
+        m.update(Msg::AckStart);
+        assert_eq!(
+            m.ack_pin_len(),
+            None,
+            "a prompt nobody can see must not own the keyboard"
+        );
     }
 
     /// The race the guard in `flush_pending` exists for: a confirmation parks

@@ -81,7 +81,8 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
 /// is invented here: a paraphrase in the one place that carries the alarm
 /// colour is exactly the kind of drift nobody notices.
 ///
-/// The tabs take 59 columns, so the long form needs roughly 115 to appear; a
+/// The tabs take 59 columns and the phrase is 45, so the long form needs 105
+/// to appear (measured, not estimated — the earlier "~115" was neither); a
 /// standard 80-column terminal leaves 21 and gets the short one. The short form
 /// keeps the half that changes what the human does, and the instruction itself
 /// lives in the Dashboard banner — truncating the long form instead would cut
@@ -2389,7 +2390,7 @@ mod tests {
     /// alarm colour, so it earns literal accuracy rather than a paraphrase.
     ///
     /// Wide terminals are where it renders — the tabs take 59 columns, so the
-    /// full wording needs ~115. Narrower ones get the approved short form,
+    /// full wording needs 105. Narrower ones get the approved short form,
     /// which is a different question from whether the designed phrase exists at
     /// all.
     #[test]

@@ -565,6 +565,28 @@ mod tests {
         assert_eq!(ctx.allowed_chains, vec![1]);
     }
 
+    /// Every other op has a round-trip through the real socket; `ack` did not.
+    /// The parser is unit-tested, but nothing proved the request reaches the
+    /// wire as an `ack` and the answer comes back as `Reply::Ack`.
+    #[test]
+    fn ack_round_trips_through_the_socket() {
+        let server = FakeServer::start(
+            "ack_rt",
+            vec![
+                Some(HELLO_OK),
+                Some(r#"{"ok":true,"mode":"autonomous","origin":"acknowledged"}"#),
+            ],
+        );
+        let t = Transport::connect(&server.path);
+        assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
+        let line = zeroize::Zeroizing::new(r#"{"op":"ack","pin":"483920"}"#.to_owned());
+        assert!(t.send(Request::Ack(line)));
+        assert!(
+            matches!(t.recv(), Some(Reply::Ack(AckOutcome::Confirmed))),
+            "an ack reply must come back as Reply::Ack"
+        );
+    }
+
     #[test]
     fn context_wallet_locked_degrades_not_fatal() {
         let server = FakeServer::start(

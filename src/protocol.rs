@@ -318,18 +318,6 @@ pub enum PolicyOrigin {
 }
 
 impl Policy {
-    /// Whether this wallet parks a send instead of making it.
-    ///
-    /// The single place the pair is interpreted, so no caller re-derives it and
-    /// gets it subtly wrong.
-    #[must_use]
-    pub fn parks_sends(self) -> bool {
-        !matches!(
-            (self.mode, self.origin),
-            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged)
-        )
-    }
-
     /// Whether there is autonomy here awaiting a human's confirmation — the one
     /// state that asks something of the human.
     #[must_use]
