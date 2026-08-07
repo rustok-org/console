@@ -1840,7 +1840,7 @@ mod tests {
         );
     }
 
-    /// The column the mockup called AGE shows time LEFT instead    /// The column the mockup called AGE shows time LEFT instead — the wire
+    /// The column the mockup called AGE shows time LEFT instead — the wire
     /// carries no creation time, and what matters for triage is how long the
     /// human has, not how long it has sat (Reviewer, round 10).
     #[test]
@@ -1880,7 +1880,7 @@ mod tests {
         assert!(screen.contains("expired"), "{screen}");
     }
 
-    /// Danger reads before the card is opened    /// Danger reads before the card is opened: a high-risk row carries `◆` and
+    /// Danger reads before the card is opened: a high-risk row carries `◆` and
     /// the alarm colour, an ordinary one carries `●`.
     #[test]
     fn risk_is_visible_in_the_list_itself() {

@@ -2023,7 +2023,7 @@ mod tests {
         }
     }
 
-    /// Every refusal says what happened — a prompt that just closes leaves the    /// Every refusal says what happened — a prompt that just closes leaves the
+    /// Every refusal says what happened — a prompt that just closes leaves the
     /// human guessing whether the gate moved.
     ///
     /// It asserts WHICH message, not merely that one exists: `notice.is_some()`
