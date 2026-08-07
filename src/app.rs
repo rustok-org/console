@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, PositionsOutcome,
-    ResolveOutcome, Summary, TerminalState, WalletContext,
+    AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, Policy,
+    PositionsOutcome, ResolveOutcome, Summary, TerminalState, WalletContext,
 };
 use crate::transport::{self, Reply, TransportError};
 use crate::ui;
@@ -699,6 +699,19 @@ impl Model {
     #[must_use]
     pub fn wallet_context(&self) -> Option<&WalletContext> {
         self.wallet.as_ref()
+    }
+
+    /// The wallet's autonomy — mode and origin as one value (§3.7).
+    ///
+    /// Before the first `context` reply this is the default, whose mode is
+    /// `Unknown`: the console has not been told yet, and the header says
+    /// nothing rather than guessing. It never defaults to a real mode —
+    /// a guess here is a claim about whether this wallet spends by itself.
+    #[must_use]
+    pub fn policy(&self) -> Policy {
+        self.wallet
+            .as_ref()
+            .map_or_else(Policy::default, |w| w.policy)
     }
 
     /// The dashboard's positions block (tri-state).

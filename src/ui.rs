@@ -13,7 +13,7 @@ use crate::app::{
     AuthError, Confirm, DecisionKind, HistoryEntry, Model, Notice, Phase, Positions, ResolveError,
     View,
 };
-use crate::protocol::{Card, OutcomeState, Summary};
+use crate::protocol::{Card, OutcomeState, Policy, PolicyMode, PolicyOrigin, Summary};
 use crate::{format, qr, theme};
 
 /// Render the whole screen for the current model.
@@ -39,15 +39,105 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
                 *selected,
                 confirm.as_deref(),
                 notice.as_ref(),
-                model.wallet_address(),
+                WalletView {
+                    address: model.wallet_address(),
+                    policy: model.policy(),
+                },
                 now_unix,
             ),
-            View::Receive => render_receive(frame, items.len(), model.wallet_address()),
+            View::Receive => {
+                render_receive(frame, items.len(), model.wallet_address(), model.policy())
+            }
             View::Dashboard => render_dashboard(frame, items.len(), model),
             View::Activity => render_activity(frame, items.len(), model, now_unix),
         },
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
+}
+
+/// The wallet's autonomy as one phrase for the header, with the style that
+/// carries its meaning — or `None` when there is nothing truthful to say yet.
+///
+/// **The alarm colour is spent on exactly one state.** `autonomous` +
+/// `provisioned` is the only combination where what the human expects and what
+/// the wallet does come apart: the mode reads "sends by itself" while every
+/// send parks. Acknowledged autonomy is not an alarm — it is the human's own
+/// choice, and colouring it like danger would spend the signal that makes the
+/// one real case stand out.
+///
+/// `PolicyMode::Unknown` renders **nothing**. The header states a fact about
+/// this wallet; before the first `context` reply lands there is no fact, and an
+/// invented placeholder would be a claim we cannot back.
+///
+/// Two lengths, because the phrase shares one row with the tabs: on a standard
+/// 80-column terminal the tabs leave 21 columns, which the designed full
+/// wording does not fit. The short form keeps the half that changes what the
+/// human does — truncating instead would cut exactly that half off the end.
+fn mode_phrase(policy: Policy, budget: usize) -> Option<Span<'static>> {
+    let (full, short, style) = match (policy.mode, policy.origin) {
+        (PolicyMode::Unknown, _) => return None,
+        (PolicyMode::ReadOnly, _) => (
+            "только чтение",
+            "только чтение",
+            Style::new().fg(theme::high_risk()),
+        ),
+        (PolicyMode::Supervised, _) => ("ручной режим", "ручной", theme::label_style()),
+        (PolicyMode::Autonomous, PolicyOrigin::Acknowledged) => (
+            "автономный · подтверждён",
+            "подтверждён",
+            Style::new().fg(theme::accent()),
+        ),
+        (PolicyMode::Autonomous, PolicyOrigin::Provisioned) => (
+            "автономный · не подтверждён — отправки встают",
+            "не подтверждён",
+            Style::new()
+                .fg(theme::high_risk())
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+    let text = if full.chars().count() <= budget {
+        full
+    } else {
+        short
+    };
+    Some(Span::styled(text, style))
+}
+
+/// What the chrome needs to know about the wallet itself: who it is, and how it
+/// behaves. Travelling together because they are read together — the header
+/// states the policy, the card's From block states the address, and both are
+/// facts about this wallet rather than about the item being decided.
+#[derive(Clone, Copy)]
+struct WalletView<'a> {
+    address: Option<&'a str>,
+    policy: Policy,
+}
+
+/// The header row: tabs on the left, the wallet's autonomy on the right.
+///
+/// The phrase is on **every** screen, not only the one that can act on it —
+/// Q5's rule is that the mode is loud at every use, not readable on request.
+/// It is pushed right by padding rather than by a nested layout so the tab
+/// bar's own geometry (and with it the card's, §`watch_chunks`) is untouched.
+/// When the phrase cannot fit at all, the tabs win: navigation must not be
+/// unreachable, and the state still has the Dashboard banner.
+fn header_line(active: View, pending: usize, policy: Policy, width: u16) -> Line<'static> {
+    let mut line = tab_line(active, pending);
+    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let width = usize::from(width);
+    let Some(budget) = width.checked_sub(used + 1) else {
+        return line;
+    };
+    let Some(phrase) = mode_phrase(policy, budget) else {
+        return line;
+    };
+    let len = phrase.content.chars().count();
+    if len > budget {
+        return line;
+    }
+    line.spans.push(Span::raw(" ".repeat(width - used - len)));
+    line.spans.push(phrase);
+    line
 }
 
 /// The nav-shell tab bar — one line, both registered views with their keys,
@@ -210,7 +300,7 @@ fn render_watch(
     selected: usize,
     confirm: Option<&Confirm>,
     notice: Option<&Notice>,
-    wallet: Option<&str>,
+    wallet: WalletView<'_>,
     now_unix: u64,
 ) {
     let chunks = watch_chunks(frame.area(), confirm.is_some(), notice.is_some());
@@ -218,7 +308,12 @@ fn render_watch(
     // The tab bar lives in the header row the layout already had — the card's
     // geometry (and with it `priority_fields_fit`) is untouched by nav-shell.
     frame.render_widget(
-        Paragraph::new(tab_line(View::Queue, items.len())),
+        Paragraph::new(header_line(
+            View::Queue,
+            items.len(),
+            wallet.policy,
+            frame.area().width,
+        )),
         chunks[0],
     );
 
@@ -227,7 +322,7 @@ fn render_watch(
     // The card chunk exists only while a confirmation is open, so everything
     // after it shifts by one — see `watch_chunks`.
     let actions_idx = if confirm.is_some() {
-        render_detail(frame, confirm, wallet, chunks[2]);
+        render_detail(frame, confirm, wallet.address, chunks[2]);
         3
     } else {
         2
@@ -235,7 +330,7 @@ fn render_watch(
     // The same fit the model gates approve on (`priority_fields_fit`), taken
     // from the very chunk the card is drawn into. With no card open there is
     // nothing to gate: `is_none_or` answers true and no chunk is consulted.
-    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, wallet, chunks[2]));
+    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, wallet.address, chunks[2]));
     render_actions(frame, confirm, approve_ok, now_unix, chunks[actions_idx]);
 
     if let Some(notice) = notice {
@@ -395,9 +490,17 @@ fn kind_word(s: &Summary) -> &'static str {
 /// Degraded context (`wallet_locked`, an old server — `None` here) and an
 /// empty address (`parse_context` rejects a missing one, not an empty one)
 /// show "no receive address": a QR of nothing must never be fabricated.
-fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
+fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>, policy: Policy) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
-    frame.render_widget(Paragraph::new(tab_line(View::Receive, pending)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(header_line(
+            View::Receive,
+            pending,
+            policy,
+            frame.area().width,
+        )),
+        chunks[0],
+    );
 
     let block = themed_block(" Receive ");
     let inner = block.inner(chunks[1]);
@@ -479,7 +582,15 @@ fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
 /// clip (the Stage-5 budget lesson: exact-fit vs marker split, one budget).
 fn render_activity(frame: &mut Frame, pending: usize, model: &Model, now_unix: u64) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
-    frame.render_widget(Paragraph::new(tab_line(View::Activity, pending)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(header_line(
+            View::Activity,
+            pending,
+            model.policy(),
+            frame.area().width,
+        )),
+        chunks[0],
+    );
 
     let block = themed_block(" Activity ");
     let inner = block.inner(chunks[1]);
@@ -596,7 +707,12 @@ fn age_label(now_unix: u64, unix: u64) -> String {
 fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
     frame.render_widget(
-        Paragraph::new(tab_line(View::Dashboard, pending)),
+        Paragraph::new(header_line(
+            View::Dashboard,
+            pending,
+            model.policy(),
+            frame.area().width,
+        )),
         chunks[0],
     );
 
@@ -1258,6 +1374,125 @@ mod tests {
     /// A session whose `context` answered ok with an EMPTY address string —
     /// distinct from a degraded context: `parse_context` rejects a missing
     /// address but passes `""` through (T2).
+    /// [`to_watching`] with an explicit policy — the header states the pair, so
+    /// its tests need to set it.
+    fn to_watching_with_policy(model: &mut Model, policy: Policy) {
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        model.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        model.update(Msg::PinDigit('1'));
+        model.update(Msg::PinSubmit);
+        model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+                policy,
+            },
+        )))));
+        model.update(Msg::Tick);
+        model.update(Msg::Reply(Reply::List(vec![])));
+    }
+
+    fn policy_of(mode: PolicyMode, origin: PolicyOrigin) -> Policy {
+        Policy { mode, origin }
+    }
+
+    /// Q5: the mode is loud at every use. It is stated on every screen, not
+    /// only the one that can act on it.
+    #[test]
+    fn the_header_states_the_wallets_autonomy_on_every_screen() {
+        for view in [
+            crate::app::View::Dashboard,
+            crate::app::View::Queue,
+            crate::app::View::Receive,
+            crate::app::View::Activity,
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(
+                &mut model,
+                policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+            );
+            model.update(Msg::View(view));
+            let header = draw_rows(&model, 80, 24)[0].clone();
+            assert!(
+                header.contains("не подтверждён"),
+                "{view:?} must state it too: {header}"
+            );
+        }
+    }
+
+    /// The Reviewer's criterion, and the whole point of the phrase: the alarm
+    /// colour marks exactly one state — the one where the human's expectation
+    /// and the wallet's behaviour come apart. Acknowledged autonomy is the
+    /// human's own choice, not a warning; painting it red would spend the
+    /// signal. Text alone cannot catch this — a swap of `high_risk()` for
+    /// `accent()` renders fine and reads fine.
+    #[test]
+    fn the_alarm_colour_marks_only_unacknowledged_autonomy() {
+        let alarm = theme::high_risk();
+        for (mode, origin, needle, expect_alarm) in [
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+                "не подтверждён",
+                true,
+            ),
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Acknowledged,
+                "подтверждён",
+                false,
+            ),
+            (
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+                "ручной",
+                false,
+            ),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            let fgs = row_fgs_containing(&model, 80, 24, needle);
+            assert_eq!(
+                fgs.contains(&alarm),
+                expect_alarm,
+                "{mode:?}/{origin:?} alarm-coloured? expected {expect_alarm}"
+            );
+        }
+    }
+
+    /// Before the first `context` reply the console has not been told the mode.
+    /// It says nothing rather than inventing a placeholder — an invented one is
+    /// a claim about whether this wallet spends by itself.
+    #[test]
+    fn an_unknown_mode_states_nothing() {
+        let mut model = Model::default();
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        model.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        model.update(Msg::PinDigit('1'));
+        model.update(Msg::PinSubmit);
+        model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        let header = draw_rows(&model, 80, 24)[0].clone();
+        for word in ["подтверждён", "ручной", "только чтение", "автономный"]
+        {
+            assert!(
+                !header.contains(word),
+                "nothing is known yet, so nothing is claimed: {header}"
+            );
+        }
+    }
+
     fn to_watching_empty_address(model: &mut Model, items: Vec<Summary>) {
         model.update(Msg::Resize {
             width: 80,
