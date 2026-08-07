@@ -15,13 +15,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire protocol major version this client speaks. Proto 2 adds the auth-gated
-/// `context` read-op (protocol §3.7) — the source of the wallet's own address
-/// for the card's From→To block. There is deliberately no fallback to proto 1
-/// against an older server: the wallet image ships core and console as a pair,
-/// so a mismatch means a hand-built setup — the honest answer is the upgrade
-/// hint, not a silently poorer card (Gate-1 ratification, 2026-07-12).
-pub const PROTO_VERSION: u32 = 2;
+/// Wire protocol major version this client speaks. Proto 3 adds `ack`
+/// (protocol §3.10) — the operation by which a human confirms an autonomous
+/// mode the core's volume-shape heuristic assigned on its own — together with
+/// the `policy_mode` / `policy_origin` pair on `context` (§3.7). Proto 2 had
+/// added the auth-gated read-ops, `context` among them.
+///
+/// **There is deliberately no fallback to an older proto against an older
+/// server: the wallet image ships core and console as a pair, so a mismatch
+/// means a hand-built setup — the honest answer is the upgrade hint, not a
+/// silently poorer card (Gate-1 ratification, 2026-07-12).** Re-confirmed when
+/// proto 3 landed (2026-08-07) by re-measuring the premise rather than
+/// trusting it: `Dockerfile.wallet` copies this binary in from a pinned
+/// console image tag and lays it beside `core-server`, so the two versions are
+/// locked together by the image build. A reconnect-and-degrade branch would be
+/// machinery for a case the deployment does not produce.
+pub const PROTO_VERSION: u32 = 3;
 
 // ─────────────────────────── Requests (client → server) ───────────────────────────
 
@@ -859,7 +868,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            r#"{"op":"hello","proto":2,"client":"rustok-console/0.0.1"}"#
+            r#"{"op":"hello","proto":3,"client":"rustok-console/0.0.1"}"#
         );
     }
 

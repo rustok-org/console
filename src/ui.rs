@@ -169,27 +169,35 @@ fn auth_error_text(err: &AuthError) -> String {
 /// would take its space from the card, and the card is the one thing on this
 /// screen whose priority fields must never leave the screen (`AGENTS.md` #1).
 ///
-/// While a confirmation is open the card is the decision surface: the queue
-/// collapses to a single-item strip (the List keeps the selection in view)
-/// and the card takes every remaining row. Splitting the height evenly would
-/// starve the card of the rows its risk warnings and PIN prompt need on a
-/// 24-row terminal.
+/// The screen has two shapes, and the card exists in only one of them.
+///
+/// **Confirmation open** — the card is the decision surface: the queue
+/// collapses to a single-item strip (the List keeps the selection in view) and
+/// the card takes every remaining row. Splitting the height evenly would starve
+/// the card of the rows its risk warnings and PIN prompt need on a 24-row
+/// terminal.
+///
+/// **Confirmation closed** — there is no card row at all, and the queue takes
+/// the whole middle. The rows the card needs are needed only while it is open,
+/// and by then the queue has already collapsed and freed them: a permanent
+/// reserve was protecting a case in which the reserve is not required. The
+/// "enter to open" hint moves to the navigation row, which is one row, not six.
 fn watch_chunks(
     area: ratatui::layout::Rect,
     confirm_open: bool,
     has_note: bool,
 ) -> std::rc::Rc<[ratatui::layout::Rect]> {
-    let queue_rows = if confirm_open {
-        Constraint::Length(3) // borders + the selected row
+    let mut constraints = vec![Constraint::Length(1)]; // header
+    if confirm_open {
+        constraints.push(Constraint::Length(3)); // queue: borders + selected row
+        constraints.push(Constraint::Min(6)); // card
     } else {
-        Constraint::Min(3)
-    };
-    let mut constraints = vec![
-        Constraint::Length(1), // header
-        queue_rows,            // queue
-        Constraint::Min(6),    // card / hint
-        Constraint::Length(1), // decision row / navigation hint
-    ];
+        // No card, no reserve: the list takes the rows the card used to hold
+        // empty, and the "enter to open" hint lives in the navigation row
+        // below — one row is all it needs.
+        constraints.push(Constraint::Min(3)); // queue
+    }
+    constraints.push(Constraint::Length(1)); // decision row / navigation hint
     if has_note {
         constraints.push(Constraint::Length(1)); // transient note
     }
@@ -215,14 +223,23 @@ fn render_watch(
     );
 
     render_queue(frame, items, selected, chunks[1]);
-    render_detail(frame, confirm, wallet, chunks[2]);
+
+    // The card chunk exists only while a confirmation is open, so everything
+    // after it shifts by one — see `watch_chunks`.
+    let actions_idx = if confirm.is_some() {
+        render_detail(frame, confirm, wallet, chunks[2]);
+        3
+    } else {
+        2
+    };
     // The same fit the model gates approve on (`priority_fields_fit`), taken
-    // from the very chunk the card is drawn into.
+    // from the very chunk the card is drawn into. With no card open there is
+    // nothing to gate: `is_none_or` answers true and no chunk is consulted.
     let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, wallet, chunks[2]));
-    render_actions(frame, confirm, approve_ok, now_unix, chunks[3]);
+    render_actions(frame, confirm, approve_ok, now_unix, chunks[actions_idx]);
 
     if let Some(notice) = notice {
-        frame.render_widget(Paragraph::new(notice_line(notice)), chunks[4]);
+        frame.render_widget(Paragraph::new(notice_line(notice)), chunks[actions_idx + 1]);
     }
 }
 
@@ -1058,7 +1075,7 @@ mod tests {
     use super::*;
     use crate::app::{Model, Msg};
     use crate::protocol::{
-        AuthOutcome, Card, ContextOutcome, DecodedCall, Kind, Risk, WalletContext,
+        AuthOutcome, Card, ContextOutcome, DecodedCall, GetOutcome, Kind, Risk, WalletContext,
     };
     use crate::transport::Reply;
     use ratatui::Terminal;
@@ -1125,6 +1142,74 @@ mod tests {
     fn has_line_with(rows: &[String], fragments: &[&str]) -> bool {
         rows.iter()
             .any(|row| fragments.iter().all(|f| row.contains(f)))
+    }
+
+    /// The Captain's question, as a test: the bottom block must not hold rows
+    /// while there is nothing in it. The card earns its space in the moment of
+    /// a decision and gives it back when the decision is over — the property
+    /// `watch_chunks` protects (rows for risk warnings and the PIN prompt on a
+    /// 24-row terminal) is needed only while the card is open, and by then the
+    /// queue has already collapsed to a strip and freed them.
+    #[test]
+    fn a_closed_card_reserves_no_rows() {
+        let mut model = Model::default();
+        to_watching(
+            &mut model,
+            (0..18)
+                .map(|i| {
+                    summary(
+                        &format!("{i:08}-0000-0000-0000-000000000000"),
+                        "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                        "1000000000000000000",
+                        false,
+                    )
+                })
+                .collect(),
+        );
+        let rows = draw_rows(&model, 80, 24);
+        let screen = rows.join("\n");
+        assert!(
+            !screen.contains("Card"),
+            "no card block while none is open:\n{screen}"
+        );
+        assert!(
+            !screen.contains("press enter to see the full card"),
+            "the hint belongs in the navigation row, not in six reserved rows:\n{screen}"
+        );
+
+        // And the rows it used to hold go to the list.
+        let listed = rows.iter().filter(|r| r.contains("0x8b3E")).count();
+        assert!(
+            listed >= 18,
+            "every waiting item fits once the reserve is gone, saw {listed}:\n{screen}"
+        );
+    }
+
+    /// The reverse side: with a card open the protected geometry is unchanged —
+    /// the queue collapses to a strip and the card takes the rest.
+    #[test]
+    fn an_open_card_still_gets_its_rows() {
+        let mut model = Model::default();
+        to_watching(
+            &mut model,
+            vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )],
+        );
+        model.update(Msg::Open);
+        model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+            "00000000-0000-0000-0000-000000000000",
+            NOW + 300,
+            false,
+        )))));
+        let screen = draw_rows(&model, 80, 24).join("\n");
+        assert!(
+            screen.contains("Card"),
+            "an open card must be drawn:\n{screen}"
+        );
     }
 
     fn summary(id: &str, to: &str, amount: &str, high_risk: bool) -> Summary {
