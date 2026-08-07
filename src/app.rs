@@ -1008,8 +1008,13 @@ impl Model {
         if self.awaiting_card || matches!(self.pending, Some(PendingIntent::Get(_))) {
             return;
         }
+        // Both guards are stated, not assumed: the key map cannot produce this
+        // message while a card or the confirmation prompt is up, and the model
+        // refuses it anyway. A message the model accepts is a message some
+        // future caller will send.
         if let Phase::Watching {
             confirm: None,
+            ack: None,
             view: current,
             ..
         } = &mut self.phase
@@ -1811,6 +1816,25 @@ mod tests {
         )))));
         m.update(Msg::View(View::Dashboard));
         m
+    }
+
+    /// The model refuses the navigation itself, not only the key map.
+    ///
+    /// The key map already cannot produce `View` while the prompt is up, and
+    /// today that is enough. The second layer exists because the rest of this
+    /// codebase states it as a principle rather than an extra: the card's
+    /// screen guard is two-layered for the same reason, and a message the
+    /// model accepts is a message some future caller will send.
+    #[test]
+    fn the_model_refuses_to_navigate_away_from_an_open_confirmation() {
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::AckStart);
+        m.update(Msg::View(View::Queue));
+        let Phase::Watching { view, ack, .. } = m.phase() else {
+            panic!("still watching");
+        };
+        assert_eq!(*view, View::Dashboard, "the screen did not move");
+        assert!(ack.is_some(), "and the prompt is still up");
     }
 
     /// Design §3: the invitation exists only where there is something to
