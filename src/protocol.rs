@@ -559,6 +559,75 @@ pub fn parse_hello(line: &str) -> Result<HelloOutcome, ProtocolError> {
 /// # Errors
 /// [`ProtocolError::Malformed`] on non-JSON / wrong shape; [`ProtocolError::Unexpected`]
 /// on an unmodeled error code.
+/// Outcome of `ack` (§3.10) — confirming this wallet's autonomous mode.
+///
+/// Deliberately a separate type from [`AuthOutcome`] even though the PIN-family
+/// answers coincide: `ack` also answers `not_autonomous` and
+/// `policy_store_failed`, and one shared type would let an `auth` handler
+/// silently accept an outcome that only makes sense here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The mode is confirmed — and stays confirmed across restarts.
+    Confirmed,
+    /// Wrong PIN; `attempts_left == 0` means the lockout is now armed.
+    BadPin {
+        /// Attempts before the lockout trips.
+        attempts_left: u32,
+    },
+    /// Lockout active; retry after this many seconds.
+    Locked {
+        /// Seconds until the channel accepts a PIN again.
+        retry_after_s: u64,
+    },
+    /// The wallet has no PIN record.
+    PinNotSet,
+    /// Transient Argon2 backend failure — never an accept.
+    PinUnavailable,
+    /// Not an autonomous wallet: nothing to confirm. `ack` confirms an existing
+    /// mode and never switches one.
+    NotAutonomous,
+    /// The core could not persist the policy and left it unchanged on purpose —
+    /// a confirmation that lasted only until the next restart would be worse
+    /// than a visible failure.
+    StoreFailed,
+}
+
+/// Parse an `ack` reply (§3.10).
+///
+/// # Errors
+/// [`ProtocolError::Unexpected`] for anything the canon does not list —
+/// including `unauthorized` and `protocol_error`, which mean the channel is not
+/// what we negotiated. This op lifts the parking gate for good, so an answer we
+/// do not understand is never read as a confirmation.
+pub fn parse_ack(line: &str) -> Result<AckOutcome, ProtocolError> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ok: bool,
+        error: Option<String>,
+        attempts_left: Option<u32>,
+        retry_after_s: Option<u64>,
+    }
+    let raw: Raw = parse_line(line)?;
+    if raw.ok {
+        return Ok(AckOutcome::Confirmed);
+    }
+    match raw.error.as_deref() {
+        Some("bad_pin") => Ok(AckOutcome::BadPin {
+            attempts_left: raw.attempts_left.unwrap_or(0),
+        }),
+        Some("locked") => Ok(AckOutcome::Locked {
+            retry_after_s: raw.retry_after_s.unwrap_or(0),
+        }),
+        Some("pin_not_set") => Ok(AckOutcome::PinNotSet),
+        Some("pin_unavailable") => Ok(AckOutcome::PinUnavailable),
+        Some("not_autonomous") => Ok(AckOutcome::NotAutonomous),
+        Some("policy_store_failed") => Ok(AckOutcome::StoreFailed),
+        other => Err(ProtocolError::Unexpected(
+            other.unwrap_or("ack without ok or error").to_owned(),
+        )),
+    }
+}
+
 pub fn parse_auth(line: &str) -> Result<AuthOutcome, ProtocolError> {
     #[derive(Deserialize)]
     struct Raw {
@@ -901,6 +970,71 @@ mod tests {
         // decimal wei string, verbatim — never re-based here
         assert_eq!(ctx.balances[0].balance, "1000000000000000000");
         assert_eq!(ctx.allowed_chains, vec![1, 8453]);
+    }
+
+    /// Every answer §3.10 lists, transcribed from the protocol canon rather
+    /// than from whatever the parser happens to accept.
+    #[test]
+    fn parse_ack_covers_every_documented_answer() {
+        for (line, expected) in [
+            (
+                r#"{"ok":true,"mode":"autonomous","origin":"acknowledged"}"#,
+                AckOutcome::Confirmed,
+            ),
+            (
+                r#"{"ok":false,"error":"bad_pin","attempts_left":2}"#,
+                AckOutcome::BadPin { attempts_left: 2 },
+            ),
+            (
+                r#"{"ok":false,"error":"locked","retry_after_s":287}"#,
+                AckOutcome::Locked { retry_after_s: 287 },
+            ),
+            (
+                r#"{"ok":false,"error":"pin_not_set"}"#,
+                AckOutcome::PinNotSet,
+            ),
+            (
+                r#"{"ok":false,"error":"pin_unavailable"}"#,
+                AckOutcome::PinUnavailable,
+            ),
+            (
+                r#"{"ok":false,"error":"not_autonomous"}"#,
+                AckOutcome::NotAutonomous,
+            ),
+            (
+                r#"{"ok":false,"error":"policy_store_failed"}"#,
+                AckOutcome::StoreFailed,
+            ),
+        ] {
+            assert_eq!(parse_ack(line).unwrap(), expected, "line: {line}");
+        }
+    }
+
+    /// An answer the canon does not list is not silently read as success —
+    /// this is the one op that lifts the parking gate for good.
+    #[test]
+    fn an_unknown_ack_answer_is_never_a_confirmation() {
+        for line in [
+            r#"{"ok":false,"error":"unauthorized"}"#,
+            r#"{"ok":false,"error":"protocol_error"}"#,
+            r#"{"ok":false}"#,
+        ] {
+            assert!(
+                parse_ack(line).is_err(),
+                "must not resolve to an outcome: {line}"
+            );
+        }
+    }
+
+    /// §3.10 — the PIN rides on the operation itself, and the line is built in
+    /// a zeroizing buffer like `auth`, never through the general Serialize path.
+    #[test]
+    fn the_ack_line_carries_the_pin_and_nothing_else() {
+        let mut pin = crate::app::Pin::default();
+        for c in "483920".chars() {
+            pin.push(c);
+        }
+        assert_eq!(&*pin.ack_line(), r#"{"op":"ack","pin":"483920"}"#);
     }
 
     /// §3.7: the mode and its origin are ONE statement. A wallet reported as

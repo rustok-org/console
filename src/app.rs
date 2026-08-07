@@ -104,6 +104,25 @@ impl Pin {
         line
     }
 
+    /// Build the `ack` request line into a `Zeroizing` buffer (protocol §3.10).
+    ///
+    /// Same construction as [`Self::auth_line`] and for the same reason — the
+    /// PIN must never exist in an un-zeroized `String`. The op carries the PIN
+    /// itself rather than leaning on the session `auth`: one `ack` lifts the
+    /// parking gate for good, while an `approve` releases one transaction.
+    #[must_use]
+    pub fn ack_line(&self) -> Zeroizing<String> {
+        const PREFIX: &str = r#"{"op":"ack","pin":""#;
+        const SUFFIX: &str = r#""}"#;
+        let mut line = Zeroizing::new(String::with_capacity(
+            PREFIX.len() + self.0.len() + SUFFIX.len(),
+        ));
+        line.push_str(PREFIX);
+        line.push_str(&self.0);
+        line.push_str(SUFFIX);
+        line
+    }
+
     /// Build the high-risk `approve` request line into a `Zeroizing` buffer.
     ///
     /// The `id` goes through serde (so it is quoted and escaped by the same code
