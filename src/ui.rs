@@ -69,10 +69,17 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
 /// this wallet; before the first `context` reply lands there is no fact, and an
 /// invented placeholder would be a claim we cannot back.
 ///
-/// Two lengths, because the phrase shares one row with the tabs: on a standard
-/// 80-column terminal the tabs leave 21 columns, which the designed full
-/// wording does not fit. The short form keeps the half that changes what the
-/// human does — truncating instead would cut exactly that half off the end.
+/// Two lengths, because the phrase shares one row with the tabs, and **both of
+/// them are ratified strings** — the long one transcribed from the design
+/// decision (§2), the short one approved with it. No third, in-between wording
+/// is invented here: a paraphrase in the one place that carries the alarm
+/// colour is exactly the kind of drift nobody notices.
+///
+/// The tabs take 59 columns, so the long form needs roughly 115 to appear; a
+/// standard 80-column terminal leaves 21 and gets the short one. The short form
+/// keeps the half that changes what the human does, and the instruction itself
+/// lives in the Dashboard banner — truncating the long form instead would cut
+/// exactly that half off the end.
 fn mode_phrase(policy: Policy, budget: usize) -> Option<Span<'static>> {
     let (full, short, style) = match (policy.mode, policy.origin) {
         (PolicyMode::Unknown, _) => return None,
@@ -88,7 +95,7 @@ fn mode_phrase(policy: Policy, budget: usize) -> Option<Span<'static>> {
             Style::new().fg(theme::accent()),
         ),
         (PolicyMode::Autonomous, PolicyOrigin::Provisioned) => (
-            "автономный · не подтверждён — отправки встают",
+            "автономный · не подтверждён — отправки встают в очередь",
             "не подтверждён",
             Style::new()
                 .fg(theme::high_risk())
@@ -1465,6 +1472,33 @@ mod tests {
                 "{mode:?}/{origin:?} alarm-coloured? expected {expect_alarm}"
             );
         }
+    }
+
+    /// The ratified phrase, transcribed from the design decision (§2 table) and
+    /// not from the code: this is the one string in the slice that carries the
+    /// alarm colour, so it earns literal accuracy rather than a paraphrase.
+    ///
+    /// Wide terminals are where it renders — the tabs take 59 columns, so the
+    /// full wording needs ~115. Narrower ones get the approved short form,
+    /// which is a different question from whether the designed phrase exists at
+    /// all.
+    #[test]
+    fn the_designed_alarm_phrase_renders_verbatim_when_it_fits() {
+        const DESIGNED: &str = "автономный · не подтверждён — отправки встают в очередь";
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Resize {
+            width: 120,
+            height: 24,
+        });
+        let header = draw_rows(&model, 120, 24)[0].clone();
+        assert!(
+            header.contains(DESIGNED),
+            "the ratified wording must be reachable, not only a paraphrase of it:\n{header}"
+        );
     }
 
     /// Before the first `context` reply the console has not been told the mode.
