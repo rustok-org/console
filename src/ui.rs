@@ -7,13 +7,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     AuthError, Confirm, DecisionKind, HistoryEntry, Model, Notice, Phase, Positions, ResolveError,
     View,
 };
-use crate::protocol::{Card, OutcomeState, Policy, PolicyMode, PolicyOrigin, Summary};
+use crate::protocol::{Card, Kind, OutcomeState, Policy, PolicyMode, PolicyOrigin, Summary};
 use crate::{format, qr, theme};
 
 /// Render the whole screen for the current model.
@@ -443,42 +443,79 @@ fn render_queue(
     selected: usize,
     area: ratatui::layout::Rect,
 ) {
-    let block = themed_block(" Queue ");
+    let title = format!(" Queue — {} waiting for your decision ", items.len());
+    let block = themed_block(if items.is_empty() { " Queue " } else { &title });
     if items.is_empty() {
         let empty = Paragraph::new("Queue is empty — waiting for approval requests…").block(block);
         frame.render_widget(empty, area);
         return;
     }
-    let rows: Vec<ListItem> = items
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "  KIND    AMOUNT             RECIPIENT        NETWORK",
+            Style::new().fg(theme::faint()),
+        )),
+        split[0],
+    );
+
+    let rows: Vec<(String, bool)> = items
         .iter()
         .map(|s| {
-            let flag = if s.high_risk { "⚠ " } else { "  " };
-            let text = format!(
-                "{flag}{kind:5} {to}  {amount} wei",
-                kind = kind_word(s),
-                to = s.to,
-                amount = s.amount_wei
-            );
-            // A high-risk item is amber even in the list, so danger reads before
-            // the card is opened.
-            if s.high_risk {
-                ListItem::new(Span::styled(text, Style::new().fg(theme::high_risk())))
+            // Danger reads before the card is opened, so the marker carries it
+            // and the whole row takes the alarm colour.
+            let marker = if s.high_risk { '◆' } else { '●' };
+            // Money first, kind second. A call CAN carry native value, and a
+            // column that says only "contract" would hide it — the same rule
+            // the card follows: a zero native value is not headlined, a
+            // non-zero one always is. (`wei_to_eth` already carries the unit.)
+            let amount = if format::is_zero_wei(&s.amount_wei) && s.kind == Kind::Call {
+                "contract".to_owned()
             } else {
-                ListItem::new(text)
-            }
+                format::wei_to_eth(&s.amount_wei)
+            };
+            let text = format!(
+                "{marker} {kind:6}  {amount:<18} → {to:<16} {net}",
+                kind = kind_word(s),
+                to = format::short_addr(&s.to),
+                net = format::network_name(s.chain_id),
+            );
+            (text, s.high_risk)
         })
         .collect();
-    let mut state = ListState::default();
-    state.select(Some(selected.min(items.len().saturating_sub(1))));
-    let list = List::new(rows)
-        .block(block)
-        .highlight_symbol("▶ ")
-        .highlight_style(
-            Style::new()
-                .fg(theme::accent())
-                .add_modifier(Modifier::REVERSED),
-        );
-    frame.render_stateful_widget(list, area, &mut state);
+    let cursor = selected.min(items.len().saturating_sub(1));
+    // The bar is drawn as content rather than through `highlight_symbol`,
+    // because a highlight style repaints the whole row and would swallow the
+    // amber that carries risk. Bar in accent, row in its own colour, bold on
+    // the selected one — never inversion, which fights the light theme (§5).
+    let rows: Vec<ListItem> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (text, high_risk))| {
+            let mut style = if high_risk {
+                Style::new().fg(theme::high_risk())
+            } else {
+                Style::new()
+            };
+            if i == cursor {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let bar = if i == cursor {
+                Span::styled(
+                    "▌ ",
+                    Style::new()
+                        .fg(theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            ListItem::new(Line::from(vec![bar, Span::styled(text, style)]))
+        })
+        .collect();
+    frame.render_widget(List::new(rows), split[1]);
 }
 
 fn kind_word(s: &Summary) -> &'static str {
@@ -1660,6 +1697,100 @@ mod tests {
         }
     }
 
+    /// Text modifiers on the first row containing `needle`. The design says the
+    /// selection is a marker plus bold and **not** inversion (inversion fights
+    /// the light theme) — a property no colour or text check can hold.
+    fn row_mods_containing(model: &Model, w: u16, h: u16, needle: &str) -> Modifier {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains(needle) {
+                return (0..w).fold(Modifier::empty(), |acc, x| {
+                    acc | buffer[(x, y)].style().add_modifier
+                });
+            }
+        }
+        Modifier::empty()
+    }
+
+    fn queued(model: &mut Model, policy: Policy) {
+        to_watching_with_policy(model, policy);
+        model.update(Msg::Reply(Reply::List(vec![
+            {
+                let mut s = summary(
+                    "00000000-0000-0000-0000-000000000000",
+                    "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                    "1500000000000000000",
+                    true,
+                );
+                s.chain_id = 8453;
+                s
+            },
+            summary(
+                "11111111-1111-1111-1111-111111111111",
+                "0x1fA9c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9c4D2",
+                "420000000000000000",
+                false,
+            ),
+        ])));
+        model.update(Msg::View(crate::app::View::Queue));
+    }
+
+    /// The queue is a table, and a table names its columns (mockup state 3).
+    #[test]
+    fn the_queue_names_its_columns() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        for column in ["KIND", "AMOUNT", "RECIPIENT", "NETWORK"] {
+            assert!(
+                screen.contains(column),
+                "column {column} missing:\n{screen}"
+            );
+        }
+    }
+
+    /// Danger reads before the card is opened: a high-risk row carries `◆` and
+    /// the alarm colour, an ordinary one carries `●`.
+    #[test]
+    fn risk_is_visible_in_the_list_itself() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains('◆'), "high-risk marker:\n{screen}");
+        assert!(screen.contains('●'), "ordinary marker:\n{screen}");
+        let fgs = row_fgs_containing(&model, 100, 24, "◆");
+        assert!(fgs.contains(&theme::high_risk()), "and it is amber");
+    }
+
+    /// Design §5: the selected row is a left bar plus bold — **not** inversion,
+    /// which fights the light theme.
+    #[test]
+    fn the_selected_row_is_barred_and_bold_never_inverted() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains('▌'), "the selection bar:\n{screen}");
+        let mods = row_mods_containing(&model, 100, 24, "▌");
+        assert!(mods.contains(Modifier::BOLD), "the selected row is bold");
+        assert!(
+            !mods.contains(Modifier::REVERSED),
+            "and never inverted — inversion fights the light theme"
+        );
+    }
+
     /// §4: the card says why this payment is waiting, and the answer follows
     /// from the pair (mode, origin) — the wire carries no reason field, and
     /// within one wallet the reason is the same for every parked item.
@@ -2010,17 +2141,21 @@ mod tests {
             )],
         );
         let rows = draw_rows(&m, 90, 20);
-        // Address AND decimal wei on the SAME line, verbatim — a swap would split
-        // them across lines.
+        // What this pins is the PAIRING: the recipient and the amount of the
+        // SAME item on one line, so a swap would split them across lines.
+        // The representation moved with the design — the queue is a reading
+        // list and shortens the address (as Activity already does), while the
+        // card stays the signing surface and shows it in full. The property
+        // did not move.
         assert!(
             has_line_with(
                 &rows,
                 &[
-                    "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
-                    "100000000000000000",
+                    &crate::format::short_addr("0x742d35Cc6634C0532925a3b844Bc454e4438f44e"),
+                    "0.1 ETH",
                 ],
             ),
-            "address and amount must render together, exactly as received"
+            "recipient and amount of one item must render together"
         );
     }
 

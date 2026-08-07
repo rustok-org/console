@@ -54,12 +54,31 @@ pub fn is_zero_wei(wei: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|b| b == b'0')
 }
 
+/// Human name for an EVM chain id, or the id itself when we do not know it.
+///
+/// Display formatting, not re-derivation (`AGENTS.md` #1): the core's value is
+/// the id, and an unknown one is shown as the number rather than guessed at —
+/// a wrong chain name on a payment screen is worse than a bare number.
+#[must_use]
+pub fn network_name(chain_id: u64) -> String {
+    match chain_id {
+        1 => "Ethereum".to_owned(),
+        8453 => "Base".to_owned(),
+        other => format!("chain {other}"),
+    }
+}
+
 /// Shorten an address for a DISPLAY-LIST row: `0x489Fe0…bbbb` (first 6 + last 4
 /// hex digits, EIP-55 casing preserved verbatim). **Never on a signing or
 /// approving surface** — the card, From→To and Receive render addresses in full
-/// (address poisoning; ТЗ §4.1): this exists for the Activity list only, where
-/// the row is display, not a decision. Input without a `0x` prefix, non-ASCII,
-/// or too short to save space is returned verbatim (display never crashes).
+/// (address poisoning; ТЗ §4.1).
+///
+/// Display lists, as of design §4 (2026-08-07): Activity, and the queue. The
+/// boundary did not move — the queue is scanned, and the decision is made on
+/// the card, which still shows the address in full. What changed is that a
+/// second list exists, not that a decision surface started shortening.
+/// Input without a `0x` prefix, non-ASCII, or too short to save space is
+/// returned verbatim (display never crashes).
 #[must_use]
 pub fn short_addr(addr: &str) -> String {
     match addr.strip_prefix("0x") {
