@@ -453,7 +453,15 @@ fn render_queue(
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    // Collapsed to a strip (a card is open): one row of inner space cannot hold
+    // both the heading and the item it heads, and the strip exists to show the
+    // item. Between the two, the item wins.
+    let collapsed = inner.height <= 1;
+    let split = if collapsed {
+        Layout::vertical([Constraint::Length(0), Constraint::Min(0)]).split(inner)
+    } else {
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner)
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(
             // The two leading columns are the ones the selection bar occupies
@@ -524,6 +532,30 @@ fn render_queue(
             ListItem::new(Line::from(vec![bar, Span::styled(text, style)]))
         })
         .collect();
+    // A window around the cursor, kept by hand rather than by `ListState`:
+    // the stateful widget brings `highlight_style` back with it, and that
+    // style repaints the whole row — which is what swallowed the amber on a
+    // selected high-risk item once already. The bar is content here, so the
+    // scrolling has to be content too.
+    let view_rows = usize::from(split[1].height);
+    let (rows, hidden) = if view_rows == 0 || rows.len() <= view_rows {
+        (rows, 0)
+    } else {
+        // Leave the last row for the marker, and keep the cursor inside.
+        let shown = view_rows - 1;
+        let start = cursor
+            .saturating_sub(shown.saturating_sub(1))
+            .min(rows.len().saturating_sub(shown));
+        let hidden = rows.len() - shown;
+        (rows[start..start + shown].to_vec(), hidden)
+    };
+    let mut rows = rows;
+    if hidden > 0 {
+        rows.push(ListItem::new(Span::styled(
+            format!("  +{hidden} more — terminal too small"),
+            Style::new().fg(theme::faint()),
+        )));
+    }
     frame.render_widget(List::new(rows), split[1]);
 }
 
@@ -1915,6 +1947,81 @@ mod tests {
         model.update(Msg::View(crate::app::View::Queue));
         let screen = draw_rows(&model, 100, 24).join("\n");
         assert!(screen.contains("expired"), "{screen}");
+    }
+
+    /// Б-3: the list must follow the cursor. Kimi walked 39 items down and the
+    /// selection bar left the screen entirely — the human is deciding on a
+    /// payment they cannot see. The queue is where duplicates pile up when
+    /// autonomy is unconfirmed, which this wave documents as expected, so a
+    /// long queue is not a corner case here.
+    #[test]
+    fn the_queue_follows_the_cursor_and_says_what_is_hidden() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let items: Vec<_> = (0..40)
+            .map(|i| {
+                let mut s = summary(
+                    &format!("{i:08}-0000-0000-0000-000000000000"),
+                    "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                    "1000000000000000000",
+                    false,
+                );
+                s.not_after_unix = NOW + 300;
+                s
+            })
+            .collect();
+        model.update(Msg::Reply(Reply::List(items)));
+        model.update(Msg::View(crate::app::View::Queue));
+
+        let top = draw_rows(&model, 100, 24).join("\n");
+        assert!(top.contains('▌'), "the bar is on screen at the top:\n{top}");
+        assert!(
+            top.contains("more — terminal too small"),
+            "and what is hidden is stated, as positions and activity do:\n{top}"
+        );
+
+        for _ in 0..39 {
+            model.update(Msg::MoveDown);
+        }
+        let bottom = draw_rows(&model, 100, 24).join("\n");
+        assert!(
+            bottom.contains('▌'),
+            "the bar must still be on screen at the far end:\n{bottom}"
+        );
+    }
+
+    /// И-1: with a card open the queue collapses to one row, and that row is
+    /// the selected item — the property the collapsed strip exists for. The
+    /// column header cannot also fit there, and between a heading and the item
+    /// it heads, the item wins.
+    #[test]
+    fn the_collapsed_strip_shows_the_item_not_the_heading() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::List(vec![summary(
+            "00000000-0000-0000-0000-000000000000",
+            "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+            "1000000000000000000",
+            false,
+        )])));
+        model.update(Msg::View(crate::app::View::Queue));
+        model.update(Msg::Open);
+        model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+            "00000000-0000-0000-0000-000000000000",
+            NOW + 300,
+            false,
+        )))));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(
+            screen.contains("0x8b3E"),
+            "the collapsed strip shows the selected item:\n{screen}"
+        );
     }
 
     /// The header and the rows are one table or they are not a table.
