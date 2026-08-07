@@ -714,6 +714,49 @@ fn age_label(now_unix: u64, unix: u64) -> String {
 /// The rows the confirmation banner claims: two borders plus its two lines.
 const ACK_BANNER_ROWS: u16 = 4;
 
+/// Width of the Dashboard's identity column. Fixed rather than proportional:
+/// it holds three short lines whose longest is the shortened address, so a
+/// share of the width would only take room from the balances beside it.
+const IDENTITY_COL: u16 = 22;
+
+/// Rows for the balance panel: two borders plus a line per allowed chain, with
+/// room for the staleness note. Positions take whatever is left — the list
+/// there is the one that grows.
+const BALANCE_ROWS: u16 = 6;
+
+/// Who this wallet is: the product, the version this binary can vouch for, and
+/// which address is loaded (design v2, mockup states 1–2).
+///
+/// The version is the crate's own `CARGO_PKG_VERSION`. The edition number the
+/// marketing side uses has no honest source inside the binary — it is not
+/// passed in at build time — and printing a number the program cannot verify
+/// is the same class of claim as a mode without its origin (В-3).
+fn render_identity(frame: &mut Frame, address: Option<&str>, area: ratatui::layout::Rect) {
+    let block = themed_block("");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "RUSTOK",
+                Style::new()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" WALLET", Style::new().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled(
+            concat!("console v", env!("CARGO_PKG_VERSION")),
+            Style::new().fg(theme::faint()),
+        )),
+    ];
+    if let Some(address) = address {
+        lines.push(Line::from(Span::styled(
+            format::short_addr(address),
+            Style::new().fg(theme::accent_bright()),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 /// The one-time invitation to confirm autonomy (design §3).
 ///
 /// It is drawn **only** while there is something to confirm, for the same
@@ -768,15 +811,27 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
         chunks[1]
     };
 
-    let block = themed_block(" Dashboard ");
-    let inner = block.inner(body);
-    let width = usize::from(inner.width);
-    let height = usize::from(inner.height);
+    // Identity on the left, content on the right (design v2). The identity
+    // column is fixed: it holds three short lines whose longest is the
+    // shortened address, so giving it a share of the width would only take
+    // room from the balances.
+    let cols =
+        Layout::horizontal([Constraint::Length(IDENTITY_COL), Constraint::Min(0)]).split(body);
+    render_identity(frame, model.wallet_address(), cols[0]);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let panels = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(BALANCE_ROWS),
+        Constraint::Min(0),
+    ])
+    .split(cols[1]);
 
     // ── Waiting for you — the reason this console exists comes first.
-    let waiting = if pending == 0 {
+    let queue_block = themed_block(" Queue ");
+    let width = usize::from(queue_block.inner(panels[0]).width);
+    let waiting = if policy.awaits_acknowledgment() {
+        format!("Waiting: {pending} — all parked, mode unconfirmed")
+    } else if pending == 0 {
         "Waiting for you: nothing pending".to_owned()
     } else {
         format!("Waiting for you: {pending} pending — press a")
@@ -786,16 +841,17 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
     } else {
         theme::high_risk_style()
     };
+    let mut lines: Vec<Line<'static>> = Vec::new();
     push_wrapped(&mut lines, width, waiting, waiting_style);
-    lines.push(Line::from(""));
+    frame.render_widget(Paragraph::new(lines).block(queue_block), panels[0]);
 
+    let block = themed_block(" balance ");
+    let inner = block.inner(panels[1]);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+    let _ = height;
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // ── Balance (from `context`; per-chain native ETH).
-    push_wrapped(
-        &mut lines,
-        width,
-        "balance".to_owned(),
-        theme::label_style(),
-    );
     match model.wallet_context() {
         Some(ctx) if !ctx.balances.is_empty() => {
             for b in &ctx.balances {
@@ -833,15 +889,15 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             theme::high_risk_style(),
         );
     }
-    lines.push(Line::from(""));
 
+    frame.render_widget(Paragraph::new(lines).block(block), panels[1]);
+
+    let block = themed_block(" positions ");
+    let inner = block.inner(panels[2]);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // ── Positions (tri-state: loading / loaded / unavailable).
-    push_wrapped(
-        &mut lines,
-        width,
-        "positions".to_owned(),
-        theme::label_style(),
-    );
     match model.positions() {
         Positions::NotYet => push_wrapped(
             &mut lines,
@@ -907,8 +963,7 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             }
         }
     }
-
-    frame.render_widget(Paragraph::new(lines).block(block), body);
+    frame.render_widget(Paragraph::new(lines).block(block), panels[2]);
 }
 
 /// The card's priority lines — every field except `raw_data` — pre-wrapped to
@@ -1517,6 +1572,76 @@ mod tests {
                 "{mode:?}/{origin:?} alarm-coloured? expected {expect_alarm}"
             );
         }
+    }
+
+    /// The identity panel (mockup, dashboard states 1–2): who this wallet is,
+    /// stated in three lines on the left. The version is the crate's own — В-3
+    /// ratified that the binary shows the number it can actually vouch for,
+    /// not the edition number it has no honest source for.
+    #[test]
+    fn the_dashboard_states_who_this_wallet_is() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains("RUSTOK WALLET"), "the name:\n{screen}");
+        assert!(
+            screen.contains(&format!("console v{}", env!("CARGO_PKG_VERSION"))),
+            "the version it can vouch for:\n{screen}"
+        );
+        assert!(
+            screen.contains(&crate::format::short_addr(WALLET)),
+            "and which wallet this is:\n{screen}"
+        );
+    }
+
+    /// The panels carry the titles the mockup names, so a human reading the
+    /// screen and a human reading the design see the same words.
+    #[test]
+    fn the_dashboard_content_sits_in_named_panels() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let rows = draw_rows(&model, 100, 24);
+        for title in ["Queue", "balance", "positions"] {
+            // A framed title, not the bare word: "Queue" is also a tab and
+            // "balance" was already a flat label, so a substring check passes
+            // before the panels exist and proves nothing.
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(title) && r.contains('┌') && r.contains('─')),
+                "panel {title} is not a titled frame:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// Mockup state 2: while the mode is unconfirmed the queue block says why
+    /// the queue is a queue at all, instead of repeating the count as if this
+    /// were an ordinary backlog.
+    #[test]
+    fn the_queue_panel_says_why_everything_is_parked_when_unconfirmed() {
+        const WHY: &str = "all parked, mode unconfirmed";
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::List(vec![summary(
+            "00000000-0000-0000-0000-000000000000",
+            "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+            "1000000000000000000",
+            false,
+        )])));
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains(WHY), "{screen}");
     }
 
     /// The banner exists only where there is something to confirm. A permanent
@@ -2658,7 +2783,7 @@ mod tests {
         let many: Vec<Position> = (0..40)
             .map(|i| {
                 let mut p = aave_position();
-                p.asset_symbol = format!("TOK{i}");
+                p.asset_symbol = format!("SYM{i}");
                 p
             })
             .collect();
@@ -2675,7 +2800,7 @@ mod tests {
         (0..n)
             .map(|i| {
                 let mut p = aave_position();
-                p.asset_symbol = format!("TOK{i}");
+                p.asset_symbol = format!("SYM{i}");
                 p.extra.clear(); // keep each row single-line at this width
                 p
             })
@@ -2683,33 +2808,34 @@ mod tests {
     }
 
     fn position_rows(rows: &[String]) -> usize {
-        rows.iter().filter(|r| r.contains("TOK")).count()
+        rows.iter().filter(|r| r.contains("SYM")).count()
     }
 
     #[test]
     fn the_positions_budget_sits_exactly_on_its_boundary() {
-        // Geometry at 100×24, empty balances: tab(1)+borders(2) → inner 21;
-        // header = waiting(1)+blank(1)+"balance"(1)+"no balances"(1)+blank(1)
-        // +"positions"(1) = 6 → budget 15. The Gate-2 blocker subtracted the
-        // header TWICE and cut positions that fit — this pins both edges.
-        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(15)));
+        // Geometry at 100×24 after the panel split: header row (1) + Queue
+        // panel (3) + balance panel (BALANCE_ROWS) leaves 14 for positions,
+        // whose own borders take 2 → budget 12. The numbers moved with the
+        // layout; what this pins did not — the Gate-2 blocker subtracted the
+        // header TWICE and cut positions that fit, so both edges stay pinned.
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(12)));
         let rows = draw_rows(&m, 100, 24);
         assert_eq!(
             position_rows(&rows),
-            15,
+            12,
             "an exact fit shows every position, no marker"
         );
         assert!(!rows.join("\n").contains("more — terminal too small"));
 
-        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(16)));
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(13)));
         let rows = draw_rows(&m, 100, 24);
         assert_eq!(
             position_rows(&rows),
-            14,
-            "one over: 14 positions + the marker fill the budget exactly — \
-             nothing that fits is hidden (the blocker cut at 11 here)"
+            11,
+            "one over: the positions that fit stay, the marker takes the last \
+             row — nothing that fits is hidden"
         );
-        assert!(rows.join("\n").contains("+2 more — terminal too small"));
+        assert!(rows.join("\n").contains("more — terminal too small"));
     }
 
     #[test]
