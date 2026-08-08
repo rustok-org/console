@@ -1076,11 +1076,14 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
                 push_wrapped(
                     &mut lines,
                     width,
+                    // The unit comes from the amount, which already carries it —
+                    // `b.symbol` is `ETH` for every chain the core allows
+                    // (`server.rs`, `wallet_context_data`), and appending it on
+                    // top is what made the first screen read `0.01 ETH ETH`.
                     format!(
-                        "  chain {}  {} {}",
-                        b.chain_id,
-                        format::wei_to_eth(&b.balance),
-                        b.symbol
+                        "  {}  {}",
+                        format::network_name(b.chain_id),
+                        format::short_eth(&b.balance)
                     ),
                     theme::value_style(),
                 );
@@ -3534,6 +3537,24 @@ mod tests {
         }
     }
 
+    /// The balance panel is a scan surface too: the live run showed seventeen
+    /// fractional digits on the first screen after unlock. The exact figure is
+    /// not lost — it is on the card, where a decision is made.
+    #[test]
+    fn the_balance_panel_shortens_a_long_amount() {
+        let balances = vec![ChainBalance {
+            chain_id: 1,
+            symbol: "ETH".to_owned(),
+            balance: "5499068022390730".to_owned(), // 0.00549906802239073 ETH
+        }];
+        let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["Ethereum", "0.005499… ETH"]),
+            "the balance is shortened for scanning:\n{rows:#?}"
+        );
+    }
+
     #[test]
     fn the_dashboard_shows_balance_positions_and_the_waiting_count() {
         let balances = vec![ChainBalance {
@@ -3544,8 +3565,16 @@ mod tests {
         let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
         let rows = draw_rows(&m, 100, 24);
         assert!(
-            has_line_with(&rows, &["chain 1", "0.01 ETH"]),
-            "the balance reads humanly, per chain"
+            has_line_with(&rows, &["Ethereum", "0.01 ETH"]),
+            "the balance reads humanly, per chain — and the chain has the name it \
+             carries everywhere else in the wallet"
+        );
+        // The unit belongs to the amount, and the amount already carries it. The
+        // panel used to append `symbol` on top, so the first screen after unlock
+        // read `0.01 ETH ETH`.
+        assert!(
+            !rows.iter().any(|r| r.contains("ETH ETH")),
+            "the unit is stated once:\n{rows:#?}"
         );
         assert!(
             has_line_with(&rows, &["aave_v3", "1000 USD", "Aave v3 account"]),

@@ -246,6 +246,12 @@ pub struct ChainBalance {
     /// EVM chain id.
     pub chain_id: u64,
     /// Native token symbol (`"ETH"` for every chain in the allowed set).
+    ///
+    /// Parsed because the wire carries it, **not rendered**: the amount
+    /// formatter already states the unit, and printing both is what made the
+    /// balance panel read `0.01 ETH ETH`. If a chain with a different native
+    /// token is ever allowed, the unit and the 18 decimals both have to move —
+    /// this field alone would not be enough.
     pub symbol: String,
     /// Native balance, decimal wei string.
     pub balance: String,
