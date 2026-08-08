@@ -755,9 +755,11 @@ fn activity_line(entry: &HistoryEntry, now_unix: u64) -> Line<'static> {
         Span::styled(format!("{word:<8}"), Style::new().fg(color)),
     ];
     match (&entry.to, &entry.amount_wei) {
+        // A scan surface, like the queue: shortened amount beside a shortened
+        // address. What was actually signed lives in the core's audit log.
         (Some(to), Some(amount)) => spans.push(Span::raw(format!(
             " {} → {}",
-            format::wei_to_eth(amount),
+            format::short_eth(amount),
             format::short_addr(to)
         ))),
         _ => spans.push(Span::styled(
@@ -1267,7 +1269,11 @@ fn priority_lines(
     push_wrapped(
         &mut lines,
         width,
-        format!("chain  {}", card.chain_id),
+        // Named, not numbered — the same word the queue and the balance use for
+        // the same network. The label moves with the value: an unknown chain
+        // renders as `chain 42161`, and `chain  chain 42161` would read as a
+        // stutter.
+        format!("network  {}", format::network_name(card.chain_id)),
         theme::label_style(),
     );
     if card.high_risk {
@@ -3181,6 +3187,52 @@ mod tests {
         assert!(screen.contains("~300s"));
     }
 
+    /// The card names its network the way every other screen names it. It used
+    /// to print the bare id, so one wallet called one network two different
+    /// things depending on which screen you were looking at.
+    #[test]
+    fn the_card_names_the_network_it_signs_on() {
+        let mut m = Model::new();
+        open_card(&mut m, "a1", NOW + 27, false);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["network", "Ethereum"]),
+            "the card names the network:\n{rows:#?}"
+        );
+    }
+
+    /// …and the card is the one surface that must NOT shorten the amount: it is
+    /// where the human decides how much leaves the wallet. The queue's
+    /// shortening would hide digits exactly where they are being approved —
+    /// the same boundary `short_addr` keeps for addresses.
+    #[test]
+    fn the_card_keeps_the_exact_amount() {
+        const EXACT: &str = "0.00549906802239073 ETH";
+        let mut m = Model::new();
+        to_watching(
+            &mut m,
+            vec![summary("a1", "0xabc", "5499068022390730", false)],
+        );
+        m.update(Msg::Open);
+        let mut c = card("a1", NOW + 27, false);
+        c.amount_wei = "5499068022390730".to_owned();
+        m.update(Msg::Reply(Reply::Get(crate::protocol::GetOutcome::Card(c))));
+
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["amount", EXACT]),
+            "the card shows every digit:\n{rows:#?}"
+        );
+        let amount_line = rows
+            .iter()
+            .find(|r| r.contains("amount"))
+            .expect("the amount line");
+        assert!(
+            !amount_line.contains('…'),
+            "and marks nothing as dropped: {amount_line}"
+        );
+    }
+
     #[test]
     fn the_card_shows_a_two_block_from_to_flow_with_full_addresses() {
         let mut m = Model::new();
@@ -3757,6 +3809,22 @@ mod tests {
         m.set_history(entries);
         m.update(Msg::View(View::Activity));
         m
+    }
+
+    /// Activity is read down the page like the queue, so it shortens like the
+    /// queue. The exact figure of a past decision is in the audit log, and of a
+    /// pending one on the card — neither is this row's job.
+    #[test]
+    fn activity_shortens_the_amount_it_shows() {
+        let mut rich = history("r1", NOW - 120, OutcomeState::Executed);
+        rich.to = Some("0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb".to_owned());
+        rich.amount_wei = Some("5499068022390730".to_owned());
+        let m = on_activity(vec![rich]);
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            has_line_with(&rows, &["approved", "0.005499… ETH"]),
+            "the row is scannable:\n{rows:#?}"
+        );
     }
 
     #[test]
