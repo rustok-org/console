@@ -556,7 +556,7 @@ behind. Until it lands, an `autonomous` wallet still parks every send (§3.7).
 |-------|---------------|------------------|
 | 1     | shipped as `0.1.0`; freezes at `v0.2.0` | ≥ `v0.1.0` |
 | 2     | frozen at `core v0.3.0` (adds `context` §3.7 + `positions` §3.8 + `activity` §3.9 + `wallet_locked` §3.12) | frozen at `console v0.2.0`; a `proto:1` client is unaffected — it never sends `context`/`positions`/`activity` and the server still answers its `hello` with `proto:1` (§3.1) |
-| 3     | shipped in `core main e9315c9` (adds `ack` §3.10 + `policy_mode`/`policy_origin` on `context` §3.7 + `not_autonomous`/`policy_store_failed` §3.12) | target `console v0.3.0`; a `proto:1`/`proto:2` client is unaffected — it never sends `ack`, and the extra `context` fields are ignored per §2 |
+| 3     | shipped as `core v0.4.0` (adds `ack` §3.10 + `policy_mode`/`policy_origin` on `context` §3.7 + `not_autonomous`/`policy_store_failed` §3.12) | shipped as `console v0.3.0`; a `proto:1`/`proto:2` client is unaffected — it never sends `ack`, and the extra `context` fields are ignored per §2 |
 
 - **`proto` is the only compatibility gate.** The `server` version string is
   informational (§3.1) — a client must never gate on it. The shipped server reports
