@@ -489,7 +489,9 @@ fn render_queue(
             let amount = if format::is_zero_wei(&s.amount_wei) && s.kind == Kind::Call {
                 "contract".to_owned()
             } else {
-                format::wei_to_eth(&s.amount_wei)
+                // Shortened: the queue is scanned, and the exact figure waits on
+                // the card, where the decision is actually made.
+                format::short_eth(&s.amount_wei)
             };
             let text = queue_row(
                 &marker.to_string(),
@@ -882,12 +884,20 @@ fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
 const Q_MARKER: usize = 2;
 const Q_KIND: usize = 8;
 const Q_AMOUNT: usize = 19;
+/// Money is read down the right edge of its column (design §4, §5), so the
+/// amount is the one cell that aligns right. The column keeps its last
+/// character as a gap, or the number would touch the arrow.
+const Q_AMOUNT_CELL: usize = Q_AMOUNT - 1;
 const Q_ARROW: usize = 2;
 const Q_RECIPIENT: usize = 15;
 const Q_NETWORK: usize = 11;
 
 /// One line of the queue table, header or data. The arrow has its own cell so
 /// the `RECIPIENT` heading sits over the address rather than over the arrow.
+///
+/// Every fixed cell is clamped to its width: a value wider than its column would
+/// otherwise shove everything after it sideways, out from under the headings —
+/// which is exactly what a long amount did on the first live run.
 fn queue_row(
     marker: &str,
     kind: &str,
@@ -897,10 +907,33 @@ fn queue_row(
     network: &str,
     expires: &str,
 ) -> String {
+    let marker = clamp_cell(marker, Q_MARKER);
+    let kind = clamp_cell(kind, Q_KIND);
+    let amount = clamp_cell(amount, Q_AMOUNT_CELL);
+    let arrow = clamp_cell(arrow, Q_ARROW);
+    let recipient = clamp_cell(recipient, Q_RECIPIENT);
+    let network = clamp_cell(network, Q_NETWORK);
+    // `expires` is last and has no column after it to disturb, so it is not
+    // clamped — the terminal's own edge is its limit.
     format!(
-        "{marker:<Q_MARKER$}{kind:<Q_KIND$}{amount:<Q_AMOUNT$}{arrow:<Q_ARROW$}\
+        "{marker:<Q_MARKER$}{kind:<Q_KIND$}{amount:>Q_AMOUNT_CELL$} {arrow:<Q_ARROW$}\
 {recipient:<Q_RECIPIENT$}{network:<Q_NETWORK$}{expires}"
     )
+}
+
+/// Trim a cell to its column, marking that it was trimmed.
+///
+/// Counted in CHARACTERS, not bytes: these rows carry `▌ ● ◆ → …`, and a byte
+/// ruler measures a different table than the one the terminal draws.
+fn clamp_cell(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    // The amount may already carry its own `…` from `short_eth`, and the cut can
+    // land right on it. One marker is the whole message — "not all of it is
+    // here" — so a second is dropped rather than stacked.
+    format!("{}…", kept.trim_end_matches('…'))
 }
 
 /// How long is left before this item expires, for the queue's last column.
@@ -2128,6 +2161,120 @@ mod tests {
                 "column {word} must start where {cell} starts\nheader: {header}\nrow:    {data}"
             );
         }
+    }
+
+    /// Two mechanisms shorten a queue cell — `short_eth` cuts the number,
+    /// `clamp_cell` cuts the cell — and the second can land on the marker the
+    /// first left behind. One `…` is the whole message; two are noise.
+    #[test]
+    fn clamp_cell_never_doubles_the_ellipsis() {
+        assert_eq!(
+            clamp_cell("0.005499… ETH", Q_AMOUNT_CELL),
+            "0.005499… ETH",
+            "a cell that fits is untouched, marker and all"
+        );
+        // A cut past the marker replaces the tail, and fills the cell exactly:
+        // `Q_AMOUNT_CELL - 1` kept characters plus the one that says "there was
+        // more" — asserted against the constant, not against a hand count.
+        let cut = clamp_cell("120,000,000.123456… ETH", Q_AMOUNT_CELL);
+        assert_eq!(cut.chars().count(), Q_AMOUNT_CELL, "fills the cell: {cut}");
+        assert_eq!(cut, "120,000,000.12345…");
+        assert_eq!(
+            clamp_cell("12345…89", 7),
+            "12345…",
+            "a cut landing ON the marker keeps one, not two"
+        );
+    }
+
+    /// The same statement, under an amount that does not fit its column. The
+    /// fixture above carries a short `1.5 ETH`, so it proved the headings sit
+    /// over the columns only for amounts we happened to pick — the live run
+    /// showed a real one (`0.00549906802239073 ETH`) shoving the recipient,
+    /// the network and the deadline to the right, out from under their names.
+    #[test]
+    fn the_queue_columns_hold_under_a_hostile_amount() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::List(vec![{
+            // U256::MAX wei — 60 whole ether digits. No wallet holds it; the
+            // point is that the table cannot be pushed apart by its content,
+            // not that this content is plausible.
+            let mut s = summary(
+                "22222222-2222-2222-2222-222222222222",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                false,
+            );
+            s.chain_id = 8453;
+            s.not_after_unix = NOW + 300;
+            s
+        }])));
+        model.update(Msg::View(crate::app::View::Queue));
+        let rows = draw_rows(&model, 100, 24);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("RECIPIENT"))
+            .expect("the header row");
+        // Found by its marker, not by the recipient: an overflowing amount can
+        // push the recipient off the screen entirely, and a test that looks for
+        // the recipient would then report "no data row" instead of the defect.
+        let data = rows.iter().find(|r| r.contains('●')).expect("a data row");
+
+        for cell in ["0x8b3E", "Base", "5 min"] {
+            assert!(
+                data.contains(cell),
+                "the amount must not push {cell} out of the row\nheader: {header}\nrow:    {data}"
+            );
+        }
+        let col = |s: &str, needle: &str| s.find(needle).map(|b| s[..b].chars().count());
+        for (word, cell) in [
+            ("RECIPIENT", "0x8b3E"),
+            ("NETWORK", "Base"),
+            ("EXPIRES", "5 min"),
+        ] {
+            assert_eq!(
+                col(header, word),
+                col(data, cell),
+                "column {word} must start where {cell} starts even when the amount \
+                 overflows\nheader: {header}\nrow:    {data}"
+            );
+        }
+    }
+
+    /// Design §4 and §5: the amount is a column read down its RIGHT edge, so
+    /// two amounts of different length end at the same place — and the heading
+    /// ends there too.
+    #[test]
+    fn the_amount_column_is_right_aligned() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let rows = draw_rows(&model, 100, 24);
+        let ends_at = |row_needle: &str, cell: &str| {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(row_needle))
+                .unwrap_or_else(|| panic!("a row containing {row_needle}"));
+            let at = row.find(cell).unwrap_or_else(|| panic!("{cell} in {row}"));
+            row[..at + cell.len()].chars().count()
+        };
+        // `1.5 ETH` and `0.42 ETH` differ in length; right-aligned, they stop
+        // at the same column.
+        assert_eq!(
+            ends_at("0x8b3E", "ETH"),
+            ends_at("0x1fA9", "ETH"),
+            "two amounts of different length must end at the same column\n{rows:#?}"
+        );
+        assert_eq!(
+            ends_at("AMOUNT", "AMOUNT"),
+            ends_at("0x8b3E", "ETH"),
+            "and the heading's right edge sits over the column's\n{rows:#?}"
+        );
     }
 
     /// Danger reads before the card is opened: a high-risk row carries `◆` and
