@@ -8,15 +8,25 @@
 /// Wei in one ether (`10^18`).
 const ETH_DECIMALS: usize = 18;
 
+/// The wei string as ASCII decimal digits, or `None` when the core sent something
+/// this module will not re-derive.
+///
+/// The ONE place "is this a number" is decided, so the exact form ([`wei_to_eth`])
+/// and the shortened one ([`short_eth`]) cannot come to different answers about
+/// the same wire value.
+fn decimal_wei(wei: &str) -> Option<&str> {
+    let digits = wei.trim();
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
+}
+
 /// Format a native **decimal wei** string as ether, e.g. `"10000000000000000"`
 /// → `"0.01 ETH"`. Trailing fractional zeros are trimmed. Non-numeric input is
 /// returned verbatim (defensive — the card shows the truth rather than crashing).
 #[must_use]
 pub fn wei_to_eth(wei: &str) -> String {
-    let digits = wei.trim();
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let Some(digits) = decimal_wei(wei) else {
         return wei.to_owned();
-    }
+    };
 
     // Drop leading zeros; keep one if the whole value is zero.
     let significant = digits.trim_start_matches('0');
@@ -59,13 +69,87 @@ pub fn is_zero_wei(wei: &str) -> bool {
 /// Display formatting, not re-derivation (`AGENTS.md` #1): the core's value is
 /// the id, and an unknown one is shown as the number rather than guessed at —
 /// a wrong chain name on a payment screen is worse than a bare number.
+///
+/// The names live HERE, in code, not in configuration: which networks a wallet
+/// speaks of is a product decision, and letting an operator label the network on
+/// the screen where money moves is the wrong kind of flexibility. A name is added
+/// **together with support for the chain**, never ahead of it — `Arbitrum` on a
+/// wallet that cannot reach Arbitrum would read as "it works" (Captain, 2026-08-08).
 #[must_use]
 pub fn network_name(chain_id: u64) -> String {
     match chain_id {
         1 => "Ethereum".to_owned(),
         8453 => "Base".to_owned(),
+        42161 => "Arbitrum".to_owned(),
         other => format!("chain {other}"),
     }
+}
+
+/// Fractional digits a SCAN surface keeps. Six is roughly a micro-ether — enough
+/// to tell two rows apart while triaging, and short enough that the column holds.
+const SCAN_FRAC_DIGITS: usize = 6;
+
+/// Shorten an ether amount for a SCAN surface — the queue, the balance panel and
+/// Activity: `0.00549906802239073 ETH` → `0.005499… ETH`.
+///
+/// **Never on the card.** The card is where the human decides how much leaves the
+/// wallet, and it renders the exact value ([`wei_to_eth`]) — the same boundary
+/// [`short_addr`] keeps for addresses.
+///
+/// What it does, in order:
+/// - digits of the whole part are grouped: `1,234.5 ETH`;
+/// - a value with no fraction at all — a real zero among them — is done there
+///   and never meets the floor below;
+/// - the fraction is cut to [`SCAN_FRAC_DIGITS`] — **truncated, never rounded**,
+///   because a wallet must not display more than there is — and a `…` marks that
+///   digits were dropped;
+/// - a value too small to survive that cut reads `<0.000001 ETH` rather than
+///   `0.000000…`, so dust never looks like nothing.
+#[must_use]
+pub fn short_eth(wei: &str) -> String {
+    let exact = wei_to_eth(wei);
+    if decimal_wei(wei).is_none() {
+        return exact;
+    }
+
+    let number = exact.strip_suffix(" ETH").unwrap_or(&exact);
+    let (int_part, frac) = number.split_once('.').unwrap_or((number, ""));
+    let whole = group_thousands(int_part);
+    // Nothing to shorten — and this is also what keeps a REAL zero a zero: an
+    // exact `0 ETH` has no fraction at all, so it never reaches the dust floor
+    // below (`short_eth_keeps_a_real_zero_a_zero` fails if this return goes).
+    if frac.is_empty() {
+        return format!("{whole} ETH");
+    }
+
+    // Truncate, never round: a wallet must not display more than there is.
+    let kept: String = frac.chars().take(SCAN_FRAC_DIGITS).collect();
+    let dropped = frac.chars().count() > SCAN_FRAC_DIGITS;
+    // Everything that survived the cut is zero, yet digits were dropped — so the
+    // value is small, not absent. Say that with a floor rather than render
+    // `0.000000…`, which reads as none. `dropped` is what makes the test
+    // "all kept digits are zero" mean something: on an empty fraction it would
+    // hold vacuously, and an exact zero would come out as `<0.000001 ETH`.
+    if dropped && int_part == "0" && kept.bytes().all(|b| b == b'0') {
+        return format!("<0.{:0>SCAN_FRAC_DIGITS$} ETH", 1);
+    }
+    let marker = if dropped { "…" } else { "" };
+    format!("{whole}.{kept}{marker} ETH")
+}
+
+/// Separate a run of ASCII digits into groups of three: `120000000` →
+/// `120,000,000`. A comma, not a space — the interface is English, and a space
+/// inside a table cell reads as two numbers.
+fn group_thousands(digits: &str) -> String {
+    let n = digits.len();
+    let mut out = String::with_capacity(n + n / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (n - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Shorten an address for a DISPLAY-LIST row: `0x489Fe0…bbbb` (first 6 + last 4
@@ -101,6 +185,7 @@ mod tests {
     fn network_name_maps_what_it_knows_and_shows_the_rest() {
         assert_eq!(network_name(1), "Ethereum");
         assert_eq!(network_name(8453), "Base");
+        assert_eq!(network_name(42161), "Arbitrum");
         assert_eq!(network_name(42), "chain 42");
     }
 
@@ -132,6 +217,46 @@ mod tests {
     fn wei_to_eth_returns_non_numeric_verbatim() {
         assert_eq!(wei_to_eth("not-a-number"), "not-a-number");
         assert_eq!(wei_to_eth(""), "");
+    }
+
+    /// A scan row has a column, not a page: the whole part gets separators, the
+    /// fraction is cut to six digits, and the `…` says digits were dropped.
+    #[test]
+    fn short_eth_groups_digits_and_marks_what_it_dropped() {
+        // The amount from the live acceptance run — 19 characters before the unit.
+        assert_eq!(short_eth("5499068022390730"), "0.005499… ETH");
+        assert_eq!(short_eth("1234500000000000000000"), "1,234.5 ETH");
+        assert_eq!(
+            short_eth("120000000123456789000000000"),
+            "120,000,000.123456… ETH"
+        );
+        // Nothing to drop: a short amount is left exactly as it is, no marker.
+        assert_eq!(short_eth("1500000000000000000"), "1.5 ETH");
+    }
+
+    /// Dust is not nothing. Cutting at six digits would render one wei as
+    /// `0.000000…`, which reads as zero at a glance — so it gets a floor mark.
+    #[test]
+    fn short_eth_never_rounds_dust_to_zero() {
+        assert_eq!(short_eth("1"), "<0.000001 ETH");
+        assert_eq!(short_eth("999999999999"), "<0.000001 ETH");
+    }
+
+    /// …and the floor must not swallow a REAL zero: an empty balance on an
+    /// allowed chain is an ordinary state, and `<0.000001 ETH` would be a lie
+    /// about it. The zero is recognised on the raw wei, before any shortening.
+    #[test]
+    fn short_eth_keeps_a_real_zero_a_zero() {
+        assert_eq!(short_eth("0"), "0 ETH");
+        assert_eq!(short_eth("000"), "0 ETH");
+    }
+
+    /// Same defensive contract as `wei_to_eth`: display never crashes and never
+    /// invents a number it could not read.
+    #[test]
+    fn short_eth_returns_non_numeric_verbatim() {
+        assert_eq!(short_eth("not-a-number"), "not-a-number");
+        assert_eq!(short_eth(""), "");
     }
 
     #[test]
