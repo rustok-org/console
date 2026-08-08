@@ -97,8 +97,9 @@ const SCAN_FRAC_DIGITS: usize = 6;
 /// [`short_addr`] keeps for addresses.
 ///
 /// What it does, in order:
-/// - a real zero (checked on the RAW wei, before any shortening) stays `0 ETH`;
 /// - digits of the whole part are grouped: `1,234.5 ETH`;
+/// - a value with no fraction at all — a real zero among them — is done there
+///   and never meets the floor below;
 /// - the fraction is cut to [`SCAN_FRAC_DIGITS`] — **truncated, never rounded**,
 ///   because a wallet must not display more than there is — and a `…` marks that
 ///   digits were dropped;
