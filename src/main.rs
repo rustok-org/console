@@ -599,6 +599,17 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Esc => Some(Msg::Quit),
             _ => None,
         },
+        // The confirmation prompt owns the keyboard while it is up — it is a
+        // PIN entry, so a stray `d` must not navigate away mid-typing. Esc
+        // cancels the attempt; it is NOT a reject, because there is nothing to
+        // reject (design §3).
+        Phase::Watching { ack: Some(_), .. } => match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() => Some(Msg::PinDigit(c)),
+            KeyCode::Backspace => Some(Msg::PinBackspace),
+            KeyCode::Enter => Some(Msg::PinSubmit),
+            KeyCode::Esc => Some(Msg::AckCancel),
+            _ => None,
+        },
         // The queue: no decision is pending, so quitting is free.
         Phase::Watching {
             confirm: None,
@@ -628,12 +639,15 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Char('q') => Some(Msg::Quit),
             _ => None,
         },
-        // The Dashboard is display-only: navigation and quit, nothing else.
+        // The Dashboard is display-only except for one action: confirming
+        // autonomy, which only exists while there is autonomy to confirm (the
+        // model refuses `c` otherwise — the key map is not the boundary).
         Phase::Watching {
             confirm: None,
             view: View::Dashboard,
             ..
         } => match key.code {
+            KeyCode::Char('c') => Some(Msg::AckStart),
             KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
             KeyCode::Char('r') => Some(Msg::View(View::Receive)),
             KeyCode::Char('h') => Some(Msg::View(View::Activity)),
@@ -704,6 +718,62 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Queue,
+            ack: None,
+        }
+    }
+
+    fn dashboard_with_prompt() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Dashboard,
+            ack: Some(rustok_console::app::AckPrompt::default()),
+        }
+    }
+
+    fn dashboard() -> Phase {
+        Phase::Watching {
+            items: vec![],
+            selected: 0,
+            confirm: None,
+            notice: None,
+            view: View::Dashboard,
+            ack: None,
+        }
+    }
+
+    /// The key map is what this file is for, and the confirmation's keys were
+    /// the one branch in it with no test at all.
+    #[test]
+    fn c_starts_the_confirmation_and_the_prompt_then_owns_the_keyboard() {
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('c')), &dashboard()),
+            Some(Msg::AckStart)
+        ));
+
+        // While it is up, the screen keys are gone: a stray `d` must not walk
+        // away mid-PIN, and Esc cancels the attempt rather than rejecting
+        // anything — there is nothing here to reject.
+        let up = dashboard_with_prompt();
+        assert!(matches!(
+            map_key(&key(KeyCode::Char('1')), &up),
+            Some(Msg::PinDigit('1'))
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Enter), &up),
+            Some(Msg::PinSubmit)
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Esc), &up),
+            Some(Msg::AckCancel)
+        ));
+        for dead in ['d', 'a', 'r', 'h', 'q'] {
+            assert!(
+                map_key(&key(KeyCode::Char(dead)), &up).is_none(),
+                "`{dead}` must be dead while the PIN prompt is up"
+            );
         }
     }
 
@@ -714,6 +784,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Receive,
+            ack: None,
         }
     }
 
@@ -744,6 +815,7 @@ mod tests {
                 address: "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb".to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         m.update(Msg::View(View::Queue)); // Stage-5 home is Dashboard
@@ -1094,6 +1166,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Dashboard,
+            ack: None,
         }
     }
 
@@ -1157,6 +1230,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Activity,
+            ack: None,
         }
     }
 

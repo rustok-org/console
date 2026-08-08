@@ -7,13 +7,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     AuthError, Confirm, DecisionKind, HistoryEntry, Model, Notice, Phase, Positions, ResolveError,
     View,
 };
-use crate::protocol::{Card, OutcomeState, Summary};
+use crate::protocol::{Card, Kind, OutcomeState, Policy, PolicyMode, PolicyOrigin, Summary};
 use crate::{format, qr, theme};
 
 /// Render the whole screen for the current model.
@@ -32,6 +32,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
             confirm,
             notice,
             view,
+            ack,
         } => match view {
             View::Queue => render_watch(
                 frame,
@@ -39,15 +40,118 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
                 *selected,
                 confirm.as_deref(),
                 notice.as_ref(),
-                model.wallet_address(),
+                WalletView {
+                    address: model.wallet_address(),
+                    policy: model.policy(),
+                },
                 now_unix,
             ),
-            View::Receive => render_receive(frame, items.len(), model.wallet_address()),
-            View::Dashboard => render_dashboard(frame, items.len(), model),
+            View::Receive => {
+                render_receive(frame, items.len(), model.wallet_address(), model.policy())
+            }
+            View::Dashboard => {
+                render_dashboard(frame, items.len(), model);
+                if let Some(a) = ack {
+                    render_ack_prompt(frame, a.pin_len());
+                }
+            }
             View::Activity => render_activity(frame, items.len(), model, now_unix),
         },
         Phase::Fatal(err) => render_centered(frame, &err.to_string()),
     }
+}
+
+/// The wallet's autonomy as one phrase for the header, with the style that
+/// carries its meaning — or `None` when there is nothing truthful to say yet.
+///
+/// **The alarm colour is spent on exactly one state.** `autonomous` +
+/// `provisioned` is the only combination where what the human expects and what
+/// the wallet does come apart: the mode reads "sends by itself" while every
+/// send parks. Acknowledged autonomy is not an alarm — it is the human's own
+/// choice, and colouring it like danger would spend the signal that makes the
+/// one real case stand out.
+///
+/// `PolicyMode::Unknown` renders **nothing**. The header states a fact about
+/// this wallet; before the first `context` reply lands there is no fact, and an
+/// invented placeholder would be a claim we cannot back.
+///
+/// Two lengths, because the phrase shares one row with the tabs, and **both of
+/// them are ratified strings** — the long one transcribed from the design
+/// decision (§2), the short one approved with it. No third, in-between wording
+/// is invented here: a paraphrase in the one place that carries the alarm
+/// colour is exactly the kind of drift nobody notices.
+///
+/// The tabs take 59 columns and the phrase is 45, so the long form needs 105
+/// to appear (measured, not estimated — the earlier "~115" was neither); a
+/// standard 80-column terminal leaves 21 and gets the short one. The short form
+/// keeps the half that changes what the human does, and the instruction itself
+/// lives in the Dashboard banner — truncating the long form instead would cut
+/// exactly that half off the end.
+fn mode_phrase(policy: Policy, budget: usize) -> Option<Span<'static>> {
+    let (full, short, style) = match (policy.mode, policy.origin) {
+        (PolicyMode::Unknown, _) => return None,
+        (PolicyMode::ReadOnly, _) => (
+            "read-only",
+            "read-only",
+            Style::new().fg(theme::high_risk()),
+        ),
+        (PolicyMode::Supervised, _) => ("manual mode", "manual mode", theme::label_style()),
+        (PolicyMode::Autonomous, PolicyOrigin::Acknowledged) => (
+            "autonomous · confirmed",
+            "confirmed",
+            Style::new().fg(theme::accent()),
+        ),
+        (PolicyMode::Autonomous, PolicyOrigin::Provisioned) => (
+            "autonomous · unconfirmed — sends wait for you",
+            "unconfirmed",
+            Style::new()
+                .fg(theme::high_risk())
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+    let text = if full.chars().count() <= budget {
+        full
+    } else {
+        short
+    };
+    Some(Span::styled(text, style))
+}
+
+/// What the chrome needs to know about the wallet itself: who it is, and how it
+/// behaves. Travelling together because they are read together — the header
+/// states the policy, the card's From block states the address, and both are
+/// facts about this wallet rather than about the item being decided.
+#[derive(Clone, Copy)]
+struct WalletView<'a> {
+    address: Option<&'a str>,
+    policy: Policy,
+}
+
+/// The header row: tabs on the left, the wallet's autonomy on the right.
+///
+/// The phrase is on **every** screen, not only the one that can act on it —
+/// Q5's rule is that the mode is loud at every use, not readable on request.
+/// It is pushed right by padding rather than by a nested layout so the tab
+/// bar's own geometry (and with it the card's, §`watch_chunks`) is untouched.
+/// When the phrase cannot fit at all, the tabs win: navigation must not be
+/// unreachable, and the state still has the Dashboard banner.
+fn header_line(active: View, pending: usize, policy: Policy, width: u16) -> Line<'static> {
+    let mut line = tab_line(active, pending);
+    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let width = usize::from(width);
+    let Some(budget) = width.checked_sub(used + 1) else {
+        return line;
+    };
+    let Some(phrase) = mode_phrase(policy, budget) else {
+        return line;
+    };
+    let len = phrase.content.chars().count();
+    if len > budget {
+        return line;
+    }
+    line.spans.push(Span::raw(" ".repeat(width - used - len)));
+    line.spans.push(phrase);
+    line
 }
 
 /// The nav-shell tab bar — one line, both registered views with their keys,
@@ -169,27 +273,35 @@ fn auth_error_text(err: &AuthError) -> String {
 /// would take its space from the card, and the card is the one thing on this
 /// screen whose priority fields must never leave the screen (`AGENTS.md` #1).
 ///
-/// While a confirmation is open the card is the decision surface: the queue
-/// collapses to a single-item strip (the List keeps the selection in view)
-/// and the card takes every remaining row. Splitting the height evenly would
-/// starve the card of the rows its risk warnings and PIN prompt need on a
-/// 24-row terminal.
+/// The screen has two shapes, and the card exists in only one of them.
+///
+/// **Confirmation open** — the card is the decision surface: the queue
+/// collapses to a single-item strip (the List keeps the selection in view) and
+/// the card takes every remaining row. Splitting the height evenly would starve
+/// the card of the rows its risk warnings and PIN prompt need on a 24-row
+/// terminal.
+///
+/// **Confirmation closed** — there is no card row at all, and the queue takes
+/// the whole middle. The rows the card needs are needed only while it is open,
+/// and by then the queue has already collapsed and freed them: a permanent
+/// reserve was protecting a case in which the reserve is not required. The
+/// "enter to open" hint moves to the navigation row, which is one row, not six.
 fn watch_chunks(
     area: ratatui::layout::Rect,
     confirm_open: bool,
     has_note: bool,
 ) -> std::rc::Rc<[ratatui::layout::Rect]> {
-    let queue_rows = if confirm_open {
-        Constraint::Length(3) // borders + the selected row
+    let mut constraints = vec![Constraint::Length(1)]; // header
+    if confirm_open {
+        constraints.push(Constraint::Length(3)); // queue: borders + selected row
+        constraints.push(Constraint::Min(6)); // card
     } else {
-        Constraint::Min(3)
-    };
-    let mut constraints = vec![
-        Constraint::Length(1), // header
-        queue_rows,            // queue
-        Constraint::Min(6),    // card / hint
-        Constraint::Length(1), // decision row / navigation hint
-    ];
+        // No card, no reserve: the list takes the rows the card used to hold
+        // empty, and the "enter to open" hint lives in the navigation row
+        // below — one row is all it needs.
+        constraints.push(Constraint::Min(3)); // queue
+    }
+    constraints.push(Constraint::Length(1)); // decision row / navigation hint
     if has_note {
         constraints.push(Constraint::Length(1)); // transient note
     }
@@ -202,7 +314,7 @@ fn render_watch(
     selected: usize,
     confirm: Option<&Confirm>,
     notice: Option<&Notice>,
-    wallet: Option<&str>,
+    wallet: WalletView<'_>,
     now_unix: u64,
 ) {
     let chunks = watch_chunks(frame.area(), confirm.is_some(), notice.is_some());
@@ -210,19 +322,34 @@ fn render_watch(
     // The tab bar lives in the header row the layout already had — the card's
     // geometry (and with it `priority_fields_fit`) is untouched by nav-shell.
     frame.render_widget(
-        Paragraph::new(tab_line(View::Queue, items.len())),
+        Paragraph::new(header_line(
+            View::Queue,
+            items.len(),
+            wallet.policy,
+            frame.area().width,
+        )),
         chunks[0],
     );
 
-    render_queue(frame, items, selected, chunks[1]);
-    render_detail(frame, confirm, wallet, chunks[2]);
+    render_queue(frame, items, selected, now_unix, chunks[1]);
+
+    // The card chunk exists only while a confirmation is open, so everything
+    // after it shifts by one — see `watch_chunks`.
+    let actions_idx = if confirm.is_some() {
+        render_detail(frame, confirm, wallet.address, wallet.policy, chunks[2]);
+        3
+    } else {
+        2
+    };
     // The same fit the model gates approve on (`priority_fields_fit`), taken
-    // from the very chunk the card is drawn into.
-    let approve_ok = confirm.is_none_or(|c| card_priority_fits(c, wallet, chunks[2]));
-    render_actions(frame, confirm, approve_ok, now_unix, chunks[3]);
+    // from the very chunk the card is drawn into. With no card open there is
+    // nothing to gate: `is_none_or` answers true and no chunk is consulted.
+    let approve_ok =
+        confirm.is_none_or(|c| card_priority_fits(c, wallet.address, wallet.policy, chunks[2]));
+    render_actions(frame, confirm, approve_ok, now_unix, chunks[actions_idx]);
 
     if let Some(notice) = notice {
-        frame.render_widget(Paragraph::new(notice_line(notice)), chunks[4]);
+        frame.render_widget(Paragraph::new(notice_line(notice)), chunks[actions_idx + 1]);
     }
 }
 
@@ -315,44 +442,122 @@ fn render_queue(
     frame: &mut Frame,
     items: &[Summary],
     selected: usize,
+    now_unix: u64,
     area: ratatui::layout::Rect,
 ) {
-    let block = themed_block(" Queue ");
+    let title = format!(" Queue — {} waiting for your decision ", items.len());
+    let block = themed_block(if items.is_empty() { " Queue " } else { &title });
     if items.is_empty() {
         let empty = Paragraph::new("Queue is empty — waiting for approval requests…").block(block);
         frame.render_widget(empty, area);
         return;
     }
-    let rows: Vec<ListItem> = items
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Collapsed to a strip (a card is open): one row of inner space cannot hold
+    // both the heading and the item it heads, and the strip exists to show the
+    // item. Between the two, the item wins.
+    let collapsed = inner.height <= 1;
+    let split = if collapsed {
+        Layout::vertical([Constraint::Length(0), Constraint::Min(0)]).split(inner)
+    } else {
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            // The two leading columns are the ones the selection bar occupies
+            // on every data row; without them the header floats two left.
+            format!(
+                "  {}",
+                queue_row("", "KIND", "AMOUNT", "", "RECIPIENT", "NETWORK", "EXPIRES")
+            ),
+            Style::new().fg(theme::faint()),
+        )),
+        split[0],
+    );
+
+    let rows: Vec<(String, bool)> = items
         .iter()
         .map(|s| {
-            let flag = if s.high_risk { "⚠ " } else { "  " };
-            let text = format!(
-                "{flag}{kind:5} {to}  {amount} wei",
-                kind = kind_word(s),
-                to = s.to,
-                amount = s.amount_wei
-            );
-            // A high-risk item is amber even in the list, so danger reads before
-            // the card is opened.
-            if s.high_risk {
-                ListItem::new(Span::styled(text, Style::new().fg(theme::high_risk())))
+            // Danger reads before the card is opened, so the marker carries it
+            // and the whole row takes the alarm colour.
+            let marker = if s.high_risk { '◆' } else { '●' };
+            // Money first, kind second. A call CAN carry native value, and a
+            // column that says only "contract" would hide it — the same rule
+            // the card follows: a zero native value is not headlined, a
+            // non-zero one always is. (`wei_to_eth` already carries the unit.)
+            let amount = if format::is_zero_wei(&s.amount_wei) && s.kind == Kind::Call {
+                "contract".to_owned()
             } else {
-                ListItem::new(text)
-            }
+                format::wei_to_eth(&s.amount_wei)
+            };
+            let text = queue_row(
+                &marker.to_string(),
+                kind_word(s),
+                &amount,
+                "→",
+                &format::short_addr(&s.to),
+                &format::network_name(s.chain_id),
+                &time_left_word(s.not_after_unix, now_unix),
+            );
+            (text, s.high_risk)
         })
         .collect();
-    let mut state = ListState::default();
-    state.select(Some(selected.min(items.len().saturating_sub(1))));
-    let list = List::new(rows)
-        .block(block)
-        .highlight_symbol("▶ ")
-        .highlight_style(
-            Style::new()
-                .fg(theme::accent())
-                .add_modifier(Modifier::REVERSED),
-        );
-    frame.render_stateful_widget(list, area, &mut state);
+    let cursor = selected.min(items.len().saturating_sub(1));
+    // The bar is drawn as content rather than through `highlight_symbol`,
+    // because a highlight style repaints the whole row and would swallow the
+    // amber that carries risk. Bar in accent, row in its own colour, bold on
+    // the selected one — never inversion, which fights the light theme (§5).
+    let rows: Vec<ListItem> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (text, high_risk))| {
+            let mut style = if high_risk {
+                Style::new().fg(theme::high_risk())
+            } else {
+                Style::new()
+            };
+            if i == cursor {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let bar = if i == cursor {
+                Span::styled(
+                    "▌ ",
+                    Style::new()
+                        .fg(theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            ListItem::new(Line::from(vec![bar, Span::styled(text, style)]))
+        })
+        .collect();
+    // A window around the cursor, kept by hand rather than by `ListState`:
+    // the stateful widget brings `highlight_style` back with it, and that
+    // style repaints the whole row — which is what swallowed the amber on a
+    // selected high-risk item once already. The bar is content here, so the
+    // scrolling has to be content too.
+    let view_rows = usize::from(split[1].height);
+    let (rows, hidden) = if view_rows == 0 || rows.len() <= view_rows {
+        (rows, 0)
+    } else {
+        // Leave the last row for the marker, and keep the cursor inside.
+        let shown = view_rows - 1;
+        let start = cursor
+            .saturating_sub(shown.saturating_sub(1))
+            .min(rows.len().saturating_sub(shown));
+        let hidden = rows.len() - shown;
+        (rows[start..start + shown].to_vec(), hidden)
+    };
+    let mut rows = rows;
+    if hidden > 0 {
+        rows.push(ListItem::new(Span::styled(
+            format!("  +{hidden} more — terminal too small"),
+            Style::new().fg(theme::faint()),
+        )));
+    }
+    frame.render_widget(List::new(rows), split[1]);
 }
 
 fn kind_word(s: &Summary) -> &'static str {
@@ -378,9 +583,17 @@ fn kind_word(s: &Summary) -> &'static str {
 /// Degraded context (`wallet_locked`, an old server — `None` here) and an
 /// empty address (`parse_context` rejects a missing one, not an empty one)
 /// show "no receive address": a QR of nothing must never be fabricated.
-fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
+fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>, policy: Policy) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
-    frame.render_widget(Paragraph::new(tab_line(View::Receive, pending)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(header_line(
+            View::Receive,
+            pending,
+            policy,
+            frame.area().width,
+        )),
+        chunks[0],
+    );
 
     let block = themed_block(" Receive ");
     let inner = block.inner(chunks[1]);
@@ -462,7 +675,15 @@ fn render_receive(frame: &mut Frame, pending: usize, wallet: Option<&str>) {
 /// clip (the Stage-5 budget lesson: exact-fit vs marker split, one budget).
 fn render_activity(frame: &mut Frame, pending: usize, model: &Model, now_unix: u64) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
-    frame.render_widget(Paragraph::new(tab_line(View::Activity, pending)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(header_line(
+            View::Activity,
+            pending,
+            model.policy(),
+            frame.area().width,
+        )),
+        chunks[0],
+    );
 
     let block = themed_block(" Activity ");
     let inner = block.inner(chunks[1]);
@@ -576,22 +797,227 @@ fn age_label(now_unix: u64, unix: u64) -> String {
 /// Honesty rules: a failed balance refresh flags the block as possibly stale
 /// (never silently shows old data as fresh); positions that do not fit end
 /// with an explicit "+N more" marker, never a silent clip.
+/// The rows the confirmation banner claims: two borders plus its two lines.
+const ACK_BANNER_ROWS: u16 = 4;
+
+/// Width of the Dashboard's identity column. Fixed rather than proportional:
+/// it holds three short lines whose longest is the shortened address, so a
+/// share of the width would only take room from the balances beside it.
+const IDENTITY_COL: u16 = 22;
+
+/// Rows for the balance panel: two borders plus a line per allowed chain, with
+/// room for the staleness note. Positions take whatever is left — the list
+/// there is the one that grows.
+const BALANCE_ROWS: u16 = 6;
+
+/// Who this wallet is: the product, the version this binary can vouch for, and
+/// which address is loaded (design v2, mockup states 1–2).
+///
+/// The version is the crate's own `CARGO_PKG_VERSION`. The edition number the
+/// marketing side uses has no honest source inside the binary — it is not
+/// passed in at build time — and printing a number the program cannot verify
+/// is the same class of claim as a mode without its origin (В-3).
+fn render_identity(frame: &mut Frame, address: Option<&str>, area: ratatui::layout::Rect) {
+    let block = themed_block("");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "RUSTOK",
+                Style::new()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" WALLET", Style::new().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled(
+            concat!("console v", env!("CARGO_PKG_VERSION")),
+            Style::new().fg(theme::faint()),
+        )),
+    ];
+    if let Some(address) = address {
+        lines.push(Line::from(Span::styled(
+            format::short_addr(address),
+            Style::new().fg(theme::accent_bright()),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The one-time invitation to confirm autonomy (design §3).
+///
+/// It is drawn **only** while there is something to confirm, for the same
+/// reason the card no longer holds rows it is not using: a permanent strip for
+/// a once-in-a-wallet action is a standing reserve. A supervised wallet has no
+/// autonomy to acknowledge, so it is never asked.
+///
+/// The alarm colour is the same one the header spends on this one state — the
+/// banner is where that state says what to do about itself.
+fn render_ack_banner(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let block = Block::bordered()
+        .border_style(Style::new().fg(theme::high_risk()))
+        .title(Line::from(Span::styled(
+            " Autonomous mode unconfirmed ",
+            Style::new()
+                .fg(theme::high_risk())
+                .add_modifier(Modifier::BOLD),
+        )));
+    let body = Paragraph::new(vec![
+        Line::from("Every send queues and waits for you."),
+        Line::from(vec![
+            Span::styled("[c]", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(" — confirm autonomy "),
+            Span::styled("(requires PIN)", Style::new().fg(theme::faint())),
+        ]),
+    ])
+    .block(block);
+    frame.render_widget(body, area);
+}
+
+/// Column widths of the queue table — the ONE place they live.
+///
+/// The header and the data rows were two independently hand-built strings and
+/// they drifted: `RECIPIENT` ended up over the arrow, two columns left of the
+/// address it names. Both now go through [`queue_row`], so a width cannot move
+/// in one without moving in the other.
+const Q_MARKER: usize = 2;
+const Q_KIND: usize = 8;
+const Q_AMOUNT: usize = 19;
+const Q_ARROW: usize = 2;
+const Q_RECIPIENT: usize = 15;
+const Q_NETWORK: usize = 11;
+
+/// One line of the queue table, header or data. The arrow has its own cell so
+/// the `RECIPIENT` heading sits over the address rather than over the arrow.
+fn queue_row(
+    marker: &str,
+    kind: &str,
+    amount: &str,
+    arrow: &str,
+    recipient: &str,
+    network: &str,
+    expires: &str,
+) -> String {
+    format!(
+        "{marker:<Q_MARKER$}{kind:<Q_KIND$}{amount:<Q_AMOUNT$}{arrow:<Q_ARROW$}\
+{recipient:<Q_RECIPIENT$}{network:<Q_NETWORK$}{expires}"
+    )
+}
+
+/// How long is left before this item expires, for the queue's last column.
+///
+/// The mockup asked for AGE, which the wire cannot produce: a summary carries
+/// its deadline, never its birth. Time LEFT is both derivable and the thing
+/// that matters when triaging a queue — how long the human has, not how long
+/// it has sat (Reviewer, round 10). Saturating like the card's countdown: a
+/// deadline already past reads as expired, never as a wrapped-around eternity.
+fn time_left_word(not_after_unix: u64, now_unix: u64) -> String {
+    match seconds_left(not_after_unix, now_unix) {
+        0 => "expired".to_owned(),
+        s if s < 60 => format!("{s} s"),
+        s => format!("{} min", s / 60),
+    }
+}
+
+/// Why this payment is waiting, derived from the pair (mode, origin) — §4.
+///
+/// The wire carries no reason field and does not need one: within a single
+/// wallet the reason is the same for every parked item, so a per-item field
+/// would be the same string repeated. Only the unconfirmed case is
+/// alarm-coloured, the same rule the header follows applied to the same fact.
+fn parking_reason(policy: Policy) -> (&'static str, Style) {
+    match (policy.mode, policy.origin) {
+        (PolicyMode::Autonomous, PolicyOrigin::Provisioned) => (
+            "parked: autonomy unconfirmed — confirm on the Dashboard",
+            Style::new().fg(theme::high_risk()),
+        ),
+        (PolicyMode::Autonomous, PolicyOrigin::Acknowledged) => (
+            "parked until mode confirmation — decided by you",
+            theme::label_style(),
+        ),
+        _ => ("waiting for your decision", theme::label_style()),
+    }
+}
+
+/// The autonomy-confirmation PIN prompt, centred over the screen.
+///
+/// Same behaviour as the card's high-risk prompt — on top, masked, nothing
+/// stored — and deliberately not the same state: that one belongs to an item,
+/// this one to the wallet (design §3, correction of 2026-08-07).
+fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
+    let area = frame.area();
+    let width = 44.min(area.width);
+    let height = 4.min(area.height);
+    let rect = ratatui::layout::Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(theme::high_risk()))
+        .title(Line::from(Span::styled(
+            " Confirm autonomy ",
+            Style::new()
+                .fg(theme::high_risk())
+                .add_modifier(Modifier::BOLD),
+        )));
+    let body = Paragraph::new(vec![
+        Line::from(format!("PIN: {}", "●".repeat(pin_len))),
+        Line::from(Span::styled(
+            "enter — confirm · esc — cancel",
+            Style::new().fg(theme::faint()),
+        )),
+    ])
+    .block(block);
+    frame.render_widget(body, rect);
+}
+
 fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
+    let policy = model.policy();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
     frame.render_widget(
-        Paragraph::new(tab_line(View::Dashboard, pending)),
+        Paragraph::new(header_line(
+            View::Dashboard,
+            pending,
+            policy,
+            frame.area().width,
+        )),
         chunks[0],
     );
 
-    let block = themed_block(" Dashboard ");
-    let inner = block.inner(chunks[1]);
-    let width = usize::from(inner.width);
-    let height = usize::from(inner.height);
+    // The banner takes its rows from the body, not from the header: the mode
+    // phrase must stay on screen in every state, the invitation only in one.
+    let body = if policy.awaits_acknowledgment() {
+        let split = Layout::vertical([Constraint::Length(ACK_BANNER_ROWS), Constraint::Min(0)])
+            .split(chunks[1]);
+        render_ack_banner(frame, split[0]);
+        split[1]
+    } else {
+        chunks[1]
+    };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Identity on the left, content on the right (design v2). The identity
+    // column is fixed: it holds three short lines whose longest is the
+    // shortened address, so giving it a share of the width would only take
+    // room from the balances.
+    let cols =
+        Layout::horizontal([Constraint::Length(IDENTITY_COL), Constraint::Min(0)]).split(body);
+    render_identity(frame, model.wallet_address(), cols[0]);
+
+    let panels = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(BALANCE_ROWS),
+        Constraint::Min(0),
+    ])
+    .split(cols[1]);
 
     // ── Waiting for you — the reason this console exists comes first.
-    let waiting = if pending == 0 {
+    let queue_block = themed_block(" Queue ");
+    let width = usize::from(queue_block.inner(panels[0]).width);
+    let waiting = if policy.awaits_acknowledgment() {
+        format!("Waiting: {pending} — all parked, mode unconfirmed")
+    } else if pending == 0 {
         "Waiting for you: nothing pending".to_owned()
     } else {
         format!("Waiting for you: {pending} pending — press a")
@@ -601,16 +1027,16 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
     } else {
         theme::high_risk_style()
     };
+    let mut lines: Vec<Line<'static>> = Vec::new();
     push_wrapped(&mut lines, width, waiting, waiting_style);
-    lines.push(Line::from(""));
+    frame.render_widget(Paragraph::new(lines).block(queue_block), panels[0]);
 
+    let block = themed_block(" balance ");
+    let inner = block.inner(panels[1]);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // ── Balance (from `context`; per-chain native ETH).
-    push_wrapped(
-        &mut lines,
-        width,
-        "balance".to_owned(),
-        theme::label_style(),
-    );
     match model.wallet_context() {
         Some(ctx) if !ctx.balances.is_empty() => {
             for b in &ctx.balances {
@@ -640,7 +1066,26 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             theme::label_style(),
         ),
     }
-    if model.context_stale() {
+    // The staleness line is not a balance row — it is the line that says the
+    // balance rows may be wrong. It outranks them: a reserved row keeps it out
+    // of the truncation, so a wallet with many chains cannot quietly drop the
+    // one line warning that the numbers above it are stale.
+    let stale = model.context_stale();
+    let reserved = usize::from(stale);
+    if lines.len() + reserved > height {
+        // One row goes to the marker, so what was hidden is stated rather than
+        // silently cut — the same contract the positions panel below keeps.
+        let keep = height.saturating_sub(reserved).saturating_sub(1);
+        let hidden = lines.len() - keep;
+        lines.truncate(keep);
+        push_wrapped(
+            &mut lines,
+            width,
+            format!("  +{hidden} more — terminal too small"),
+            theme::label_style(),
+        );
+    }
+    if stale {
         push_wrapped(
             &mut lines,
             width,
@@ -648,15 +1093,15 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             theme::high_risk_style(),
         );
     }
-    lines.push(Line::from(""));
 
+    frame.render_widget(Paragraph::new(lines).block(block), panels[1]);
+
+    let block = themed_block(" positions ");
+    let inner = block.inner(panels[2]);
+    let width = usize::from(inner.width);
+    let height = usize::from(inner.height);
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // ── Positions (tri-state: loading / loaded / unavailable).
-    push_wrapped(
-        &mut lines,
-        width,
-        "positions".to_owned(),
-        theme::label_style(),
-    );
     match model.positions() {
         Positions::NotYet => push_wrapped(
             &mut lines,
@@ -722,8 +1167,7 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
             }
         }
     }
-
-    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+    frame.render_widget(Paragraph::new(lines).block(block), panels[2]);
 }
 
 /// The card's priority lines — every field except `raw_data` — pre-wrapped to
@@ -731,7 +1175,12 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
 /// arithmetic downstream is exact. One source for the renderer AND for
 /// [`priority_fields_fit`]: the approve gate can never disagree with what is
 /// actually drawn.
-fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
+fn priority_lines(
+    confirm: &Confirm,
+    from: Option<&str>,
+    policy: Policy,
+    width: usize,
+) -> Vec<Line<'static>> {
     let card: &Card = confirm.card();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -821,6 +1270,12 @@ fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Li
             );
         }
     }
+    // Why this one is waiting (§4) — after the risk warnings, before the PIN
+    // prompt and the deadline. A priority field on purpose: a human who cannot
+    // see why the payment stopped cannot tell "the wallet is asking me" from
+    // "the wallet is broken".
+    let (reason, reason_style) = parking_reason(policy);
+    push_wrapped(&mut lines, width, reason.to_owned(), reason_style);
     if let Some(pin_len) = confirm.pin_len() {
         lines.push(Line::from(""));
         push_wrapped(
@@ -850,9 +1305,15 @@ fn priority_lines(confirm: &Confirm, from: Option<&str>, width: usize) -> Vec<Li
 }
 
 /// Whether the card's priority lines fit its inner area.
-fn card_priority_fits(confirm: &Confirm, from: Option<&str>, area: ratatui::layout::Rect) -> bool {
+fn card_priority_fits(
+    confirm: &Confirm,
+    from: Option<&str>,
+    policy: Policy,
+    area: ratatui::layout::Rect,
+) -> bool {
     let inner = Block::bordered().inner(area);
-    priority_lines(confirm, from, usize::from(inner.width)).len() <= usize::from(inner.height)
+    priority_lines(confirm, from, policy, usize::from(inner.width)).len()
+        <= usize::from(inner.height)
 }
 
 /// The approve gate: can a `width`×`height` terminal show every priority field
@@ -865,10 +1326,16 @@ fn card_priority_fits(confirm: &Confirm, from: Option<&str>, area: ratatui::layo
 /// `has_note` is `false` by construction: a note and an open confirmation never
 /// coexist (`apply_get`/`apply_resolve` set one while clearing the other).
 #[must_use]
-pub fn priority_fields_fit(confirm: &Confirm, from: Option<&str>, width: u16, height: u16) -> bool {
+pub fn priority_fields_fit(
+    confirm: &Confirm,
+    from: Option<&str>,
+    policy: Policy,
+    width: u16,
+    height: u16,
+) -> bool {
     let area = ratatui::layout::Rect::new(0, 0, width, height);
     let chunks = watch_chunks(area, true, false);
-    card_priority_fits(confirm, from, chunks[2])
+    card_priority_fits(confirm, from, policy, chunks[2])
 }
 
 /// Render the open confirmation's card — the core's fields **verbatim**, no
@@ -885,6 +1352,7 @@ fn render_detail(
     frame: &mut Frame,
     confirm: Option<&Confirm>,
     from: Option<&str>,
+    policy: Policy,
     area: ratatui::layout::Rect,
 ) {
     let block = themed_block(" Card ");
@@ -899,7 +1367,7 @@ fn render_detail(
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
 
-    let mut lines = priority_lines(confirm, from, width);
+    let mut lines = priority_lines(confirm, from, policy, width);
     if lines.len() > height {
         // The card cannot show what the human must read; approve is gated off
         // (`priority_fields_fit` — the model refuses `y` and PIN submits). The
@@ -1058,7 +1526,7 @@ mod tests {
     use super::*;
     use crate::app::{Model, Msg};
     use crate::protocol::{
-        AuthOutcome, Card, ContextOutcome, DecodedCall, Kind, Risk, WalletContext,
+        AuthOutcome, Card, ContextOutcome, DecodedCall, GetOutcome, Kind, Risk, WalletContext,
     };
     use crate::transport::Reply;
     use ratatui::Terminal;
@@ -1127,6 +1595,74 @@ mod tests {
             .any(|row| fragments.iter().all(|f| row.contains(f)))
     }
 
+    /// The Captain's question, as a test: the bottom block must not hold rows
+    /// while there is nothing in it. The card earns its space in the moment of
+    /// a decision and gives it back when the decision is over — the property
+    /// `watch_chunks` protects (rows for risk warnings and the PIN prompt on a
+    /// 24-row terminal) is needed only while the card is open, and by then the
+    /// queue has already collapsed to a strip and freed them.
+    #[test]
+    fn a_closed_card_reserves_no_rows() {
+        let mut model = Model::default();
+        to_watching(
+            &mut model,
+            (0..18)
+                .map(|i| {
+                    summary(
+                        &format!("{i:08}-0000-0000-0000-000000000000"),
+                        "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                        "1000000000000000000",
+                        false,
+                    )
+                })
+                .collect(),
+        );
+        let rows = draw_rows(&model, 80, 24);
+        let screen = rows.join("\n");
+        assert!(
+            !screen.contains("Card"),
+            "no card block while none is open:\n{screen}"
+        );
+        assert!(
+            !screen.contains("press enter to see the full card"),
+            "the hint belongs in the navigation row, not in six reserved rows:\n{screen}"
+        );
+
+        // And the rows it used to hold go to the list.
+        let listed = rows.iter().filter(|r| r.contains("0x8b3E")).count();
+        assert!(
+            listed >= 18,
+            "every waiting item fits once the reserve is gone, saw {listed}:\n{screen}"
+        );
+    }
+
+    /// The reverse side: with a card open the protected geometry is unchanged —
+    /// the queue collapses to a strip and the card takes the rest.
+    #[test]
+    fn an_open_card_still_gets_its_rows() {
+        let mut model = Model::default();
+        to_watching(
+            &mut model,
+            vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )],
+        );
+        model.update(Msg::Open);
+        model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+            "00000000-0000-0000-0000-000000000000",
+            NOW + 300,
+            false,
+        )))));
+        let screen = draw_rows(&model, 80, 24).join("\n");
+        assert!(
+            screen.contains("Card"),
+            "an open card must be drawn:\n{screen}"
+        );
+    }
+
     fn summary(id: &str, to: &str, amount: &str, high_risk: bool) -> Summary {
         Summary {
             id: id.to_owned(),
@@ -1162,6 +1698,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
@@ -1172,6 +1709,734 @@ mod tests {
     /// A session whose `context` answered ok with an EMPTY address string —
     /// distinct from a degraded context: `parse_context` rejects a missing
     /// address but passes `""` through (T2).
+    /// [`to_watching`] with an explicit policy — the header states the pair, so
+    /// its tests need to set it.
+    fn to_watching_with_policy(model: &mut Model, policy: Policy) {
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        model.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        model.update(Msg::PinDigit('1'));
+        model.update(Msg::PinSubmit);
+        model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: vec![],
+                allowed_chains: vec![1],
+                policy,
+            },
+        )))));
+        model.update(Msg::Tick);
+        model.update(Msg::Reply(Reply::List(vec![])));
+    }
+
+    fn policy_of(mode: PolicyMode, origin: PolicyOrigin) -> Policy {
+        Policy { mode, origin }
+    }
+
+    /// Q5: the mode is loud at every use. It is stated on every screen, not
+    /// only the one that can act on it.
+    #[test]
+    fn the_header_states_the_wallets_autonomy_on_every_screen() {
+        for view in [
+            crate::app::View::Dashboard,
+            crate::app::View::Queue,
+            crate::app::View::Receive,
+            crate::app::View::Activity,
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(
+                &mut model,
+                policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+            );
+            model.update(Msg::View(view));
+            let header = draw_rows(&model, 80, 24)[0].clone();
+            assert!(
+                header.contains("unconfirmed"),
+                "{view:?} must state it too: {header}"
+            );
+        }
+    }
+
+    /// The Reviewer's criterion, and the whole point of the phrase: the alarm
+    /// colour marks exactly one state — the one where the human's expectation
+    /// and the wallet's behaviour come apart. Acknowledged autonomy is the
+    /// human's own choice, not a warning; painting it red would spend the
+    /// signal. Text alone cannot catch this — a swap of `high_risk()` for
+    /// `accent()` renders fine and reads fine.
+    #[test]
+    fn the_alarm_colour_marks_only_unacknowledged_autonomy() {
+        let alarm = theme::high_risk();
+        for (mode, origin, needle, expect_alarm) in [
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+                "unconfirmed",
+                true,
+            ),
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Acknowledged,
+                "confirmed",
+                false,
+            ),
+            (
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+                "manual",
+                false,
+            ),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            let fgs = row_fgs_containing(&model, 80, 24, needle);
+            assert_eq!(
+                fgs.contains(&alarm),
+                expect_alarm,
+                "{mode:?}/{origin:?} alarm-coloured? expected {expect_alarm}"
+            );
+        }
+    }
+
+    /// Text modifiers on the first row containing `needle`. The design says the
+    /// selection is a marker plus bold and **not** inversion (inversion fights
+    /// the light theme) — a property no colour or text check can hold.
+    fn row_mods_containing(model: &Model, w: u16, h: u16, needle: &str) -> Modifier {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains(needle) {
+                return (0..w).fold(Modifier::empty(), |acc, x| {
+                    acc | buffer[(x, y)].style().add_modifier
+                });
+            }
+        }
+        Modifier::empty()
+    }
+
+    fn queued(model: &mut Model, policy: Policy) {
+        to_watching_with_policy(model, policy);
+        model.update(Msg::Reply(Reply::List(vec![
+            {
+                let mut s = summary(
+                    "00000000-0000-0000-0000-000000000000",
+                    "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                    "1500000000000000000",
+                    true,
+                );
+                s.chain_id = 8453;
+                s.not_after_unix = NOW + 300;
+                s
+            },
+            {
+                let mut s = summary(
+                    "11111111-1111-1111-1111-111111111111",
+                    "0x1fA9c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9c4D2",
+                    "420000000000000000",
+                    false,
+                );
+                s.not_after_unix = NOW + 300;
+                s
+            },
+        ])));
+        model.update(Msg::View(crate::app::View::Queue));
+    }
+
+    /// The queue is a table, and a table names its columns (mockup state 3).
+    #[test]
+    fn the_queue_names_its_columns() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        for column in ["KIND", "AMOUNT", "RECIPIENT", "NETWORK"] {
+            assert!(
+                screen.contains(column),
+                "column {column} missing:\n{screen}"
+            );
+        }
+    }
+
+    /// The approve gate's boundary, pinned from BOTH sides in one test — the
+    /// device `the_positions_budget_sits_exactly_on_its_boundary` already uses
+    /// for the positions panel.
+    ///
+    /// **Red-first is impossible here by construction:** the code is already
+    /// correct, so there is no state in which this test fails before a fix —
+    /// there is no fix. The falsifiability proof is the mutation, shown in the
+    /// report: `<= height` → `<= height + 1` breaks the tight side, and
+    /// `<= height` → `< height` breaks the exact-fit side.
+    ///
+    /// This is the boundary a stray `+ 1` walked past 243 green tests.
+    #[test]
+    fn the_approve_gate_sits_exactly_on_its_boundary() {
+        const W: u16 = 100;
+        let mut m = Model::default();
+        to_watching(
+            &mut m,
+            vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )],
+        );
+        m.update(Msg::Open);
+        m.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+            "00000000-0000-0000-0000-000000000000",
+            NOW + 300,
+            false,
+        )))));
+        let policy = m.policy();
+        let from = m.wallet_address();
+        let Phase::Watching {
+            confirm: Some(c), ..
+        } = m.phase()
+        else {
+            panic!("a card is open");
+        };
+
+        // Found by construction, not by hand arithmetic: the test survives a
+        // layout change and still pins the edge it is about.
+        let tight = (6u16..80)
+            .find(|h| priority_fields_fit(c, from, policy, W, *h))
+            .expect("some height arms approve");
+        assert!(
+            !priority_fields_fit(c, from, policy, W, tight - 1),
+            "one row less than the exact fit must NOT arm approve (height {tight})"
+        );
+
+        // And what is drawn agrees with the gate on both sides.
+        let at_fit = draw_rows(&m, W, tight).join("\n");
+        assert!(
+            !at_fit.contains("TERMINAL TOO SMALL"),
+            "an exact fit shows the card, no banner:\n{at_fit}"
+        );
+        let one_short = draw_rows(&m, W, tight - 1).join("\n");
+        assert!(
+            one_short.contains("TERMINAL TOO SMALL"),
+            "one row short must say so and disable approve:\n{one_short}"
+        );
+    }
+
+    /// The column the mockup called AGE shows time LEFT instead — the wire
+    /// carries no creation time, and what matters for triage is how long the
+    /// human has, not how long it has sat (Reviewer, round 10).
+    #[test]
+    fn the_queue_shows_how_long_is_left_not_how_long_it_sat() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains("EXPIRES"), "the column is named:\n{screen}");
+        assert!(
+            screen.contains("4 min") || screen.contains("5 min"),
+            "and it counts down:\n{screen}"
+        );
+    }
+
+    /// A deadline already past reads as expired, never as a huge number: the
+    /// countdown saturates rather than wrapping (same rule as the card's).
+    #[test]
+    fn a_passed_deadline_reads_as_expired() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let mut s = summary(
+            "00000000-0000-0000-0000-000000000000",
+            "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+            "1000000000000000000",
+            false,
+        );
+        s.not_after_unix = NOW - 10;
+        model.update(Msg::Reply(Reply::List(vec![s])));
+        model.update(Msg::View(crate::app::View::Queue));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains("expired"), "{screen}");
+    }
+
+    /// Ф-4: the balance panel counted its budget and threw it away
+    /// (`let _ = height;`), so content past the panel vanished with no marker —
+    /// unlike positions right below it, which says what it hid.
+    ///
+    /// And the staleness warning is pushed last, so it was the FIRST thing to
+    /// disappear. It is not data, it is the line that says the data may be
+    /// wrong; it outranks a balance row and survives the truncation.
+    #[test]
+    fn the_balance_panel_says_what_it_hid_and_keeps_the_warning() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            WalletContext {
+                address: WALLET.to_owned(),
+                balances: (0..10)
+                    .map(|i| crate::protocol::ChainBalance {
+                        chain_id: i,
+                        symbol: "ETH".to_owned(),
+                        balance: "1000000000000000000".to_owned(),
+                    })
+                    .collect(),
+                allowed_chains: vec![1],
+                policy: policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+            },
+        )))));
+        // A refresh that failed after a good one: the wallet is kept, the data
+        // is flagged as possibly stale.
+        model.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        model.update(Msg::View(crate::app::View::Dashboard));
+
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(
+            screen.contains("more — terminal too small"),
+            "the panel must say what it hid:\n{screen}"
+        );
+        assert!(
+            screen.contains("may be stale"),
+            "and the warning must outlive the rows it warns about:\n{screen}"
+        );
+    }
+
+    /// Б-3: the list must follow the cursor. Kimi walked 39 items down and the
+    /// selection bar left the screen entirely — the human is deciding on a
+    /// payment they cannot see. The queue is where duplicates pile up when
+    /// autonomy is unconfirmed, which this wave documents as expected, so a
+    /// long queue is not a corner case here.
+    #[test]
+    fn the_queue_follows_the_cursor_and_says_what_is_hidden() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let items: Vec<_> = (0..40)
+            .map(|i| {
+                let mut s = summary(
+                    &format!("{i:08}-0000-0000-0000-000000000000"),
+                    "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                    "1000000000000000000",
+                    false,
+                );
+                s.not_after_unix = NOW + 300;
+                s
+            })
+            .collect();
+        model.update(Msg::Reply(Reply::List(items)));
+        model.update(Msg::View(crate::app::View::Queue));
+
+        let top = draw_rows(&model, 100, 24).join("\n");
+        assert!(top.contains('▌'), "the bar is on screen at the top:\n{top}");
+        assert!(
+            top.contains("more — terminal too small"),
+            "and what is hidden is stated, as positions and activity do:\n{top}"
+        );
+
+        for _ in 0..39 {
+            model.update(Msg::MoveDown);
+        }
+        let bottom = draw_rows(&model, 100, 24).join("\n");
+        assert!(
+            bottom.contains('▌'),
+            "the bar must still be on screen at the far end:\n{bottom}"
+        );
+    }
+
+    /// И-1: with a card open the queue collapses to one row, and that row is
+    /// the selected item — the property the collapsed strip exists for. The
+    /// column header cannot also fit there, and between a heading and the item
+    /// it heads, the item wins.
+    #[test]
+    fn the_collapsed_strip_shows_the_item_not_the_heading() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::List(vec![summary(
+            "00000000-0000-0000-0000-000000000000",
+            "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+            "1000000000000000000",
+            false,
+        )])));
+        model.update(Msg::View(crate::app::View::Queue));
+        model.update(Msg::Open);
+        model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+            "00000000-0000-0000-0000-000000000000",
+            NOW + 300,
+            false,
+        )))));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(
+            screen.contains("0x8b3E"),
+            "the collapsed strip shows the selected item:\n{screen}"
+        );
+    }
+
+    /// The header and the rows are one table or they are not a table.
+    ///
+    /// `the_queue_names_its_columns` only asks whether the words are present,
+    /// which is true of any two independently hand-built strings — and they
+    /// were two, and they drifted: `RECIPIENT` sat over the arrow, two columns
+    /// left of the address it names. This asserts the column INDEX, so a width
+    /// changed in one place and not the other fails here.
+    #[test]
+    fn the_queue_header_sits_over_the_columns_it_names() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let rows = draw_rows(&model, 100, 24);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("RECIPIENT"))
+            .expect("the header row");
+        let data = rows
+            .iter()
+            .find(|r| r.contains("0x8b3E"))
+            .expect("a data row");
+
+        // Character offsets, not byte offsets: `▌`, `●` and `→` are multi-byte,
+        // so `find` alone would compare two different rulers.
+        let col = |s: &str, needle: &str| s.find(needle).map(|b| s[..b].chars().count());
+        for (word, cell) in [
+            ("RECIPIENT", "0x8b3E"),
+            ("NETWORK", "Base"),
+            // The cell CONTENT, not a fragment of it: "min" also matches
+            // inside "5 min" two columns in, and would compare cell starts
+            // against a position that is not one.
+            ("EXPIRES", "5 min"),
+        ] {
+            assert_eq!(
+                col(header, word),
+                col(data, cell),
+                "column {word} must start where {cell} starts\nheader: {header}\nrow:    {data}"
+            );
+        }
+    }
+
+    /// Danger reads before the card is opened: a high-risk row carries `◆` and
+    /// the alarm colour, an ordinary one carries `●`.
+    #[test]
+    fn risk_is_visible_in_the_list_itself() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains('◆'), "high-risk marker:\n{screen}");
+        assert!(screen.contains('●'), "ordinary marker:\n{screen}");
+        let fgs = row_fgs_containing(&model, 100, 24, "◆");
+        assert!(fgs.contains(&theme::high_risk()), "and it is amber");
+    }
+
+    /// Design §5: the selected row is a left bar plus bold — **not** inversion,
+    /// which fights the light theme.
+    #[test]
+    fn the_selected_row_is_barred_and_bold_never_inverted() {
+        let mut model = Model::default();
+        queued(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains('▌'), "the selection bar:\n{screen}");
+        let mods = row_mods_containing(&model, 100, 24, "▌");
+        assert!(mods.contains(Modifier::BOLD), "the selected row is bold");
+        assert!(
+            !mods.contains(Modifier::REVERSED),
+            "and never inverted — inversion fights the light theme"
+        );
+    }
+
+    /// §4: the card says why this payment is waiting, and the answer follows
+    /// from the pair (mode, origin) — the wire carries no reason field, and
+    /// within one wallet the reason is the same for every parked item.
+    #[test]
+    fn the_card_says_why_the_payment_is_waiting() {
+        for (mode, origin, reason) in [
+            (
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+                "waiting for your decision",
+            ),
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+                "parked: autonomy unconfirmed — confirm on the Dashboard",
+            ),
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Acknowledged,
+                "parked until mode confirmation — decided by you",
+            ),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            model.update(Msg::Reply(Reply::List(vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )])));
+            model.update(Msg::View(crate::app::View::Queue));
+            model.update(Msg::Open);
+            model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+                "00000000-0000-0000-0000-000000000000",
+                NOW + 300,
+                false,
+            )))));
+            let screen = draw_rows(&model, 100, 24).join("\n");
+            assert!(
+                screen.contains(reason),
+                "{mode:?}/{origin:?} must say why:\n{screen}"
+            );
+        }
+    }
+
+    /// Only the state that asks something of the human is alarm-coloured —
+    /// the same rule the header follows, applied to the same fact.
+    #[test]
+    fn only_the_unconfirmed_reason_is_alarm_coloured() {
+        for (mode, origin, needle, expect_alarm) in [
+            (
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+                "confirm on the Dashboard",
+                true,
+            ),
+            (
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+                "waiting for your decision",
+                false,
+            ),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            model.update(Msg::Reply(Reply::List(vec![summary(
+                "00000000-0000-0000-0000-000000000000",
+                "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+                "1000000000000000000",
+                false,
+            )])));
+            model.update(Msg::View(crate::app::View::Queue));
+            model.update(Msg::Open);
+            model.update(Msg::Reply(Reply::Get(GetOutcome::Card(card(
+                "00000000-0000-0000-0000-000000000000",
+                NOW + 300,
+                false,
+            )))));
+            let fgs = row_fgs_containing(&model, 100, 24, needle);
+            assert_eq!(
+                fgs.contains(&theme::high_risk()),
+                expect_alarm,
+                "{mode:?}/{origin:?}: alarm expected {expect_alarm}"
+            );
+        }
+    }
+
+    /// The identity panel (mockup, dashboard states 1–2): who this wallet is,
+    /// stated in three lines on the left. The version is the crate's own — В-3
+    /// ratified that the binary shows the number it can actually vouch for,
+    /// not the edition number it has no honest source for.
+    #[test]
+    fn the_dashboard_states_who_this_wallet_is() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains("RUSTOK WALLET"), "the name:\n{screen}");
+        assert!(
+            screen.contains(&format!("console v{}", env!("CARGO_PKG_VERSION"))),
+            "the version it can vouch for:\n{screen}"
+        );
+        assert!(
+            screen.contains(&crate::format::short_addr(WALLET)),
+            "and which wallet this is:\n{screen}"
+        );
+    }
+
+    /// The panels carry the titles the mockup names, so a human reading the
+    /// screen and a human reading the design see the same words.
+    #[test]
+    fn the_dashboard_content_sits_in_named_panels() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let rows = draw_rows(&model, 100, 24);
+        for title in ["Queue", "balance", "positions"] {
+            // A framed title, not the bare word: "Queue" is also a tab and
+            // "balance" was already a flat label, so a substring check passes
+            // before the panels exist and proves nothing.
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(title) && r.contains('┌') && r.contains('─')),
+                "panel {title} is not a titled frame:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// Mockup state 2: while the mode is unconfirmed the queue block says why
+    /// the queue is a queue at all, instead of repeating the count as if this
+    /// were an ordinary backlog.
+    #[test]
+    fn the_queue_panel_says_why_everything_is_parked_when_unconfirmed() {
+        const WHY: &str = "all parked, mode unconfirmed";
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Reply(Reply::List(vec![summary(
+            "00000000-0000-0000-0000-000000000000",
+            "0x8b3E4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c91Aa",
+            "1000000000000000000",
+            false,
+        )])));
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains(WHY), "{screen}");
+    }
+
+    /// The banner exists only where there is something to confirm. A permanent
+    /// strip for a once-in-a-wallet action is the same standing reserve the
+    /// card just gave up (design §3).
+    #[test]
+    fn the_dashboard_offers_confirmation_only_when_there_is_something_to_confirm() {
+        const TITLE: &str = "Autonomous mode unconfirmed";
+        for (mode, origin, expected) in [
+            (PolicyMode::Autonomous, PolicyOrigin::Provisioned, true),
+            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged, false),
+            (PolicyMode::Supervised, PolicyOrigin::Provisioned, false),
+            (PolicyMode::ReadOnly, PolicyOrigin::Provisioned, false),
+            (PolicyMode::Unknown, PolicyOrigin::Provisioned, false),
+        ] {
+            let mut model = Model::default();
+            to_watching_with_policy(&mut model, policy_of(mode, origin));
+            model.update(Msg::View(crate::app::View::Dashboard));
+            let screen = draw_rows(&model, 100, 24).join("\n");
+            assert_eq!(
+                screen.contains(TITLE),
+                expected,
+                "{mode:?}/{origin:?}: banner expected {expected}\n{screen}"
+            );
+        }
+    }
+
+    /// Transcribed from design §3 — a refusal the human cannot act on is a dead
+    /// end, so the banner states what is happening and which key ends it.
+    #[test]
+    fn the_confirmation_banner_says_what_happens_and_what_to_press() {
+        const WHAT_HAPPENS: &str = "Every send queues and waits for you.";
+        const WHAT_TO_PRESS: &str = "[c] — confirm autonomy";
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows(&model, 100, 24).join("\n");
+        assert!(screen.contains(WHAT_HAPPENS), "what happens:\n{screen}");
+        assert!(screen.contains(WHAT_TO_PRESS), "what to press:\n{screen}");
+        assert!(
+            screen.contains("requires PIN"),
+            "and that it will ask for the PIN:\n{screen}"
+        );
+    }
+
+    /// The banner is the one framed thing on the Dashboard, and it carries the
+    /// alarm colour — the same signal the header spends on this one state.
+    #[test]
+    fn the_confirmation_banner_is_alarm_coloured() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let fgs = row_fgs_containing(&model, 100, 24, "Autonomous mode unconfirmed");
+        assert!(
+            fgs.contains(&theme::high_risk()),
+            "the banner must read as the thing that wants attention"
+        );
+    }
+
+    /// The ratified phrase, transcribed from the design decision (§2 table) and
+    /// not from the code: this is the one string in the slice that carries the
+    /// alarm colour, so it earns literal accuracy rather than a paraphrase.
+    ///
+    /// Wide terminals are where it renders — the tabs take 59 columns, so the
+    /// full wording needs 105. Narrower ones get the approved short form,
+    /// which is a different question from whether the designed phrase exists at
+    /// all.
+    #[test]
+    fn the_designed_alarm_phrase_renders_verbatim_when_it_fits() {
+        const DESIGNED: &str = "autonomous · unconfirmed — sends wait for you";
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::Resize {
+            width: 120,
+            height: 24,
+        });
+        let header = draw_rows(&model, 120, 24)[0].clone();
+        assert!(
+            header.contains(DESIGNED),
+            "the ratified wording must be reachable, not only a paraphrase of it:\n{header}"
+        );
+    }
+
+    /// Before the first `context` reply the console has not been told the mode.
+    /// It says nothing rather than inventing a placeholder — an invented one is
+    /// a claim about whether this wallet spends by itself.
+    #[test]
+    fn an_unknown_mode_states_nothing() {
+        let mut model = Model::default();
+        model.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        model.update(Msg::Reply(Reply::Hello {
+            server: "s".to_owned(),
+        }));
+        model.update(Msg::PinDigit('1'));
+        model.update(Msg::PinSubmit);
+        model.update(Msg::Reply(Reply::Auth(AuthOutcome::Ok)));
+        let header = draw_rows(&model, 80, 24)[0].clone();
+        for word in ["confirmed", "manual", "read-only", "autonomous"] {
+            assert!(
+                !header.contains(word),
+                "nothing is known yet, so nothing is claimed: {header}"
+            );
+        }
+    }
+
     fn to_watching_empty_address(model: &mut Model, items: Vec<Summary>) {
         model.update(Msg::Resize {
             width: 80,
@@ -1188,6 +2453,7 @@ mod tests {
                 address: String::new(),
                 balances: vec![],
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         model.update(Msg::View(crate::app::View::Queue)); // Stage-5 home is Dashboard
@@ -1249,17 +2515,21 @@ mod tests {
             )],
         );
         let rows = draw_rows(&m, 90, 20);
-        // Address AND decimal wei on the SAME line, verbatim — a swap would split
-        // them across lines.
+        // What this pins is the PAIRING: the recipient and the amount of the
+        // SAME item on one line, so a swap would split them across lines.
+        // The representation moved with the design — the queue is a reading
+        // list and shortens the address (as Activity already does), while the
+        // card stays the signing surface and shows it in full. The property
+        // did not move.
         assert!(
             has_line_with(
                 &rows,
                 &[
-                    "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
-                    "100000000000000000",
+                    &crate::format::short_addr("0x742d35Cc6634C0532925a3b844Bc454e4438f44e"),
+                    "0.1 ETH",
                 ],
             ),
-            "address and amount must render together, exactly as received"
+            "recipient and amount of one item must render together"
         );
     }
 
@@ -2091,6 +3361,7 @@ mod tests {
                 address: WALLET.to_owned(),
                 balances,
                 allowed_chains: vec![1],
+                policy: Default::default(),
             },
         )))));
         m.update(Msg::Tick);
@@ -2194,7 +3465,7 @@ mod tests {
         let many: Vec<Position> = (0..40)
             .map(|i| {
                 let mut p = aave_position();
-                p.asset_symbol = format!("TOK{i}");
+                p.asset_symbol = format!("SYM{i}");
                 p
             })
             .collect();
@@ -2211,7 +3482,7 @@ mod tests {
         (0..n)
             .map(|i| {
                 let mut p = aave_position();
-                p.asset_symbol = format!("TOK{i}");
+                p.asset_symbol = format!("SYM{i}");
                 p.extra.clear(); // keep each row single-line at this width
                 p
             })
@@ -2219,33 +3490,34 @@ mod tests {
     }
 
     fn position_rows(rows: &[String]) -> usize {
-        rows.iter().filter(|r| r.contains("TOK")).count()
+        rows.iter().filter(|r| r.contains("SYM")).count()
     }
 
     #[test]
     fn the_positions_budget_sits_exactly_on_its_boundary() {
-        // Geometry at 100×24, empty balances: tab(1)+borders(2) → inner 21;
-        // header = waiting(1)+blank(1)+"balance"(1)+"no balances"(1)+blank(1)
-        // +"positions"(1) = 6 → budget 15. The Gate-2 blocker subtracted the
-        // header TWICE and cut positions that fit — this pins both edges.
-        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(15)));
+        // Geometry at 100×24 after the panel split: header row (1) + Queue
+        // panel (3) + balance panel (BALANCE_ROWS) leaves 14 for positions,
+        // whose own borders take 2 → budget 12. The numbers moved with the
+        // layout; what this pins did not — the Gate-2 blocker subtracted the
+        // header TWICE and cut positions that fit, so both edges stay pinned.
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(12)));
         let rows = draw_rows(&m, 100, 24);
         assert_eq!(
             position_rows(&rows),
-            15,
+            12,
             "an exact fit shows every position, no marker"
         );
         assert!(!rows.join("\n").contains("more — terminal too small"));
 
-        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(16)));
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(13)));
         let rows = draw_rows(&m, 100, 24);
         assert_eq!(
             position_rows(&rows),
-            14,
-            "one over: 14 positions + the marker fill the budget exactly — \
-             nothing that fits is hidden (the blocker cut at 11 here)"
+            11,
+            "one over: the positions that fit stay, the marker takes the last \
+             row — nothing that fits is hidden"
         );
-        assert!(rows.join("\n").contains("+2 more — terminal too small"));
+        assert!(rows.join("\n").contains("more — terminal too small"));
     }
 
     #[test]

@@ -15,13 +15,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire protocol major version this client speaks. Proto 2 adds the auth-gated
-/// `context` read-op (protocol §3.7) — the source of the wallet's own address
-/// for the card's From→To block. There is deliberately no fallback to proto 1
-/// against an older server: the wallet image ships core and console as a pair,
-/// so a mismatch means a hand-built setup — the honest answer is the upgrade
-/// hint, not a silently poorer card (Gate-1 ratification, 2026-07-12).
-pub const PROTO_VERSION: u32 = 2;
+/// Wire protocol major version this client speaks. Proto 3 adds `ack`
+/// (protocol §3.10) — the operation by which a human confirms an autonomous
+/// mode the core's volume-shape heuristic assigned on its own — together with
+/// the `policy_mode` / `policy_origin` pair on `context` (§3.7). Proto 2 had
+/// added the auth-gated read-ops, `context` among them.
+///
+/// **There is deliberately no fallback to an older proto against an older
+/// server: the wallet image ships core and console as a pair, so a mismatch
+/// means a hand-built setup — the honest answer is the upgrade hint, not a
+/// silently poorer card (Gate-1 ratification, 2026-07-12).** Re-confirmed when
+/// proto 3 landed (2026-08-07) by re-measuring the premise rather than
+/// trusting it: `Dockerfile.wallet` copies this binary in from a pinned
+/// console image tag and lays it beside `core-server`, so the two versions are
+/// locked together by the image build. A reconnect-and-degrade branch would be
+/// machinery for a case the deployment does not produce.
+pub const PROTO_VERSION: u32 = 3;
 
 // ─────────────────────────── Requests (client → server) ───────────────────────────
 
@@ -253,6 +262,71 @@ pub struct WalletContext {
     pub balances: Vec<ChainBalance>,
     /// The server's configured chain allow-list, in order.
     pub allowed_chains: Vec<u64>,
+    /// The autonomy ceiling and how the core arrived at it (§3.7, proto 3+).
+    ///
+    /// Skipped by serde on purpose: the wire path goes through `parse_context`'s
+    /// private `Raw`, which is the ONE place the pair is interpreted — including
+    /// its safe readings for absent/unknown words. A second derive-driven path
+    /// would be a second interpretation, free to drift from the first.
+    #[serde(skip)]
+    pub policy: Policy,
+}
+
+/// The wallet's autonomy as the core reports it — **mode and origin together**.
+///
+/// They are one statement, not two fields (§3.7): `Autonomous` +
+/// `Provisioned` still parks every send, so anything rendering the mode alone
+/// tells the human this wallet sends when it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Policy {
+    /// The ceiling itself.
+    pub mode: PolicyMode,
+    /// How the core arrived at it.
+    pub origin: PolicyOrigin,
+}
+
+/// The autonomy ceiling (§3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyMode {
+    /// Writes denied outright.
+    ReadOnly,
+    /// Every write parks for the human.
+    Supervised,
+    /// Sends on its own — **only once [`PolicyOrigin::Acknowledged`]**.
+    Autonomous,
+    /// Absent or a word this build does not know.
+    ///
+    /// Reachable without any exotic scenario: a `proto:2` core carries no
+    /// policy fields at all, which is exactly the degraded session §3.1's
+    /// fallback lands in. The default is this rather than a real mode because
+    /// a guess here is a claim about whether the wallet spends money by itself.
+    #[default]
+    Unknown,
+}
+
+/// How the mode was set (§3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyOrigin {
+    /// Assigned by the core's volume-shape heuristic — nobody was asked.
+    ///
+    /// Normative default for an absent or unrecognised value: erring here costs
+    /// one extra confirmation, erring the other way misinforms the human.
+    #[default]
+    Provisioned,
+    /// A human confirmed it (`ack`, §3.10).
+    Acknowledged,
+}
+
+impl Policy {
+    /// Whether there is autonomy here awaiting a human's confirmation — the one
+    /// state that asks something of the human.
+    #[must_use]
+    pub fn awaits_acknowledgment(self) -> bool {
+        matches!(
+            (self.mode, self.origin),
+            (PolicyMode::Autonomous, PolicyOrigin::Provisioned)
+        )
+    }
 }
 
 /// Outcome of `context`. Both non-`Ok` variants degrade the UI (the card falls
@@ -304,7 +378,7 @@ pub enum PositionsOutcome {
     /// The wallet's positions — an empty list is a valid answer (best-effort:
     /// no positions, or every source skipped on RPC failure; §3.8).
     Ok(Vec<Position>),
-    /// The core's own keyring isn't unlocked (§3.11).
+    /// The core's own keyring isn't unlocked (§3.12).
     WalletLocked,
 }
 
@@ -473,6 +547,75 @@ pub fn parse_hello(line: &str) -> Result<HelloOutcome, ProtocolError> {
 /// # Errors
 /// [`ProtocolError::Malformed`] on non-JSON / wrong shape; [`ProtocolError::Unexpected`]
 /// on an unmodeled error code.
+/// Outcome of `ack` (§3.10) — confirming this wallet's autonomous mode.
+///
+/// Deliberately a separate type from [`AuthOutcome`] even though the PIN-family
+/// answers coincide: `ack` also answers `not_autonomous` and
+/// `policy_store_failed`, and one shared type would let an `auth` handler
+/// silently accept an outcome that only makes sense here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The mode is confirmed — and stays confirmed across restarts.
+    Confirmed,
+    /// Wrong PIN; `attempts_left == 0` means the lockout is now armed.
+    BadPin {
+        /// Attempts before the lockout trips.
+        attempts_left: u32,
+    },
+    /// Lockout active; retry after this many seconds.
+    Locked {
+        /// Seconds until the channel accepts a PIN again.
+        retry_after_s: u64,
+    },
+    /// The wallet has no PIN record.
+    PinNotSet,
+    /// Transient Argon2 backend failure — never an accept.
+    PinUnavailable,
+    /// Not an autonomous wallet: nothing to confirm. `ack` confirms an existing
+    /// mode and never switches one.
+    NotAutonomous,
+    /// The core could not persist the policy and left it unchanged on purpose —
+    /// a confirmation that lasted only until the next restart would be worse
+    /// than a visible failure.
+    StoreFailed,
+}
+
+/// Parse an `ack` reply (§3.10).
+///
+/// # Errors
+/// [`ProtocolError::Unexpected`] for anything the canon does not list —
+/// including `unauthorized` and `protocol_error`, which mean the channel is not
+/// what we negotiated. This op lifts the parking gate for good, so an answer we
+/// do not understand is never read as a confirmation.
+pub fn parse_ack(line: &str) -> Result<AckOutcome, ProtocolError> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ok: bool,
+        error: Option<String>,
+        attempts_left: Option<u32>,
+        retry_after_s: Option<u64>,
+    }
+    let raw: Raw = parse_line(line)?;
+    if raw.ok {
+        return Ok(AckOutcome::Confirmed);
+    }
+    match raw.error.as_deref() {
+        Some("bad_pin") => Ok(AckOutcome::BadPin {
+            attempts_left: raw.attempts_left.unwrap_or(0),
+        }),
+        Some("locked") => Ok(AckOutcome::Locked {
+            retry_after_s: raw.retry_after_s.unwrap_or(0),
+        }),
+        Some("pin_not_set") => Ok(AckOutcome::PinNotSet),
+        Some("pin_unavailable") => Ok(AckOutcome::PinUnavailable),
+        Some("not_autonomous") => Ok(AckOutcome::NotAutonomous),
+        Some("policy_store_failed") => Ok(AckOutcome::StoreFailed),
+        other => Err(ProtocolError::Unexpected(
+            other.unwrap_or("ack without ok or error").to_owned(),
+        )),
+    }
+}
+
 pub fn parse_auth(line: &str) -> Result<AuthOutcome, ProtocolError> {
     #[derive(Deserialize)]
     struct Raw {
@@ -565,6 +708,8 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
         address: Option<String>,
         balances: Option<Vec<ChainBalance>>,
         allowed_chains: Option<Vec<u64>>,
+        policy_mode: Option<String>,
+        policy_origin: Option<String>,
         error: Option<String>,
     }
     let raw: Raw = parse_line(line)?;
@@ -572,10 +717,27 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
         let address = raw
             .address
             .ok_or_else(|| ProtocolError::Malformed("ok context without address".to_owned()))?;
+        // Absent or unrecognised words fall to the safe reading rather than a
+        // parse error: a proto-2 core sends neither field, and refusing the
+        // whole context would cost the human the screen over a field that is
+        // not signing-critical (§3.7).
+        let policy = Policy {
+            mode: match raw.policy_mode.as_deref() {
+                Some("read_only") => PolicyMode::ReadOnly,
+                Some("supervised") => PolicyMode::Supervised,
+                Some("autonomous") => PolicyMode::Autonomous,
+                _ => PolicyMode::Unknown,
+            },
+            origin: match raw.policy_origin.as_deref() {
+                Some("acknowledged") => PolicyOrigin::Acknowledged,
+                _ => PolicyOrigin::Provisioned,
+            },
+        };
         Ok(ContextOutcome::Ok(Box::new(WalletContext {
             address,
             balances: raw.balances.unwrap_or_default(),
             allowed_chains: raw.allowed_chains.unwrap_or_default(),
+            policy,
         })))
     } else if raw.error.as_deref() == Some("wallet_locked") {
         Ok(ContextOutcome::WalletLocked)
@@ -763,7 +925,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            r#"{"op":"hello","proto":2,"client":"rustok-console/0.0.1"}"#
+            r#"{"op":"hello","proto":3,"client":"rustok-console/0.0.1"}"#
         );
     }
 
@@ -796,6 +958,149 @@ mod tests {
         // decimal wei string, verbatim — never re-based here
         assert_eq!(ctx.balances[0].balance, "1000000000000000000");
         assert_eq!(ctx.allowed_chains, vec![1, 8453]);
+    }
+
+    /// Every answer §3.10 lists, transcribed from the protocol canon rather
+    /// than from whatever the parser happens to accept.
+    #[test]
+    fn parse_ack_covers_every_documented_answer() {
+        for (line, expected) in [
+            (
+                r#"{"ok":true,"mode":"autonomous","origin":"acknowledged"}"#,
+                AckOutcome::Confirmed,
+            ),
+            (
+                r#"{"ok":false,"error":"bad_pin","attempts_left":2}"#,
+                AckOutcome::BadPin { attempts_left: 2 },
+            ),
+            (
+                r#"{"ok":false,"error":"locked","retry_after_s":287}"#,
+                AckOutcome::Locked { retry_after_s: 287 },
+            ),
+            (
+                r#"{"ok":false,"error":"pin_not_set"}"#,
+                AckOutcome::PinNotSet,
+            ),
+            (
+                r#"{"ok":false,"error":"pin_unavailable"}"#,
+                AckOutcome::PinUnavailable,
+            ),
+            (
+                r#"{"ok":false,"error":"not_autonomous"}"#,
+                AckOutcome::NotAutonomous,
+            ),
+            (
+                r#"{"ok":false,"error":"policy_store_failed"}"#,
+                AckOutcome::StoreFailed,
+            ),
+        ] {
+            assert_eq!(parse_ack(line).unwrap(), expected, "line: {line}");
+        }
+    }
+
+    /// An answer the canon does not list is not silently read as success —
+    /// this is the one op that lifts the parking gate for good.
+    #[test]
+    fn an_unknown_ack_answer_is_never_a_confirmation() {
+        for line in [
+            r#"{"ok":false,"error":"unauthorized"}"#,
+            r#"{"ok":false,"error":"protocol_error"}"#,
+            r#"{"ok":false}"#,
+        ] {
+            assert!(
+                parse_ack(line).is_err(),
+                "must not resolve to an outcome: {line}"
+            );
+        }
+    }
+
+    /// §3.10 — the PIN rides on the operation itself, and the line is built in
+    /// a zeroizing buffer like `auth`, never through the general Serialize path.
+    #[test]
+    fn the_ack_line_carries_the_pin_and_nothing_else() {
+        let mut pin = crate::app::Pin::default();
+        for c in "483920".chars() {
+            pin.push(c);
+        }
+        assert_eq!(&*pin.ack_line(), r#"{"op":"ack","pin":"483920"}"#);
+    }
+
+    /// §3.7: the mode and its origin are ONE statement. A wallet reported as
+    /// `autonomous` + `provisioned` still parks every send.
+    #[test]
+    fn parse_context_carries_the_policy_pair() {
+        for (mode_wire, origin_wire, mode, origin) in [
+            (
+                "autonomous",
+                "acknowledged",
+                PolicyMode::Autonomous,
+                PolicyOrigin::Acknowledged,
+            ),
+            (
+                "autonomous",
+                "provisioned",
+                PolicyMode::Autonomous,
+                PolicyOrigin::Provisioned,
+            ),
+            (
+                "supervised",
+                "provisioned",
+                PolicyMode::Supervised,
+                PolicyOrigin::Provisioned,
+            ),
+            (
+                "read_only",
+                "provisioned",
+                PolicyMode::ReadOnly,
+                PolicyOrigin::Provisioned,
+            ),
+        ] {
+            let line = format!(
+                r#"{{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"{mode_wire}","policy_origin":"{origin_wire}"}}"#
+            );
+            let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+                panic!("ok context");
+            };
+            assert_eq!(ctx.policy.mode, mode, "mode {mode_wire}");
+            assert_eq!(ctx.policy.origin, origin, "origin {origin_wire}");
+        }
+    }
+
+    /// Normative (§3.7): an absent or unrecognised origin reads as
+    /// `provisioned`. Reachable for real — a proto-2 core carries no policy
+    /// fields at all. Erring this way costs one extra confirmation; erring the
+    /// other way tells the human the wallet sends when it does not.
+    #[test]
+    fn an_absent_or_unknown_policy_origin_reads_as_provisioned() {
+        for line in [
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"autonomous"}"#,
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"autonomous","policy_origin":"something_new"}"#,
+        ] {
+            let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
+                panic!("ok context");
+            };
+            assert_eq!(
+                ctx.policy.origin,
+                PolicyOrigin::Provisioned,
+                "unconfirmed is the safe reading: {line}"
+            );
+        }
+    }
+
+    /// A mode word we do not know must never render as autonomy. Also reachable:
+    /// against a proto-2 core the field is absent entirely.
+    #[test]
+    fn an_absent_or_unknown_policy_mode_is_not_autonomous() {
+        for line in [
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1]}"#,
+            r#"{"ok":true,"address":"0x1","balances":[],"allowed_chains":[1],"policy_mode":"turbo"}"#,
+        ] {
+            let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
+                panic!("ok context");
+            };
+            assert_eq!(ctx.policy.mode, PolicyMode::Unknown, "line: {line}");
+            assert_ne!(ctx.policy.mode, PolicyMode::Autonomous);
+        }
     }
 
     #[test]

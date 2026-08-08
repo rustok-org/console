@@ -16,6 +16,23 @@ use ratatui::style::{Color, Modifier, Style};
 /// Whether to emit color at all. Read once: `NO_COLOR` does not change mid-run,
 /// and the renderer asks for a role on every frame.
 fn color_enabled() -> bool {
+    // In the test binary color is always on, and that is not a workaround.
+    // Under `NO_COLOR` every role resolves to the same `Color::Reset`, so a
+    // test asserting that MEANING is carried by color — amber for the one
+    // alarming state, accent for the rest — cannot distinguish anything. It
+    // does not fail because the code is wrong; it fails because there is
+    // nothing left to measure. A developer or a CI runner with `NO_COLOR` in
+    // the environment would get three red tests for a reason unrelated to the
+    // code under test.
+    //
+    // Nothing is lost by this: the degradation itself is covered purely,
+    // through `resolve(false, …)`, which never consults the environment. What
+    // this does leave uncovered is the env read on the line below — one line,
+    // and covering it would mean mutating process-wide state from parallel
+    // tests through a `OnceLock` that reads once by design.
+    if cfg!(test) {
+        return true;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NO_COLOR").is_none())
 }
@@ -128,5 +145,20 @@ mod tests {
             Color::Rgb(0x16, 0xE0, 0xC3)
         );
         assert_eq!(resolve(false, 0x16, 0xE0, 0xC3), Color::Reset);
+    }
+
+    /// The guard for the line above: color-semantics tests are only meaningful
+    /// while the roles differ from each other. If someone ever makes the test
+    /// binary honor `NO_COLOR`, every such test starts passing vacuously —
+    /// `high_risk` and `accent` would both be `Reset`, and "this is amber and
+    /// that is not" would be true of nothing.
+    #[test]
+    fn the_test_binary_keeps_the_roles_distinguishable() {
+        assert_ne!(
+            high_risk(),
+            accent(),
+            "roles must stay apart in tests, whatever NO_COLOR says outside"
+        );
+        assert_ne!(approve(), reject());
     }
 }
