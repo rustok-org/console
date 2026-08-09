@@ -805,8 +805,9 @@ fn age_label(now_unix: u64, unix: u64) -> String {
 const ACK_BANNER_ROWS: u16 = 4;
 
 /// Width of the Dashboard's identity column. Fixed rather than proportional:
-/// it holds three short lines whose longest is the shortened address, so a
-/// share of the width would only take room from the balances beside it.
+/// it holds a handful of short lines whose longest is a version row —
+/// `VERSION_LABEL_WIDTH` plus a `v` and the number — so a share of the width
+/// would only take room from the balances beside it.
 const IDENTITY_COL: u16 = 22;
 
 /// Rows for the balance panel: two borders plus a line per allowed chain, with
@@ -814,30 +815,144 @@ const IDENTITY_COL: u16 = 22;
 /// there is the one that grows.
 const BALANCE_ROWS: u16 = 6;
 
-/// Who this wallet is: the product, the version this binary can vouch for, and
-/// which address is loaded (design v2, mockup states 1–2).
+/// Columns reserved for a version label, so the numbers line up under one
+/// another. `console` is the longest of the three, and two spaces after it keep
+/// the numbers off the word.
+const VERSION_LABEL_WIDTH: usize = 9;
+
+/// What the running wallet image states about the layers the console cannot
+/// ask directly.
 ///
-/// The version is the crate's own `CARGO_PKG_VERSION`. The edition number the
-/// marketing side uses has no honest source inside the binary — it is not
-/// passed in at build time — and printing a number the program cannot verify
-/// is the same class of claim as a mode without its origin (В-3).
-fn render_identity(frame: &mut Frame, address: Option<&str>, area: ratatui::layout::Rect) {
+/// The console's own version is absent from this by design: the binary knows it
+/// at compile time and needs nobody's word for it. These two it does need, and
+/// `None` means the image said nothing — which is the ordinary case outside it.
+#[derive(Clone, Copy, Default)]
+struct Versions<'a> {
+    wallet: Option<&'a str>,
+    core: Option<&'a str>,
+}
+
+/// One version label as the image states it, or `None` when it states nothing
+/// usable.
+///
+/// Blank is not a version, and a control character would tear the frame this
+/// panel is drawn inside, so both read as absent rather than as a value. A
+/// leading `v` is dropped because the two sources disagree on shape — the
+/// wallet's number comes from a manifest (`0.9.3`), the core's from an image
+/// tag (`v0.4.1`) — and the panel states one shape regardless of which side of
+/// the build a number arrived from.
+fn parse_stated_version(raw: &str) -> Option<String> {
+    let stated = raw.trim();
+    if stated.is_empty() || stated.chars().any(char::is_control) {
+        return None;
+    }
+    Some(stated.strip_prefix('v').unwrap_or(stated).to_owned())
+}
+
+/// Split from [`parse_stated_version`] so the judgement above is a pure
+/// function: proving that a blank or a torn value reads as absent must not
+/// require mutating the environment of a parallel test binary.
+fn stated_version(name: &str) -> Option<String> {
+    parse_stated_version(&std::env::var(name).ok()?)
+}
+
+/// The versions of the image this console is running inside, read once.
+///
+/// Read once because an image cannot relabel itself mid-run while the renderer
+/// asks on every frame. Split from [`version_lines`] for the reason `theme`
+/// splits its own env read: the shape of the panel, degradation included, stays
+/// a pure function that no environment can move.
+///
+/// In the test binary this is empty, and that is not a workaround. The test
+/// binary is not the wallet image, so the honest answer there is "the image
+/// said nothing" — and a developer who happens to have `RUSTOK_WALLET_VERSION`
+/// exported would otherwise get a red test for a reason unrelated to the code.
+/// The populated shape is covered directly instead, by passing values in.
+fn image_versions() -> Versions<'static> {
+    if cfg!(test) {
+        return Versions::default();
+    }
+    static STATED: std::sync::OnceLock<(Option<String>, Option<String>)> =
+        std::sync::OnceLock::new();
+    let (wallet, core) = STATED.get_or_init(|| {
+        (
+            stated_version("RUSTOK_WALLET_VERSION"),
+            stated_version("RUSTOK_CORE_VERSION"),
+        )
+    });
+    Versions {
+        wallet: wallet.as_deref(),
+        core: core.as_deref(),
+    }
+}
+
+fn version_line(label: &str, version: &str) -> String {
+    format!("{label:<width$}v{version}", width = VERSION_LABEL_WIDTH)
+}
+
+/// The version lines of the identity panel.
+///
+/// Inside the wallet image all three layers are named, because all three can
+/// move independently and a human looking at this screen is usually asking
+/// which ones did. Outside it — a bare `cargo run`, or the console image on its
+/// own — the panel says exactly what it said before: one line, for the binary
+/// that knows itself.
+///
+/// A missing source prints nothing at all, never `unknown`. Absence is not a
+/// value, and a word standing where a number belongs invites the reader to
+/// treat it as one.
+fn version_lines(versions: Versions<'_>) -> Vec<String> {
+    let console = env!("CARGO_PKG_VERSION");
+    if versions.wallet.is_none() && versions.core.is_none() {
+        return vec![format!("console v{console}")];
+    }
+    let mut lines = Vec::with_capacity(3);
+    if let Some(wallet) = versions.wallet {
+        lines.push(version_line("wallet", wallet));
+    }
+    lines.push(version_line("console", console));
+    if let Some(core) = versions.core {
+        lines.push(version_line("core", core));
+    }
+    lines
+}
+
+/// Who this wallet is: the product, the versions of what is actually running,
+/// and which address is loaded (design v2, mockup states 1–2).
+///
+/// Until 0.3.1 this printed one number — the crate's own `CARGO_PKG_VERSION` —
+/// and the comment here argued the case for that: the number a user installs
+/// belongs to the wallet image, it was not passed in at build time, and
+/// printing a figure the program cannot verify is the same class of claim as a
+/// mode without its origin (В-3).
+///
+/// The argument was right, and this circle removed its premise instead of
+/// overruling it. The build now states those numbers into the image, and the
+/// publishing workflow refuses to produce an artifact whose number disagrees
+/// with its manifest. So the panel no longer prints a figure it cannot check —
+/// it prints what the artifact says about itself, which is a different claim,
+/// and outside that artifact it goes quiet rather than guessing.
+fn render_identity(
+    frame: &mut Frame,
+    address: Option<&str>,
+    versions: Versions<'_>,
+    area: ratatui::layout::Rect,
+) {
     let block = themed_block("");
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "RUSTOK",
-                Style::new()
-                    .fg(theme::accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" WALLET", Style::new().add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(Span::styled(
-            concat!("console v", env!("CARGO_PKG_VERSION")),
-            Style::new().fg(theme::faint()),
-        )),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "RUSTOK",
+            Style::new()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" WALLET", Style::new().add_modifier(Modifier::BOLD)),
+    ])];
+    lines.extend(
+        version_lines(versions)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::new().fg(theme::faint())))),
+    );
     if let Some(address) = address {
         lines.push(Line::from(Span::styled(
             format::short_addr(address),
@@ -1033,12 +1148,12 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
     };
 
     // Identity on the left, content on the right (design v2). The identity
-    // column is fixed: it holds three short lines whose longest is the
-    // shortened address, so giving it a share of the width would only take
-    // room from the balances.
+    // column is fixed: it holds a handful of short lines whose longest is a
+    // version row, so giving it a share of the width would only take room from
+    // the balances.
     let cols =
         Layout::horizontal([Constraint::Length(IDENTITY_COL), Constraint::Min(0)]).split(body);
-    render_identity(frame, model.wallet_address(), cols[0]);
+    render_identity(frame, model.wallet_address(), image_versions(), cols[0]);
 
     let panels = Layout::vertical([
         Constraint::Length(3),
@@ -2430,6 +2545,128 @@ mod tests {
             screen.contains(&crate::format::short_addr(WALLET)),
             "and which wallet this is:\n{screen}"
         );
+    }
+
+    /// Draws the identity panel alone, with the image's claims passed in rather
+    /// than read from the environment — the populated shape has to be provable
+    /// without a parallel test binary mutating process-wide state.
+    fn identity_rows(address: Option<&str>, versions: Versions<'_>, w: u16, h: u16) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_identity(f, address, versions, f.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Inside the wallet image the panel names all three layers, in the order a
+    /// person asks about them: the thing they installed, the screen they are
+    /// looking at, the engine underneath. The numbers line up so a changed one
+    /// is seen rather than read for.
+    #[test]
+    fn the_identity_panel_names_every_layer_the_image_states() {
+        let rows = identity_rows(
+            Some(WALLET),
+            Versions {
+                wallet: Some("0.9.3"),
+                core: Some("0.4.1"),
+            },
+            IDENTITY_COL,
+            8,
+        );
+        let screen = rows.join("\n");
+        let ordered: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains('v') && row.trim_matches(['│', ' ']).len() > 1)
+            .collect();
+        assert!(
+            screen.contains(&format!("wallet   v0.9.3")),
+            "what the human installed:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("console  v{}", env!("CARGO_PKG_VERSION"))),
+            "the screen they are looking at:\n{screen}"
+        );
+        assert!(
+            screen.contains("core     v0.4.1"),
+            "the engine underneath:\n{screen}"
+        );
+        let wallet_row = rows.iter().position(|r| r.contains("wallet")).unwrap();
+        let console_row = rows.iter().position(|r| r.contains("console")).unwrap();
+        let core_row = rows.iter().position(|r| r.contains("core")).unwrap();
+        assert!(
+            wallet_row < console_row && console_row < core_row,
+            "outermost first, engine last:\n{screen}"
+        );
+        assert!(!ordered.is_empty(), "sanity: rows were found:\n{screen}");
+    }
+
+    /// Outside the image — a bare `cargo run`, or the console's own container —
+    /// the panel says exactly what it said before this circle: one line, for
+    /// the binary that knows itself. Silence, not the word `unknown`: absence
+    /// is not a value, and a word standing where a number belongs invites the
+    /// reader to treat it as one.
+    #[test]
+    fn outside_the_wallet_image_the_panel_says_only_what_the_binary_knows() {
+        let rows = identity_rows(Some(WALLET), Versions::default(), IDENTITY_COL, 8);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains(&format!("console v{}", env!("CARGO_PKG_VERSION"))),
+            "the one number it can vouch for, in the shape it always had:\n{screen}"
+        );
+        assert!(
+            !screen.contains("unknown") && !screen.contains('?'),
+            "no placeholder standing in for a number:\n{screen}"
+        );
+        assert!(
+            !screen.contains("core"),
+            "no row for a layer that said nothing:\n{screen}"
+        );
+    }
+
+    /// One source missing does not silence the other. The image can state a
+    /// wallet version without a core pin — a hand-built image, a future layout
+    /// — and the row that has an answer still shows it.
+    #[test]
+    fn a_layer_that_states_nothing_leaves_no_row_and_takes_none_with_it() {
+        let rows = identity_rows(
+            Some(WALLET),
+            Versions {
+                wallet: Some("0.9.3"),
+                core: None,
+            },
+            IDENTITY_COL,
+            8,
+        );
+        let screen = rows.join("\n");
+        assert!(screen.contains("wallet   v0.9.3"), "the stated one:\n{screen}");
+        assert!(
+            screen.contains(&format!("console  v{}", env!("CARGO_PKG_VERSION"))),
+            "and the one that knows itself:\n{screen}"
+        );
+        assert!(
+            !screen.contains("core"),
+            "but nothing for the silent one:\n{screen}"
+        );
+    }
+
+    /// What the image says is read at a boundary, so it is judged there. Blank
+    /// is not a version; a control character would tear the frame this panel is
+    /// drawn inside. Both read as absent rather than as a value — and the `v`
+    /// the two sources disagree about is normalized away, so the panel states
+    /// one shape whichever side of the build a number came from.
+    #[test]
+    fn a_blank_or_torn_version_reads_as_absent() {
+        assert_eq!(parse_stated_version("0.9.3").as_deref(), Some("0.9.3"));
+        assert_eq!(parse_stated_version("v0.4.1").as_deref(), Some("0.4.1"));
+        assert_eq!(parse_stated_version("  0.9.3  ").as_deref(), Some("0.9.3"));
+        assert_eq!(parse_stated_version(""), None);
+        assert_eq!(parse_stated_version("   "), None);
+        assert_eq!(parse_stated_version("0.9.3\nRUSTOK WALLET"), None);
+        assert_eq!(parse_stated_version("0.9.3\u{1b}[31m"), None);
     }
 
     /// The panels carry the titles the mockup names, so a human reading the
