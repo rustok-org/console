@@ -389,7 +389,7 @@ fn run(mut terminal: Tui, transport: &Transport, stream_decisions: bool) -> u8 {
 
     loop {
         if terminal
-            .draw(|f| ui::render(f, &model, now_unix()))
+            .draw(|f| ui::render(f, &model, now_unix(), ui::image_versions()))
             .is_err()
         {
             return EXIT_FATAL;
