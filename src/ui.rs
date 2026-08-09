@@ -20,7 +20,7 @@ use crate::{format, qr, theme};
 ///
 /// `now_unix` is the wall clock, passed in rather than read here: the [`Model`]
 /// stays a pure function of its messages, and the countdown stays testable.
-pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
+pub fn render(frame: &mut Frame, model: &Model, now_unix: u64, versions: Versions<'_>) {
     match model.phase() {
         Phase::Connecting => {
             render_centered(frame, "Connecting to the wallet…");
@@ -50,7 +50,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64) {
                 render_receive(frame, items.len(), model.wallet_address(), model.policy())
             }
             View::Dashboard => {
-                render_dashboard(frame, items.len(), model);
+                render_dashboard(frame, items.len(), model, versions);
                 if let Some(a) = ack {
                     render_ack_prompt(frame, a.pin_len());
                 }
@@ -827,7 +827,7 @@ const VERSION_LABEL_WIDTH: usize = 9;
 /// at compile time and needs nobody's word for it. These two it does need, and
 /// `None` means the image said nothing — which is the ordinary case outside it.
 #[derive(Clone, Copy, Default)]
-struct Versions<'a> {
+pub struct Versions<'a> {
     wallet: Option<&'a str>,
     core: Option<&'a str>,
 }
@@ -842,11 +842,21 @@ struct Versions<'a> {
 /// tag (`v0.4.1`) — and the panel states one shape regardless of which side of
 /// the build a number arrived from.
 fn parse_stated_version(raw: &str) -> Option<String> {
-    let stated = raw.trim();
-    if stated.is_empty() || stated.chars().any(char::is_control) {
+    let trimmed = raw.trim();
+    // The `v` comes off FIRST, and then the result is judged. The other order
+    // passes a bare `v` through as an empty version, and the panel draws
+    // `wallet   v` — a label for a number, with no number.
+    let stated = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    // Printable ASCII, and nothing else. This is stricter than rejecting
+    // control characters, and deliberately so: a bidirectional override is not
+    // a control character, passes that test, and reorders the glyphs around it
+    // — on a panel whose only job is to say truthfully what is running. Every
+    // version scheme this project uses is `0-9 A-Z a-z . - +`, so nothing
+    // legitimate is turned away.
+    if stated.is_empty() || !stated.chars().all(|c| c.is_ascii_graphic()) {
         return None;
     }
-    Some(stated.strip_prefix('v').unwrap_or(stated).to_owned())
+    Some(stated.to_owned())
 }
 
 /// Split from [`parse_stated_version`] so the judgement above is a pure
@@ -868,10 +878,7 @@ fn stated_version(name: &str) -> Option<String> {
 /// said nothing" — and a developer who happens to have `RUSTOK_WALLET_VERSION`
 /// exported would otherwise get a red test for a reason unrelated to the code.
 /// The populated shape is covered directly instead, by passing values in.
-fn image_versions() -> Versions<'static> {
-    if cfg!(test) {
-        return Versions::default();
-    }
+pub fn image_versions() -> Versions<'static> {
     static STATED: std::sync::OnceLock<(Option<String>, Option<String>)> =
         std::sync::OnceLock::new();
     let (wallet, core) = STATED.get_or_init(|| {
@@ -901,20 +908,29 @@ fn version_line(label: &str, version: &str) -> String {
 /// A missing source prints nothing at all, never `unknown`. Absence is not a
 /// value, and a word standing where a number belongs invites the reader to
 /// treat it as one.
+/// A version too long for the column is cut with the same marker every other
+/// overflow in this file carries, rather than clipped silently by the renderer.
+/// The fence is tied to [`IDENTITY_COL`] instead of a written-out number: the
+/// column and the cell inside it cannot drift apart if only one of them exists.
 fn version_lines(versions: Versions<'_>) -> Vec<String> {
+    const CELL: usize = IDENTITY_COL as usize - 2; // the two borders
     let console = env!("CARGO_PKG_VERSION");
-    if versions.wallet.is_none() && versions.core.is_none() {
-        return vec![format!("console v{console}")];
-    }
     let mut lines = Vec::with_capacity(3);
-    if let Some(wallet) = versions.wallet {
-        lines.push(version_line("wallet", wallet));
-    }
-    lines.push(version_line("console", console));
-    if let Some(core) = versions.core {
-        lines.push(version_line("core", core));
+    if versions.wallet.is_none() && versions.core.is_none() {
+        lines.push(format!("console v{console}"));
+    } else {
+        if let Some(wallet) = versions.wallet {
+            lines.push(version_line("wallet", wallet));
+        }
+        lines.push(version_line("console", console));
+        if let Some(core) = versions.core {
+            lines.push(version_line("core", core));
+        }
     }
     lines
+        .into_iter()
+        .map(|line| clamp_cell(&line, CELL))
+        .collect()
 }
 
 /// Who this wallet is: the product, the versions of what is actually running,
@@ -1123,7 +1139,7 @@ fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
     frame.render_widget(body, rect);
 }
 
-fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
+fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model, versions: Versions<'_>) {
     let policy = model.policy();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
     frame.render_widget(
@@ -1153,7 +1169,7 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model) {
     // the balances.
     let cols =
         Layout::horizontal([Constraint::Length(IDENTITY_COL), Constraint::Min(0)]).split(body);
-    render_identity(frame, model.wallet_address(), image_versions(), cols[0]);
+    render_identity(frame, model.wallet_address(), versions, cols[0]);
 
     let panels = Layout::vertical([
         Constraint::Length(3),
@@ -1696,9 +1712,27 @@ mod tests {
     /// catch a field rendered under the WRONG label (a swap) — which a
     /// whole-screen substring check would miss.
     fn draw_rows_at(model: &Model, w: u16, h: u16, now_unix: u64) -> Vec<String> {
+        draw_rows_with(model, w, h, now_unix, Versions::default())
+    }
+
+    /// The whole screen, with what the image states about itself passed in.
+    ///
+    /// This is the seam that lets an ordinary `cargo test` prove the panel is
+    /// **wired**, not merely shaped: a mutation that drops the versions on the
+    /// way from `render` to the identity panel fails here, without a script and
+    /// without touching the environment of a parallel test binary.
+    fn draw_rows_with(
+        model: &Model,
+        w: u16,
+        h: u16,
+        now_unix: u64,
+        versions: Versions<'_>,
+    ) -> Vec<String> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, model, now_unix)).unwrap();
+        terminal
+            .draw(|f| render(f, model, now_unix, versions))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
@@ -1721,7 +1755,9 @@ mod tests {
     ) -> Vec<ratatui::style::Color> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        terminal
+            .draw(|f| render(f, model, NOW, Versions::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..h {
             let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
@@ -1965,7 +2001,9 @@ mod tests {
     fn row_mods_containing(model: &Model, w: u16, h: u16, needle: &str) -> Modifier {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        terminal
+            .draw(|f| render(f, model, NOW, Versions::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..h {
             let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
@@ -2665,6 +2703,105 @@ mod tests {
         assert_eq!(parse_stated_version("   "), None);
         assert_eq!(parse_stated_version("0.9.3\nRUSTOK WALLET"), None);
         assert_eq!(parse_stated_version("0.9.3\u{1b}[31m"), None);
+        // A bare `v` is a label with no number behind it. The judgement has to
+        // come AFTER the `v` is taken off, or this reads as an empty version
+        // and the panel draws `wallet   v`.
+        assert_eq!(parse_stated_version("v"), None);
+        assert_eq!(parse_stated_version("  v  "), None);
+        // A bidirectional override is not a control character and passes that
+        // weaker test — while reordering the glyphs on the one panel whose job
+        // is to say truthfully what is running.
+        assert_eq!(parse_stated_version("0.9.3\u{202e}"), None);
+        assert_eq!(parse_stated_version("0.9.\u{0663}"), None);
+    }
+
+    /// The column is narrow and a version is not obliged to be short. Every
+    /// other overflow in this file ends in an explicit marker rather than a
+    /// silent clip, and this row is no exception — the fence is the same
+    /// `clamp_cell` the queue cells use.
+    #[test]
+    fn a_version_too_long_for_the_column_is_cut_with_a_marker() {
+        const CELL: usize = IDENTITY_COL as usize - 2;
+        let lines = version_lines(Versions {
+            wallet: Some("0.9.3-rc.1+build.20260809"),
+            core: None,
+        });
+        let wallet = lines.iter().find(|l| l.starts_with("wallet")).unwrap();
+        assert_eq!(
+            wallet.chars().count(),
+            CELL,
+            "it fills the cell and no more: {wallet}"
+        );
+        assert!(
+            wallet.ends_with('…'),
+            "and says it was cut, rather than clipping in silence: {wallet}"
+        );
+    }
+
+    /// The panel is **wired**, not merely shaped: what the image states reaches
+    /// the screen through the whole render chain, not just through the function
+    /// that formats the rows.
+    ///
+    /// This is the test that was missing. The versions used to be read inside
+    /// the dashboard, from an environment the test binary deliberately kept
+    /// empty — so dropping them anywhere along the way left every test green,
+    /// and only an external script noticed. Passing them in from the top costs
+    /// one argument and makes that regression ordinary to catch.
+    #[test]
+    fn what_the_image_states_reaches_the_screen_through_the_whole_chain() {
+        let mut model = Model::default();
+        to_watching_with_policy(
+            &mut model,
+            policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
+        );
+        model.update(Msg::View(crate::app::View::Dashboard));
+        let screen = draw_rows_with(
+            &model,
+            100,
+            24,
+            NOW,
+            Versions {
+                wallet: Some("0.9.3"),
+                core: Some("0.4.1"),
+            },
+        )
+        .join("\n");
+        assert!(
+            screen.contains("wallet   v0.9.3"),
+            "the wallet's number reached the dashboard:\n{screen}"
+        );
+        assert!(
+            screen.contains("core     v0.4.1"),
+            "and so did the core's:\n{screen}"
+        );
+    }
+
+    /// The fourth combination: the core states its version and the wallet does
+    /// not. Neither row depends on the other having an answer.
+    #[test]
+    fn the_core_alone_still_gets_its_row() {
+        let rows = identity_rows(
+            Some(WALLET),
+            Versions {
+                wallet: None,
+                core: Some("0.4.1"),
+            },
+            IDENTITY_COL,
+            8,
+        );
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("core     v0.4.1"),
+            "the stated one:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("console  v{}", env!("CARGO_PKG_VERSION"))),
+            "and the one that knows itself:\n{screen}"
+        );
+        assert!(
+            !screen.contains("wallet"),
+            "but nothing for the silent one:\n{screen}"
+        );
     }
 
     /// The panels carry the titles the mockup names, so a human reading the
@@ -3499,7 +3636,9 @@ mod tests {
     ) -> Vec<ratatui::style::Color> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, model, NOW)).unwrap();
+        terminal
+            .draw(|f| render(f, model, NOW, Versions::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..h {
             let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
@@ -3537,7 +3676,9 @@ mod tests {
         // On the queue view, the Queue tab is the reversed one.
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &m, NOW)).unwrap();
+        terminal
+            .draw(|f| render(f, &m, NOW, Versions::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
         let queue_at = row.find("Queue").expect("the Queue tab renders") as u16;
@@ -4004,7 +4145,9 @@ mod tests {
         let m = to_dashboard(vec![], PositionsOutcome::Ok(vec![]));
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &m, NOW)).unwrap();
+        terminal
+            .draw(|f| render(f, &m, NOW, Versions::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
         assert!(
@@ -4131,7 +4274,9 @@ mod tests {
         ]);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &m, NOW)).unwrap();
+        terminal
+            .draw(|f| render(f, &m, NOW, Versions::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         for (word, color) in [
             ("approved", theme::approve()),
