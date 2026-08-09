@@ -2578,12 +2578,8 @@ mod tests {
             8,
         );
         let screen = rows.join("\n");
-        let ordered: Vec<&String> = rows
-            .iter()
-            .filter(|row| row.contains('v') && row.trim_matches(['│', ' ']).len() > 1)
-            .collect();
         assert!(
-            screen.contains(&format!("wallet   v0.9.3")),
+            screen.contains("wallet   v0.9.3"),
             "what the human installed:\n{screen}"
         );
         assert!(
@@ -2601,7 +2597,6 @@ mod tests {
             wallet_row < console_row && console_row < core_row,
             "outermost first, engine last:\n{screen}"
         );
-        assert!(!ordered.is_empty(), "sanity: rows were found:\n{screen}");
     }
 
     /// Outside the image — a bare `cargo run`, or the console's own container —
@@ -2642,7 +2637,10 @@ mod tests {
             8,
         );
         let screen = rows.join("\n");
-        assert!(screen.contains("wallet   v0.9.3"), "the stated one:\n{screen}");
+        assert!(
+            screen.contains("wallet   v0.9.3"),
+            "the stated one:\n{screen}"
+        );
         assert!(
             screen.contains(&format!("console  v{}", env!("CARGO_PKG_VERSION"))),
             "and the one that knows itself:\n{screen}"
