@@ -11,9 +11,14 @@ const ETH_DECIMALS: usize = 18;
 /// The wei string as ASCII decimal digits, or `None` when the core sent something
 /// this module will not re-derive.
 ///
-/// The ONE place "is this a number" is decided, so the exact form ([`wei_to_eth`])
-/// and the shortened one ([`short_eth`]) cannot come to different answers about
-/// the same wire value.
+/// The one place "is this **wei**" is decided, so the exact form
+/// ([`wei_to_eth`]) and the shortened one ([`short_eth`]) cannot come to
+/// different answers about the same wire value. [`short_amount`] asks a
+/// different question of a different string — "is this a rendered decimal" —
+/// and answers it separately, because a value with a point is a number there and
+/// not one here. The guard in [`short_eth`] is therefore still load-bearing:
+/// without it `short_eth("0.5")` would print `0.5 ETH` from an input that is not
+/// wei at all.
 fn decimal_wei(wei: &str) -> Option<&str> {
     let digits = wei.trim();
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)

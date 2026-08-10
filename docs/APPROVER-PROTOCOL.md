@@ -293,7 +293,10 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   `no_rpc_configured` (the chain has no provider) · `rpc_call_failed` (the call
   did not come back) · `call_reverted` (the address in the registry is not the
   ERC-20 it was said to be — a configuration error, not a transient one).
-  The list may be absent, which reads as empty.
+  The list may be absent, which reads as empty, and so may a row's
+  `token_address` — unlike its counterpart on a balance row, that one is not
+  displayed, so refusing the whole reply over it would cost a client its session
+  for a string nobody reads.
   **An asset missing from `balances` while `unavailable` is empty means zero,
   and only zero.** Before this field existed, an unreachable chain was simply
   omitted, and a short list of balances was indistinguishable from an empty

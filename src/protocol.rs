@@ -297,6 +297,15 @@ pub struct AssetUnavailable {
     /// place (`ui.rs`); an unknown word is shown verbatim rather than guessed at.
     pub reason: String,
     /// The token's contract, or empty for the native coin.
+    ///
+    /// Defaulted, unlike the contract on a balance row, and the difference is
+    /// the point: that one is drawn, so a core that stopped sending it would
+    /// leave a token looking like a native coin, and refusing the row is the
+    /// cheaper failure. This one is not drawn at all. Making it mandatory buys
+    /// nothing and costs a whole `context` reply — one missing field on one
+    /// unread asset would fail the parse, surface as `Reply::Fatal`, and end the
+    /// session over a string nobody reads (round-6 MINOR-3).
+    #[serde(default)]
     pub token_address: String,
 }
 
@@ -1057,17 +1066,71 @@ mod tests {
     /// from a core that predates them, and the console must refuse it rather
     /// than fill in 18 places — that default would turn 22.820562 USDC into
     /// 0.000000000000022820 and call it a balance.
+    ///
+    /// **One field at a time, on purpose** (round-6 MINOR-2). Dropping all three
+    /// at once cannot say which one is guarded: a regression that put
+    /// `serde(default)` back on `decimals` alone would still be refused by the
+    /// other two, and this test would stay green while the guard that matters
+    /// was gone.
     #[test]
-    fn parse_context_refuses_a_balance_row_without_the_token_fields() {
-        let line = r#"{"ok":true,"address":"0xAbC",
-            "balances":[{"chain_id":1,"symbol":"ETH","balance":"1000000000000000000"}],
-            "allowed_chains":[1]}"#
+    fn parse_context_refuses_a_balance_row_missing_any_one_token_field() {
+        // The whole row, then the same row with exactly one field taken out.
+        let whole = [
+            (r#""chain_id""#, "1"),
+            (r#""symbol""#, r#""ETH""#),
+            (r#""balance""#, r#""1000000000000000000""#),
+            (r#""decimals""#, "18"),
+            (r#""balance_formatted""#, r#""1""#),
+            (r#""token_address""#, r#""""#),
+        ];
+        for dropped in ["\"decimals\"", "\"balance_formatted\"", "\"token_address\""] {
+            let row: Vec<String> = whole
+                .iter()
+                .filter(|(k, _)| *k != dropped)
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect();
+            let line = format!(
+                r#"{{"ok":true,"address":"0xAbC","balances":[{{{}}}],"allowed_chains":[1]}}"#,
+                row.join(",")
+            );
+            assert!(
+                matches!(parse_context(&line), Err(ProtocolError::Malformed(_))),
+                "a row missing {dropped} must be malformed, not a row with a \
+                 silent default: {line}"
+            );
+        }
+    }
+
+    /// The counterpart with the same shape: the row that has all three parses.
+    /// Without it the test above would also pass on a parser that refuses every
+    /// balance row there is.
+    #[test]
+    fn parse_context_accepts_the_row_those_fields_complete() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[{"chain_id":1,
+            "symbol":"ETH","balance":"1000000000000000000","decimals":18,
+            "balance_formatted":"1","token_address":""}],"allowed_chains":[1]}"#
             .replace('\n', "");
-        assert!(
-            matches!(parse_context(&line), Err(ProtocolError::Malformed(_))),
-            "a row missing decimals/balance_formatted/token_address is malformed, \
-             not a row with defaults"
-        );
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("ok context");
+        };
+        assert_eq!(ctx.balances.len(), 1);
+    }
+
+    /// MINOR-3: an unread asset without a contract is an ordinary native one,
+    /// and the field it does not need must not cost the whole reply. The core
+    /// sends it today (`server.rs` puts an empty string on every native entry) —
+    /// this pins that the console does not DEPEND on it doing so.
+    #[test]
+    fn parse_context_accepts_an_unread_asset_without_a_contract() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[],
+            "unavailable":[{"chain_id":8453,"symbol":"ETH","reason":"no_rpc_configured"}],
+            "allowed_chains":[8453]}"#
+            .replace('\n', "");
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("an unread native asset carries no contract, and needs none");
+        };
+        assert_eq!(ctx.unavailable.len(), 1);
+        assert!(ctx.unavailable[0].token_address.is_empty());
     }
 
     /// An unread asset is not a zero one. The list says which asset, on which
