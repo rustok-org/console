@@ -597,6 +597,15 @@ behind. Until it lands, an `autonomous` wallet still parks every send (§3.7).
   additive field) because `context`'s auth-gating is a new *kind* of rule — the
   first read-op that is NOT pre-`auth` like `list`/`get` — and the compatibility
   table's job is to make that visible, not just wire-format additions.
+- **The token fields on `context` are additive on the wire and mandatory in this
+  client — no proto row moves** (`core v0.4.2` / `console v0.3.2`). The server
+  only added fields, which proto 3 allows. This console, however, **refuses** a
+  balance row without `decimals` / `balance_formatted` / `token_address`, so it
+  does not run against a core older than `v0.4.2`. That is a client decision,
+  not a protocol rule: filling a missing `decimals` with 18 turns a USDC balance
+  into dust, and refusing is the cheaper failure. It costs nothing in practice —
+  both binaries ship in one image, pinned by digest, so a mixed pair is not a
+  configuration this product has.
 
 ## 7. Non-goals
 
