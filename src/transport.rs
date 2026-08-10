@@ -550,7 +550,7 @@ mod tests {
             vec![
                 Some(HELLO_OK),
                 Some(
-                    r#"{"ok":true,"address":"0xAbC","balances":[{"chain_id":1,"symbol":"ETH","balance":"7"}],"allowed_chains":[1]}"#,
+                    r#"{"ok":true,"address":"0xAbC","balances":[{"chain_id":1,"symbol":"ETH","balance":"7","decimals":18,"balance_formatted":"0.000000000000000007","token_address":""}],"allowed_chains":[1]}"#,
                 ),
             ],
         );

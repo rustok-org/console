@@ -11,9 +11,14 @@ const ETH_DECIMALS: usize = 18;
 /// The wei string as ASCII decimal digits, or `None` when the core sent something
 /// this module will not re-derive.
 ///
-/// The ONE place "is this a number" is decided, so the exact form ([`wei_to_eth`])
-/// and the shortened one ([`short_eth`]) cannot come to different answers about
-/// the same wire value.
+/// The one place "is this **wei**" is decided, so the exact form
+/// ([`wei_to_eth`]) and the shortened one ([`short_eth`]) cannot come to
+/// different answers about the same wire value. [`short_amount`] asks a
+/// different question of a different string — "is this a rendered decimal" —
+/// and answers it separately, because a value with a point is a number there and
+/// not one here. The guard in [`short_eth`] is therefore still load-bearing:
+/// without it `short_eth("0.5")` would print `0.5 ETH` from an input that is not
+/// wei at all.
 fn decimal_wei(wei: &str) -> Option<&str> {
     let digits = wei.trim();
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
@@ -111,15 +116,37 @@ pub fn short_eth(wei: &str) -> String {
     if decimal_wei(wei).is_none() {
         return exact;
     }
-
     let number = exact.strip_suffix(" ETH").unwrap_or(&exact);
+    short_amount(number, "ETH")
+}
+
+/// The same shortening, over an amount the core has **already** rendered — a
+/// token's `balance_formatted` — with the unit that amount is in.
+///
+/// This is the half of [`short_eth`] that never knew anything about ether: it
+/// takes a plain decimal string and returns a scan-sized one. Tokens go through
+/// it directly, so a USDC row and an ETH row speak the same language of digits
+/// — same grouping, same six-digit cut, same `…`, same dust floor — without the
+/// console ever re-deriving an amount from raw units (`AGENTS.md` #1).
+///
+/// Input that is not a plain decimal is returned verbatim, unit and all left
+/// off: display shows the truth rather than dressing up something it could not
+/// read.
+#[must_use]
+pub fn short_amount(number: &str, unit: &str) -> String {
     let (int_part, frac) = number.split_once('.').unwrap_or((number, ""));
+    let plain = !int_part.is_empty()
+        && int_part.bytes().all(|b| b.is_ascii_digit())
+        && frac.bytes().all(|b| b.is_ascii_digit());
+    if !plain {
+        return number.to_owned();
+    }
     let whole = group_thousands(int_part);
     // Nothing to shorten — and this is also what keeps a REAL zero a zero: an
     // exact `0 ETH` has no fraction at all, so it never reaches the dust floor
     // below (`short_eth_keeps_a_real_zero_a_zero` fails if this return goes).
     if frac.is_empty() {
-        return format!("{whole} ETH");
+        return format!("{whole} {unit}");
     }
 
     // Truncate, never round: a wallet must not display more than there is.
@@ -131,10 +158,10 @@ pub fn short_eth(wei: &str) -> String {
     // "all kept digits are zero" mean something: on an empty fraction it would
     // hold vacuously, and an exact zero would come out as `<0.000001 ETH`.
     if dropped && int_part == "0" && kept.bytes().all(|b| b == b'0') {
-        return format!("<0.{:0>SCAN_FRAC_DIGITS$} ETH", 1);
+        return format!("<0.{:0>SCAN_FRAC_DIGITS$} {unit}", 1);
     }
     let marker = if dropped { "…" } else { "" };
-    format!("{whole}.{kept}{marker} ETH")
+    format!("{whole}.{kept}{marker} {unit}")
 }
 
 /// Separate a run of ASCII digits into groups of three: `120000000` →
@@ -257,6 +284,39 @@ mod tests {
     fn short_eth_returns_non_numeric_verbatim() {
         assert_eq!(short_eth("not-a-number"), "not-a-number");
         assert_eq!(short_eth(""), "");
+    }
+
+    /// A token amount arrives already rendered, in its own unit, and comes out
+    /// speaking the same language of digits as an ether one: grouped whole part,
+    /// six fractional digits, `…` when digits were dropped.
+    #[test]
+    fn short_amount_shortens_a_token_the_way_it_shortens_ether() {
+        // The live figure this whole arc exists for.
+        assert_eq!(short_amount("22.820562", "USDC"), "22.820562 USDC");
+        assert_eq!(short_amount("1234567.5", "USDT"), "1,234,567.5 USDT");
+        assert_eq!(short_amount("0.1234567", "USDC"), "0.123456… USDC");
+        assert_eq!(
+            short_amount("0", "USDC"),
+            "0 USDC",
+            "a real zero stays zero"
+        );
+    }
+
+    /// The dust floor belongs to the amount, not to ether: six places is a
+    /// hundredth of a cent in USDC, and `0.000000…` there reads as nothing just
+    /// as it does in ETH.
+    #[test]
+    fn short_amount_gives_token_dust_the_same_floor() {
+        assert_eq!(short_amount("0.0000001", "USDC"), "<0.000001 USDC");
+    }
+
+    /// Same defensive contract as the ether path: an amount this module cannot
+    /// read is shown as it came, without a unit dressed onto it.
+    #[test]
+    fn short_amount_returns_what_it_cannot_read_verbatim() {
+        assert_eq!(short_amount("not-a-number", "USDC"), "not-a-number");
+        assert_eq!(short_amount("", "USDC"), "");
+        assert_eq!(short_amount("1.2.3", "USDC"), "1.2.3");
     }
 
     #[test]

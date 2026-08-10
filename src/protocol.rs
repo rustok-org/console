@@ -239,22 +239,74 @@ pub enum GetOutcome {
     UnknownId,
 }
 
-/// One chain's native balance from `context` (protocol §3.7). `balance` is a
-/// **decimal** wei string (same convention as `amount_wei`), kept verbatim.
+/// One balance row from `context` (protocol §3.7) — the chain's native coin, or
+/// a token the operator put in the registry. `balance` is a **decimal** string
+/// in the asset's own raw units, kept verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChainBalance {
     /// EVM chain id.
     pub chain_id: u64,
-    /// Native token symbol (`"ETH"` for every chain in the allowed set).
+    /// The asset's symbol — `"ETH"` for the native coin, the registry's word for
+    /// a token.
     ///
-    /// Parsed because the wire carries it, **not rendered**: the amount
-    /// formatter already states the unit, and printing both is what made the
-    /// balance panel read `0.01 ETH ETH`. If a chain with a different native
-    /// token is ever allowed, the unit and the 18 decimals both have to move —
-    /// this field alone would not be enough.
+    /// Rendered. It used to be parsed and dropped, because every row was ETH and
+    /// the amount formatter already said so — printing both is what made the
+    /// panel read `0.01 ETH ETH`. With tokens in the list the unit is no longer
+    /// one word for the whole panel, so the row carries its own and the
+    /// formatter is told which one to state.
     pub symbol: String,
-    /// Native balance, decimal wei string.
+    /// The balance in the asset's raw integer units, decimal string.
     pub balance: String,
+    /// How many places [`Self::balance`] is denominated in — 18 for the native
+    /// coin, 6 for USDC.
+    ///
+    /// Mandatory on the wire, with no serde default: a missing field silently
+    /// read as 18 would divide a USDC balance by 10¹² and show dust where there
+    /// is money. A core too old to send it is a core this console refuses to
+    /// draw for, not one it guesses for.
+    pub decimals: u8,
+    /// [`Self::balance`] with [`Self::decimals`] applied, trailing zeros
+    /// trimmed — the string the panel prints.
+    ///
+    /// The core renders it once, exactly as it does for a position, so nothing
+    /// downstream has to know an asset's decimals in order to print it
+    /// (`AGENTS.md` #1: the console re-bases for display, never re-derives).
+    pub balance_formatted: String,
+    /// The token's contract, or empty for the native coin.
+    ///
+    /// A symbol is not unique: native USDC and bridged USDC.e sit side by side
+    /// on Arbitrum and people call both "USDC". The contract is what tells them
+    /// apart.
+    pub token_address: String,
+}
+
+/// One asset that could not be read at all (protocol §3.7).
+///
+/// Not a balance of zero — a balance the wallet does not know. The distinction
+/// is the point: before this existed, an unreachable chain simply had no row,
+/// and a short panel read as "you have nothing".
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AssetUnavailable {
+    /// EVM chain id.
+    pub chain_id: u64,
+    /// `"ETH"` for the native coin, else the token's symbol — which asset on
+    /// that chain went unread.
+    pub symbol: String,
+    /// Why, in the core's words: `no_rpc_configured` | `rpc_call_failed` |
+    /// `call_reverted`. Kept as the wire string and worded for the human in one
+    /// place (`ui.rs`); an unknown word is shown verbatim rather than guessed at.
+    pub reason: String,
+    /// The token's contract, or empty for the native coin.
+    ///
+    /// Defaulted, unlike the contract on a balance row, and the difference is
+    /// the point: that one is drawn, so a core that stopped sending it would
+    /// leave a token looking like a native coin, and refusing the row is the
+    /// cheaper failure. This one is not drawn at all. Making it mandatory buys
+    /// nothing and costs a whole `context` reply — one missing field on one
+    /// unread asset would fail the parse, surface as `Reply::Fatal`, and end the
+    /// session over a string nobody reads (round-6 MINOR-3).
+    #[serde(default)]
+    pub token_address: String,
 }
 
 /// The wallet's own context from a successful `context` reply (protocol §3.7).
@@ -263,9 +315,20 @@ pub struct WalletContext {
     /// The wallet's (signer's) address, EIP-55 checksummed — same convention
     /// as the card's top-level `to`, so From→To renders both verbatim.
     pub address: String,
-    /// Per-chain native balances; a chain whose provider was unreachable is
-    /// omitted, not zeroed (best-effort, §3.7).
+    /// Every asset the wallet holds and could read: each allowed chain's native
+    /// coin first, then that chain's registry tokens in declaration order.
+    ///
+    /// An asset missing from here is either a zero balance or an unread one, and
+    /// [`Self::unavailable`] is what separates the two.
     pub balances: Vec<ChainBalance>,
+    /// Assets the wallet could NOT read, and why (§3.7).
+    ///
+    /// Empty means everything configured was queried — so a balance row absent
+    /// from [`Self::balances`] while this list is empty means zero, and only
+    /// zero. Absent on the wire reads as empty, like `balances`: the mandatory
+    /// fields on a balance row are what refuse a core too old to have this at
+    /// all.
+    pub unavailable: Vec<AssetUnavailable>,
     /// The server's configured chain allow-list, in order.
     pub allowed_chains: Vec<u64>,
     /// The autonomy ceiling and how the core arrived at it (§3.7, proto 3+).
@@ -713,6 +776,7 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
         ok: bool,
         address: Option<String>,
         balances: Option<Vec<ChainBalance>>,
+        unavailable: Option<Vec<AssetUnavailable>>,
         allowed_chains: Option<Vec<u64>>,
         policy_mode: Option<String>,
         policy_origin: Option<String>,
@@ -742,6 +806,7 @@ pub fn parse_context(line: &str) -> Result<ContextOutcome, ProtocolError> {
         Ok(ContextOutcome::Ok(Box::new(WalletContext {
             address,
             balances: raw.balances.unwrap_or_default(),
+            unavailable: raw.unavailable.unwrap_or_default(),
             allowed_chains: raw.allowed_chains.unwrap_or_default(),
             policy,
         })))
@@ -951,7 +1016,8 @@ mod tests {
     #[test]
     fn parse_context_carries_address_balances_and_chains() {
         let line = r#"{"ok":true,"address":"0x742d35Cc6634C0532925a3b844Bc9e7595f2bD4e",
-            "balances":[{"chain_id":1,"symbol":"ETH","balance":"1000000000000000000"}],
+            "balances":[{"chain_id":1,"symbol":"ETH","balance":"1000000000000000000",
+            "decimals":18,"balance_formatted":"1","token_address":""}],
             "allowed_chains":[1,8453]}"#
             .replace('\n', "");
         let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
@@ -964,6 +1030,143 @@ mod tests {
         // decimal wei string, verbatim — never re-based here
         assert_eq!(ctx.balances[0].balance, "1000000000000000000");
         assert_eq!(ctx.allowed_chains, vec![1, 8453]);
+    }
+
+    /// Test 9 (spec §S2). A token row arrives whole — the symbol the operator
+    /// registered, the raw units, the places they are counted in, the string to
+    /// print, and the contract that tells USDC from USDC.e.
+    #[test]
+    fn parse_context_carries_a_token_row_whole() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[
+            {"chain_id":42161,"symbol":"ETH","balance":"6700000000000000",
+             "decimals":18,"balance_formatted":"0.0067","token_address":""},
+            {"chain_id":42161,"symbol":"USDC","balance":"22820562","decimals":6,
+             "balance_formatted":"22.820562",
+             "token_address":"0xaf88d065e77c8cC2239327C5EDb3A432268e5831"}],
+            "allowed_chains":[42161]}"#
+            .replace('\n', "");
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("ok context");
+        };
+        assert_eq!(ctx.balances.len(), 2, "native first, then the registry");
+        let token = &ctx.balances[1];
+        assert_eq!(token.symbol, "USDC");
+        assert_eq!(token.balance, "22820562");
+        assert_eq!(token.decimals, 6);
+        assert_eq!(token.balance_formatted, "22.820562");
+        assert_eq!(
+            token.token_address,
+            "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+        );
+        // The native row keeps the empty contract that marks it as native.
+        assert!(ctx.balances[0].token_address.is_empty());
+    }
+
+    /// Test 9, the half that has teeth. A row without the token fields is a row
+    /// from a core that predates them, and the console must refuse it rather
+    /// than fill in 18 places — that default would turn 22.820562 USDC into
+    /// 0.000000000000022820 and call it a balance.
+    ///
+    /// **One field at a time, on purpose** (round-6 MINOR-2). Dropping all three
+    /// at once cannot say which one is guarded: a regression that put
+    /// `serde(default)` back on `decimals` alone would still be refused by the
+    /// other two, and this test would stay green while the guard that matters
+    /// was gone.
+    #[test]
+    fn parse_context_refuses_a_balance_row_missing_any_one_token_field() {
+        // The whole row, then the same row with exactly one field taken out.
+        let whole = [
+            (r#""chain_id""#, "1"),
+            (r#""symbol""#, r#""ETH""#),
+            (r#""balance""#, r#""1000000000000000000""#),
+            (r#""decimals""#, "18"),
+            (r#""balance_formatted""#, r#""1""#),
+            (r#""token_address""#, r#""""#),
+        ];
+        for dropped in ["\"decimals\"", "\"balance_formatted\"", "\"token_address\""] {
+            let row: Vec<String> = whole
+                .iter()
+                .filter(|(k, _)| *k != dropped)
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect();
+            let line = format!(
+                r#"{{"ok":true,"address":"0xAbC","balances":[{{{}}}],"allowed_chains":[1]}}"#,
+                row.join(",")
+            );
+            assert!(
+                matches!(parse_context(&line), Err(ProtocolError::Malformed(_))),
+                "a row missing {dropped} must be malformed, not a row with a \
+                 silent default: {line}"
+            );
+        }
+    }
+
+    /// The counterpart with the same shape: the row that has all three parses.
+    /// Without it the test above would also pass on a parser that refuses every
+    /// balance row there is.
+    #[test]
+    fn parse_context_accepts_the_row_those_fields_complete() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[{"chain_id":1,
+            "symbol":"ETH","balance":"1000000000000000000","decimals":18,
+            "balance_formatted":"1","token_address":""}],"allowed_chains":[1]}"#
+            .replace('\n', "");
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("ok context");
+        };
+        assert_eq!(ctx.balances.len(), 1);
+    }
+
+    /// MINOR-3: an unread asset without a contract is an ordinary native one,
+    /// and the field it does not need must not cost the whole reply. The core
+    /// sends it today (`server.rs` puts an empty string on every native entry) —
+    /// this pins that the console does not DEPEND on it doing so.
+    #[test]
+    fn parse_context_accepts_an_unread_asset_without_a_contract() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[],
+            "unavailable":[{"chain_id":8453,"symbol":"ETH","reason":"no_rpc_configured"}],
+            "allowed_chains":[8453]}"#
+            .replace('\n', "");
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("an unread native asset carries no contract, and needs none");
+        };
+        assert_eq!(ctx.unavailable.len(), 1);
+        assert!(ctx.unavailable[0].token_address.is_empty());
+    }
+
+    /// An unread asset is not a zero one. The list says which asset, on which
+    /// chain, and in the core's own words why.
+    #[test]
+    fn parse_context_carries_the_assets_it_could_not_read() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[],"unavailable":[
+            {"chain_id":8453,"symbol":"ETH","reason":"no_rpc_configured","token_address":""},
+            {"chain_id":42161,"symbol":"USDT","reason":"call_reverted",
+             "token_address":"0xdAC17F958D2ee523a2206206994597C13D831ec7"}],
+            "allowed_chains":[8453,42161]}"#
+            .replace('\n', "");
+        let ContextOutcome::Ok(ctx) = parse_context(&line).unwrap() else {
+            panic!("ok context");
+        };
+        assert_eq!(ctx.unavailable.len(), 2);
+        assert_eq!(ctx.unavailable[0].chain_id, 8453);
+        assert_eq!(ctx.unavailable[0].symbol, "ETH");
+        assert_eq!(ctx.unavailable[0].reason, "no_rpc_configured");
+        assert!(ctx.unavailable[0].token_address.is_empty());
+        assert_eq!(ctx.unavailable[1].reason, "call_reverted");
+        assert_eq!(
+            ctx.unavailable[1].token_address,
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+        );
+    }
+
+    /// Nothing unavailable is the ordinary case, and it must not need the key:
+    /// an absent list reads as empty, exactly as an absent `balances` does.
+    #[test]
+    fn parse_context_reads_an_absent_unavailable_list_as_empty() {
+        let line = r#"{"ok":true,"address":"0xAbC","balances":[],"allowed_chains":[1]}"#;
+        let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
+            panic!("ok context");
+        };
+        assert!(ctx.unavailable.is_empty());
     }
 
     /// Every answer §3.10 lists, transcribed from the protocol canon rather
@@ -1111,8 +1314,9 @@ mod tests {
 
     #[test]
     fn parse_context_tolerates_empty_balances() {
-        // Every chain's provider was unreachable: balances are omitted, not
-        // zeroed or errored (protocol §3.7) — the answer is still ok.
+        // An empty list is still an `ok` answer (protocol §3.7). What it MEANS
+        // is no longer decided here: with `unavailable` empty too, this wallet
+        // holds nothing — a chain that could not be read says so in that list.
         let line = r#"{"ok":true,"address":"0xAbC","balances":[],"allowed_chains":[1]}"#;
         let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
             panic!("ok context");

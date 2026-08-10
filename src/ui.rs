@@ -793,14 +793,6 @@ fn age_label(now_unix: u64, unix: u64) -> String {
     }
 }
 
-/// The Dashboard: per-chain balance (from `context`), DeFi positions (the
-/// `positions` read-op), and the "waiting for you" count. Pure display —
-/// nothing here signs or gates; the values render **verbatim** (`extra` are
-/// display strings by canon §3.8 — including the literal `"∞"`).
-///
-/// Honesty rules: a failed balance refresh flags the block as possibly stale
-/// (never silently shows old data as fresh); positions that do not fit end
-/// with an explicit "+N more" marker, never a silent clip.
 /// The rows the confirmation banner claims: two borders plus its two lines.
 const ACK_BANNER_ROWS: u16 = 4;
 
@@ -810,10 +802,117 @@ const ACK_BANNER_ROWS: u16 = 4;
 /// would only take room from the balances beside it.
 const IDENTITY_COL: u16 = 22;
 
-/// Rows for the balance panel: two borders plus a line per allowed chain, with
-/// room for the staleness note. Positions take whatever is left — the list
-/// there is the one that grows.
-const BALANCE_ROWS: u16 = 6;
+/// The most rows the balance panel may take INSIDE its borders, however long the
+/// list gets. Eight holds three chains, three registry tokens, the staleness
+/// note and a `+N more` marker — the shape of a wallet with a token or two per
+/// chain (Captain, 2026-08-10). Past that the list is asked to fit, because the
+/// panel shares the column with positions, and a balance list free to grow would
+/// push them off the screen entirely.
+const BALANCE_ROWS_MAX: u16 = 8;
+
+/// Rows the balance panel asks for: its two borders plus the rows it will
+/// actually draw, capped by [`BALANCE_ROWS_MAX`].
+///
+/// Measured off the built rows, never off the number of assets. A long reason
+/// wraps onto two rows at an ordinary terminal width, and counting entries
+/// budgeted one row for it — which put real balances behind `+N more` at four
+/// assets, nowhere near the ceiling. That is the defect Р7 exists to remove,
+/// arriving through a second door, and the door is the same one the card walked
+/// through before it: two counts of the same thing (round-6 blocker).
+fn balance_panel_rows(entries: &[Vec<Line<'static>>], stale: bool) -> u16 {
+    let rows: usize = entries.iter().map(Vec::len).sum();
+    // The list comes off the wire, so its length is the core's to choose. A list
+    // longer than a u16 asks for more rows than any terminal has; saturating
+    // here costs nothing, because the cap below is what the panel actually takes.
+    let rows = u16::try_from(rows).unwrap_or(u16::MAX);
+    let inner = rows.saturating_add(u16::from(stale)).min(BALANCE_ROWS_MAX);
+    inner + 2
+}
+
+/// Every row the balance panel will draw, **grouped by the asset it is about**
+/// and already wrapped to `width`.
+///
+/// One group per entry, for two reasons that only a group boundary can give:
+/// truncation cuts between assets instead of through the middle of one, and
+/// `+N more` counts assets rather than terminal rows. Built once and handed to
+/// both the height arithmetic and the renderer — the same single-source contract
+/// [`priority_lines`] keeps for the card, and for the same reason.
+fn balance_entries(model: &Model, width: usize) -> Vec<Vec<Line<'static>>> {
+    let wrap = |text: String, style: Style| {
+        let mut group: Vec<Line<'static>> = Vec::new();
+        push_wrapped(&mut group, width, text, style);
+        group
+    };
+    match model.wallet_context() {
+        Some(ctx) if !ctx.balances.is_empty() || !ctx.unavailable.is_empty() => {
+            // Warnings first, and deliberately so: truncation cuts from the end,
+            // so what goes behind "+N more" is a number, never the line saying a
+            // number is missing. A hidden warning reads as "all is well" — the
+            // same rank the staleness line has held since Ф-4. Whoever adds a
+            // third category of row here inherits that ordering: the sequence
+            // below IS the priority, and the truncation downstream trusts it.
+            let unread = ctx.unavailable.iter().map(|u| {
+                wrap(
+                    format!(
+                        "  {}  {}  {}",
+                        format::network_name(u.chain_id),
+                        asset_symbol(&u.symbol),
+                        unavailable_reason(&u.reason)
+                    ),
+                    theme::high_risk_style(),
+                )
+            });
+            let held = ctx.balances.iter().map(|b| {
+                // The core rendered the amount and named the unit; the panel
+                // states each once. It used to append `b.symbol` to an amount
+                // that already carried "ETH", which is what made the first
+                // screen read `0.01 ETH ETH` — the fix then was to drop the
+                // symbol, because every row was ether. Now a row can be USDC,
+                // so the symbol is what the formatter is told to state.
+                //
+                // A token also shows its contract, shortened. The symbol does
+                // not identify it — native USDC and bridged USDC.e share one,
+                // and a registry that named a token "ETH" would otherwise draw
+                // a row indistinguishable from the chain's own coin on the very
+                // panel whose job is to say what is held.
+                let mut row = format!(
+                    "  {}  {}",
+                    format::network_name(b.chain_id),
+                    format::short_amount(&b.balance_formatted, &asset_symbol(&b.symbol))
+                );
+                if !b.token_address.is_empty() {
+                    row.push_str("  ");
+                    row.push_str(&format::short_addr(&b.token_address));
+                }
+                wrap(row, theme::value_style())
+            });
+            unread.chain(held).collect()
+        }
+        Some(_) => vec![wrap(
+            "  no balances reported".to_owned(),
+            theme::label_style(),
+        )],
+        None => vec![wrap(
+            "  balance unavailable".to_owned(),
+            theme::label_style(),
+        )],
+    }
+}
+
+/// An asset symbol as it may be drawn: printable ASCII, or a stand-in.
+///
+/// The same judgement [`parse_stated_version`] makes about a version string, for
+/// the same reason: a bidirectional override is not a control character, passes
+/// a control-character test, and reorders the glyphs around it — on the panel
+/// whose only job is to say truthfully what this wallet holds. The symbol comes
+/// from an operator's registry entry, so it is the one string on this panel a
+/// human types by hand.
+fn asset_symbol(symbol: &str) -> String {
+    if symbol.is_empty() || !symbol.chars().all(|c| c.is_ascii_graphic()) {
+        return "?".to_owned();
+    }
+    symbol.to_owned()
+}
 
 /// Columns reserved for a version label, so the numbers line up under one
 /// another. `console` is the longest of the three, and two spaces after it keep
@@ -1139,6 +1238,35 @@ fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
     frame.render_widget(body, rect);
 }
 
+/// Word an unread asset for the human, from the reason the core sent.
+///
+/// The three the core knows are separated because the answer to each differs:
+/// no RPC is the operator's configuration, a failed call is the network and may
+/// pass next minute, and a revert means the address in the registry is not the
+/// ERC-20 it was said to be — "try later" would be advice in the wrong
+/// direction. A word this console does not know is shown as it came: the core
+/// may learn a reason before the console does, and inventing a translation for
+/// it would be worse than quoting it.
+fn unavailable_reason(reason: &str) -> String {
+    match reason {
+        "no_rpc_configured" => "not queried — no RPC".to_owned(),
+        "rpc_call_failed" => "not read — RPC call failed".to_owned(),
+        "call_reverted" => "not read — call reverted, check the registry".to_owned(),
+        other => format!("not read — {other}"),
+    }
+}
+
+/// The Dashboard: the wallet's balances (from `context` — each chain's native
+/// coin and the registry tokens it holds), DeFi positions (the `positions`
+/// read-op), and the "waiting for you" count. Pure display — nothing here signs
+/// or gates; the values render **verbatim** (`extra` are display strings by
+/// canon §3.8 — including the literal `"∞"`).
+///
+/// Honesty rules: a failed balance refresh flags the block as possibly stale
+/// (never silently shows old data as fresh); rows that do not fit end with an
+/// explicit "+N more" marker, never a silent clip; and an asset the core could
+/// not read is drawn as a warning rather than left out, so a missing row means
+/// zero and nothing else.
 fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model, versions: Versions<'_>) {
     let policy = model.policy();
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
@@ -1171,9 +1299,17 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model, versions: 
         Layout::horizontal([Constraint::Length(IDENTITY_COL), Constraint::Min(0)]).split(body);
     render_identity(frame, model.wallet_address(), versions, cols[0]);
 
+    // The balance rows are built HERE, before the split that gives the panel its
+    // height, and the same vector is what gets drawn below. The width they wrap
+    // to is already known — a vertical split does not change it — and the height
+    // is measured off the rows themselves. Two counts of the same thing is the
+    // mistake this panel and the card above it have both paid for once.
+    let balance_width = usize::from(cols[1].width.saturating_sub(2));
+    let balance_content = balance_entries(model, balance_width);
+
     let panels = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(BALANCE_ROWS),
+        Constraint::Length(balance_panel_rows(&balance_content, model.context_stale())),
         Constraint::Min(0),
     ])
     .split(cols[1]);
@@ -1202,57 +1338,48 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model, versions: 
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // ── Balance (from `context`; per-chain native ETH).
-    match model.wallet_context() {
-        Some(ctx) if !ctx.balances.is_empty() => {
-            for b in &ctx.balances {
-                push_wrapped(
-                    &mut lines,
-                    width,
-                    // The unit comes from the amount, which already carries it —
-                    // `b.symbol` is `ETH` for every chain the core allows
-                    // (`server.rs`, `wallet_context_data`), and appending it on
-                    // top is what made the first screen read `0.01 ETH ETH`.
-                    format!(
-                        "  {}  {}",
-                        format::network_name(b.chain_id),
-                        format::short_eth(&b.balance)
-                    ),
-                    theme::value_style(),
-                );
-            }
-        }
-        Some(_) => push_wrapped(
-            &mut lines,
-            width,
-            "  no balances reported".to_owned(),
-            theme::label_style(),
-        ),
-        None => push_wrapped(
-            &mut lines,
-            width,
-            "  balance unavailable".to_owned(),
-            theme::label_style(),
-        ),
-    }
+    // ── Balance (from `context`): every asset the wallet holds, and above them
+    // the ones it could not read at all. The rows were built before the split
+    // above; this loop only decides how many of them fit.
+    //
     // The staleness line is not a balance row — it is the line that says the
     // balance rows may be wrong. It outranks them: a reserved row keeps it out
     // of the truncation, so a wallet with many chains cannot quietly drop the
     // one line warning that the numbers above it are stale.
     let stale = model.context_stale();
-    let reserved = usize::from(stale);
-    if lines.len() + reserved > height {
-        // One row goes to the marker, so what was hidden is stated rather than
-        // silently cut — the same contract the positions panel below keeps.
-        let keep = height.saturating_sub(reserved).saturating_sub(1);
-        let hidden = lines.len() - keep;
-        lines.truncate(keep);
-        push_wrapped(
-            &mut lines,
-            width,
-            format!("  +{hidden} more — terminal too small"),
-            theme::label_style(),
-        );
+    let budget = height.saturating_sub(usize::from(stale));
+    // The order the entries arrive in IS their priority: this loop drops from
+    // the tail, and `balance_entries` puts the warnings at the head so what goes
+    // behind the marker is a number, never the line saying a number is missing.
+    // Reordering there silently changes what this loop protects.
+    let total = balance_content.len();
+    let mut used = 0usize;
+    for (i, group) in balance_content.into_iter().enumerate() {
+        let remaining = total - i;
+        // Reserve one row for the "+N more" marker — except for the last entry,
+        // which may take the final row itself (an exact fit shows everything,
+        // no marker). Same arithmetic as the positions panel below.
+        let reserve = usize::from(remaining > 1);
+        if used + group.len() + reserve > budget {
+            // What was hidden is stated rather than silently cut, and the reason
+            // is stated too: a panel that has hit its own ceiling will not show
+            // more however the window is dragged, and "terminal too small" would
+            // send the human off to resize for nothing.
+            let cause = if inner.height >= BALANCE_ROWS_MAX {
+                "panel is full"
+            } else {
+                "terminal too small"
+            };
+            push_wrapped(
+                &mut lines,
+                width,
+                format!("  +{remaining} more — {cause}"),
+                theme::label_style(),
+            );
+            break;
+        }
+        used += group.len();
+        lines.extend(group);
     }
     if stale {
         push_wrapped(
@@ -1890,6 +2017,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -1919,6 +2047,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy,
             },
@@ -2185,8 +2314,12 @@ mod tests {
                         chain_id: i,
                         symbol: "ETH".to_owned(),
                         balance: "1000000000000000000".to_owned(),
+                        decimals: 18,
+                        balance_formatted: "1".to_owned(),
+                        token_address: String::new(),
                     })
                     .collect(),
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
             },
@@ -2198,7 +2331,12 @@ mod tests {
 
         let screen = draw_rows(&model, 100, 24).join("\n");
         assert!(
-            screen.contains("more — terminal too small"),
+            // Ten entries and the staleness note against a ceiling of eight:
+            // six rows are drawn, the marker takes the seventh, four are hidden.
+            // The cause is the panel's own ceiling — this window has rows to
+            // spare, so blaming its size would send the human to resize for
+            // nothing (round-6 MINOR-4).
+            screen.contains("+4 more — panel is full"),
             "the panel must say what it hid:\n{screen}"
         );
         assert!(
@@ -2980,6 +3118,7 @@ mod tests {
             WalletContext {
                 address: String::new(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -3911,18 +4050,43 @@ mod tests {
 
     // ── Stage 5: the Dashboard view ──
 
-    use crate::protocol::{ChainBalance, Position, PositionsOutcome};
+    use crate::protocol::{AssetUnavailable, ChainBalance, Position, PositionsOutcome};
 
     /// Drive a model onto the (home) Dashboard with the given balances, then
     /// feed it the positions reply the scheduler solicits.
     fn to_dashboard(balances: Vec<ChainBalance>, positions: PositionsOutcome) -> Model {
-        let mut m = to_dashboard_loading(balances);
+        to_dashboard_with_unavailable(balances, Vec::new(), positions)
+    }
+
+    /// Same, with assets the core could not read at all.
+    fn to_dashboard_with_unavailable(
+        balances: Vec<ChainBalance>,
+        unavailable: Vec<AssetUnavailable>,
+        positions: PositionsOutcome,
+    ) -> Model {
+        let mut m = to_dashboard_loading(balances, unavailable);
         m.update(Msg::Reply(Reply::Positions(positions)));
         m
     }
 
+    /// A native ETH row as the core sends it: raw wei, the 18 places they are
+    /// counted in, and the string the core already rendered from the two.
+    fn native_row(chain_id: u64, wei: &str, formatted: &str) -> ChainBalance {
+        ChainBalance {
+            chain_id,
+            symbol: "ETH".to_owned(),
+            balance: wei.to_owned(),
+            decimals: 18,
+            balance_formatted: formatted.to_owned(),
+            token_address: String::new(),
+        }
+    }
+
     /// Same, stopped BEFORE the positions reply lands (the loading state).
-    fn to_dashboard_loading(balances: Vec<ChainBalance>) -> Model {
+    fn to_dashboard_loading(
+        balances: Vec<ChainBalance>,
+        unavailable: Vec<AssetUnavailable>,
+    ) -> Model {
         let mut m = Model::new();
         m.update(Msg::Resize {
             width: 80,
@@ -3938,6 +4102,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances,
+                unavailable,
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -3970,11 +4135,7 @@ mod tests {
     /// not lost — it is on the card, where a decision is made.
     #[test]
     fn the_balance_panel_shortens_a_long_amount() {
-        let balances = vec![ChainBalance {
-            chain_id: 1,
-            symbol: "ETH".to_owned(),
-            balance: "5499068022390730".to_owned(), // 0.00549906802239073 ETH
-        }];
+        let balances = vec![native_row(1, "5499068022390730", "0.00549906802239073")];
         let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
         let rows = draw_rows(&m, 100, 24);
         assert!(
@@ -3983,13 +4144,356 @@ mod tests {
         );
     }
 
+    /// A registry token row — the live USDC on Arbitrum unless told otherwise.
+    fn token_row(chain_id: u64, symbol: &str, raw: &str, formatted: &str) -> ChainBalance {
+        ChainBalance {
+            chain_id,
+            symbol: symbol.to_owned(),
+            balance: raw.to_owned(),
+            decimals: 6,
+            balance_formatted: formatted.to_owned(),
+            token_address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".to_owned(),
+        }
+    }
+
+    fn unread(chain_id: u64, symbol: &str, reason: &str) -> AssetUnavailable {
+        AssetUnavailable {
+            chain_id,
+            symbol: symbol.to_owned(),
+            reason: reason.to_owned(),
+            token_address: String::new(),
+        }
+    }
+
+    /// Test 10 (spec §S2). The row this whole arc exists for, on the screen: the
+    /// symbol the operator registered and the amount the core rendered at the
+    /// token's own six places.
+    ///
+    /// Both halves are needed, and the positive one carries more weight than its
+    /// first draft claimed. Re-basing 22820562 raw units at ether's eighteen
+    /// places gives `0.000000000022820562` — but the dust floor would render
+    /// that as `<0.000001 ETH`, so the literal string below would not appear
+    /// either way. What actually catches a return to `short_eth(&b.balance)` is
+    /// the assertion that `22.820562 USDC` IS on the screen; the negative one
+    /// guards the narrower case of an un-floored eighteen-place render.
+    #[test]
+    fn the_balance_panel_prints_a_token_in_its_own_unit() {
+        let balances = vec![
+            native_row(42161, "6700000000000000", "0.0067"),
+            token_row(42161, "USDC", "22820562", "22.820562"),
+        ];
+        let m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["Arbitrum", "22.820562 USDC"]),
+            "the token reads in its own unit:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("0.000000000022820562")),
+            "a token re-based at ether's 18 places would read as dust:\n{rows:#?}"
+        );
+        // The native row of the same chain is untouched by any of this.
+        assert!(has_line_with(&rows, &["Arbitrum", "0.0067 ETH"]));
+    }
+
+    /// Test 11 (spec §S2). The shape the acceptance criteria name: three chains,
+    /// one token, and the staleness note — five lines that must all be on the
+    /// screen at once.
+    ///
+    /// Red against the panel's old fixed height: four rows inside meant the
+    /// first token pushed two real balances behind `+2 more`, and the USDC this
+    /// arc exists for was one of them.
+    #[test]
+    fn a_token_and_three_chains_and_the_stale_note_all_fit() {
+        let balances = vec![
+            native_row(1, "10000000000000000", "0.01"),
+            native_row(8453, "20000000000000000", "0.02"),
+            native_row(42161, "6700000000000000", "0.0067"),
+            token_row(42161, "USDC", "22820562", "22.820562"),
+        ];
+        let mut m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        // A refresh that failed after a good one: the rows stay, flagged stale.
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        let rows = draw_rows(&m, 100, 24);
+        for expected in [
+            "0.01 ETH",
+            "0.02 ETH",
+            "0.0067 ETH",
+            "22.820562 USDC",
+            "may be stale",
+        ] {
+            assert!(
+                rows.iter().any(|r| r.contains(expected)),
+                "`{expected}` must be on the screen:\n{rows:#?}"
+            );
+        }
+        assert!(
+            !rows.join("\n").contains("more — terminal too small"),
+            "nothing was hidden, so nothing may claim it was:\n{rows:#?}"
+        );
+    }
+
+    /// Test 12 (spec §S2). The ceiling is a ceiling: past it the panel says how
+    /// much it hid, and the line warning the numbers may be wrong still outranks
+    /// the numbers themselves.
+    #[test]
+    fn past_the_ceiling_the_panel_says_what_it_hid_and_keeps_the_warning() {
+        let balances: Vec<ChainBalance> = (0..12)
+            .map(|i| native_row(i, "10000000000000000", "0.01"))
+            .collect();
+        let mut m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            // Twelve one-row entries and a staleness note: the ceiling of eight
+            // leaves seven rows for entries, one of which the marker takes, so
+            // six are drawn and six are named as hidden.
+            rows.join("\n").contains("+6 more — panel is full"),
+            "the panel must say what it hid, and why it will not show more — this \
+             terminal has rows to spare, the ceiling is what stopped it:\n{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("may be stale")),
+            "and the warning must outlive the rows it warns about:\n{rows:#?}"
+        );
+    }
+
+    /// The other cause of the same marker, and it must not borrow the first
+    /// one's wording: here the window really is too short, and resizing it
+    /// really does help.
+    #[test]
+    fn a_short_terminal_says_so_instead_of_blaming_the_ceiling() {
+        let balances: Vec<ChainBalance> = (0..9)
+            .map(|i| native_row(i, "10000000000000000", "0.01"))
+            .collect();
+        let m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        // Nine entries ask for the full ceiling (eight rows plus borders), but a
+        // nine-row window has only five to give after the header and the queue —
+        // so the panel is cut BELOW its own ceiling, and the window is why.
+        let rows = draw_rows(&m, 100, 9);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("more — terminal too small"),
+            "a short window is named as the cause:\n{rows:#?}"
+        );
+        assert!(
+            !screen.contains("panel is full"),
+            "and the ceiling is not blamed for it:\n{rows:#?}"
+        );
+    }
+
+    /// Test 12-бис (spec §S2). When the panel has to cut, it cuts numbers — an
+    /// unread asset stays on the screen.
+    ///
+    /// Red against the obvious order (balances first, warnings after): the
+    /// truncation takes from the end, so warnings written last are the first to
+    /// go, and a wallet that could not read USDT would look exactly like a
+    /// wallet that holds none.
+    #[test]
+    fn truncation_hides_numbers_and_keeps_the_assets_it_could_not_read() {
+        let balances: Vec<ChainBalance> = (0..10)
+            .map(|i| native_row(i, "10000000000000000", "0.01"))
+            .collect();
+        let unavailable = vec![
+            unread(8453, "ETH", "no_rpc_configured"),
+            unread(42161, "USDT", "call_reverted"),
+        ];
+        let m = to_dashboard_with_unavailable(balances, unavailable, PositionsOutcome::Ok(vec![]));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            rows.join("\n").contains("more — panel is full"),
+            "this panel is over its ceiling — the test is vacuous otherwise:\n{rows:#?}"
+        );
+        assert!(
+            has_line_with(&rows, &["Base", "ETH", "not queried — no RPC"]),
+            "an unread native asset survives the cut:\n{rows:#?}"
+        );
+        assert!(
+            has_line_with(
+                &rows,
+                &[
+                    "Arbitrum",
+                    "USDT",
+                    "not read — call reverted, check the registry"
+                ]
+            ),
+            "and so does an unread token, with the reason pinned whole — it is \
+             what tells the operator the registry is wrong, not the network:\n{rows:#?}"
+        );
+    }
+
+    /// MINOR-1: the contract reaches the screen, so a token is never mistaken
+    /// for the chain's own coin.
+    ///
+    /// The symbol cannot carry that weight — the protocol says so itself: native
+    /// USDC and bridged USDC.e share one. A registry entry that named a token
+    /// "ETH" would otherwise draw a row identical to the native one, on the
+    /// panel whose whole job is to say what is held.
+    #[test]
+    fn a_token_row_shows_the_contract_that_identifies_it() {
+        let balances = vec![
+            native_row(42161, "6700000000000000", "0.0067"),
+            // A registry that calls its token ETH — a bug on the core's side, or
+            // a hostile entry; either way the panel must not agree.
+            token_row(42161, "ETH", "22820562", "22.820562"),
+        ];
+        let m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["Arbitrum", "22.820562 ETH", "0xaf88d0…5831"]),
+            "the token names its contract:\n{rows:#?}"
+        );
+        // And the native row of the same chain does NOT — an empty contract is
+        // what marks it native, and printing something there would invent one.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("0.0067 ETH") && !r.contains("0x")),
+            "the native row carries no contract:\n{rows:#?}"
+        );
+    }
+
+    /// MINOR-1, the other half. The symbol is the one string on this panel a
+    /// human types by hand, into an operator's registry entry. It gets the same
+    /// judgement the version panel makes about a version string, and for the
+    /// same reason: a bidirectional override is not a control character, passes
+    /// that test, and reorders the glyphs around it.
+    #[test]
+    fn a_symbol_that_could_tear_the_panel_is_not_drawn() {
+        let mut hostile = token_row(42161, "U\u{202E}SDC", "22820562", "22.820562");
+        hostile.balance_formatted = "22.820562".to_owned();
+        let m = to_dashboard(vec![hostile], PositionsOutcome::Ok(vec![]));
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            !rows.iter().any(|r| r.contains('\u{202E}')),
+            "the override never reaches the screen:\n{rows:#?}"
+        );
+        assert!(
+            has_line_with(&rows, &["Arbitrum", "22.820562 ?"]),
+            "and the amount is still shown, with the symbol stood in for:\n{rows:#?}"
+        );
+    }
+
+    /// Round-6 BLOCKER, regression test. The panel budgeted one row per entry
+    /// while the renderer wrapped long text onto more than one, so a single
+    /// unread asset with a long reason cost two rows and was paid for with one.
+    ///
+    /// At 80 columns — the width every other dashboard test in this file uses —
+    /// the panel is 56 cells wide inside its borders, and
+    /// `  Arbitrum  USDT  not read — call reverted, check the registry` is
+    /// longer than that. Three balances plus that one warning is four entries,
+    /// nowhere near the ceiling of eight, and the panel still truncated: two
+    /// real balances went behind `+2 more`. That is the exact defect Р7 was
+    /// written to remove, arriving through a different door.
+    #[test]
+    fn a_wrapped_warning_does_not_push_balances_off_a_normal_terminal() {
+        let balances = vec![
+            native_row(1, "10000000000000000", "0.01"),
+            native_row(8453, "20000000000000000", "0.02"),
+            native_row(42161, "6700000000000000", "0.0067"),
+        ];
+        let unavailable = vec![unread(42161, "USDT", "call_reverted")];
+        let m = to_dashboard_with_unavailable(balances, unavailable, PositionsOutcome::Ok(vec![]));
+        let rows = draw_rows(&m, 80, 24);
+        assert!(
+            !rows.join("\n").contains("more — "),
+            "four entries are under the ceiling of eight — nothing may be hidden:\n{rows:#?}"
+        );
+        for expected in ["0.01 ETH", "0.02 ETH", "0.0067 ETH"] {
+            assert!(
+                rows.iter().any(|r| r.contains(expected)),
+                "`{expected}` must survive a wrapped warning above it:\n{rows:#?}"
+            );
+        }
+        // And the warning that cost two rows is itself whole, both halves drawn.
+        // The seam falls mid-word because wrapping counts display cells, not
+        // words (`chunk_display_width`), so the tail is matched as the renderer
+        // actually leaves it — pinning the real behaviour rather than a prettier
+        // one this console does not have.
+        assert!(
+            rows.iter().any(|r| r.contains("not read — call reverted")),
+            "the warning's first row:\n{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("gistry")),
+            "and its wrapped remainder — the entry was not cut in half:\n{rows:#?}"
+        );
+    }
+
+    /// The other half of the blocker's cure, and a guard on my own fix: rows are
+    /// grouped by asset, so truncation falls BETWEEN entries and never through
+    /// one. A warning cut at the seam would leave "not read — call reverted,"
+    /// on screen with the half that says what to do about it gone.
+    #[test]
+    fn truncation_never_leaves_half_an_entry_on_the_screen() {
+        // Five two-row warnings against a ceiling of eight, so the cut falls on
+        // a LATER entry — the first one is never the one at risk, which is what
+        // made an earlier version of this test pass against the very mutation it
+        // was written to catch.
+        let unavailable: Vec<AssetUnavailable> = (0..5)
+            .map(|i| unread(42161, &format!("TK{i}"), "call_reverted"))
+            .collect();
+        let m = to_dashboard_with_unavailable(vec![], unavailable, PositionsOutcome::Ok(vec![]));
+        // 80 columns is where that reason wraps onto two rows.
+        let rows = draw_rows(&m, 80, 24);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("more — panel is full"),
+            "this panel must be truncating — the test is vacuous otherwise:\n{rows:#?}"
+        );
+        // Every warning that started has its remainder on the screen. Budgeting
+        // one row for a two-row entry draws a fourth warning whose tail the box
+        // then clips, and these two counts come apart.
+        // The seam moves with the length of the symbol before it, so the tail is
+        // matched by a suffix short enough to survive wherever it falls.
+        let started = rows.iter().filter(|r| r.contains("not read")).count();
+        let finished = rows.iter().filter(|r| r.contains("istry")).count();
+        assert_eq!(
+            started, finished,
+            "every warning drawn is drawn whole — {started} started, {finished} \
+             finished:\n{rows:#?}"
+        );
+    }
+
+    /// An asset the core could not read is not an asset worth zero. The panel
+    /// says which one, on which chain, and why — in words, not in the core's
+    /// wire vocabulary.
+    #[test]
+    fn an_unread_asset_is_named_not_omitted() {
+        let m = to_dashboard_with_unavailable(
+            vec![native_row(1, "10000000000000000", "0.01")],
+            vec![unread(8453, "ETH", "rpc_call_failed")],
+            PositionsOutcome::Ok(vec![]),
+        );
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["Base", "ETH", "not read — RPC call failed"]),
+            "the unread chain is named:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("rpc_call_failed")),
+            "the wire word is for the wire:\n{rows:#?}"
+        );
+    }
+
+    /// A reason this console has never heard of is quoted, not guessed at: the
+    /// core may learn one before the console does.
+    #[test]
+    fn an_unknown_reason_is_shown_as_it_came() {
+        let m = to_dashboard_with_unavailable(
+            vec![],
+            vec![unread(1, "ETH", "provider_quota_exhausted")],
+            PositionsOutcome::Ok(vec![]),
+        );
+        let rows = draw_rows(&m, 100, 24);
+        assert!(
+            has_line_with(&rows, &["Ethereum", "not read — provider_quota_exhausted"]),
+            "an unknown reason is quoted:\n{rows:#?}"
+        );
+    }
+
     #[test]
     fn the_dashboard_shows_balance_positions_and_the_waiting_count() {
-        let balances = vec![ChainBalance {
-            chain_id: 1,
-            symbol: "ETH".to_owned(),
-            balance: "10000000000000000".to_owned(), // 0.01 ETH
-        }];
+        let balances = vec![native_row(1, "10000000000000000", "0.01")];
         let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
         let rows = draw_rows(&m, 100, 24);
         assert!(
@@ -4024,7 +4528,7 @@ mod tests {
 
     #[test]
     fn the_dashboard_loading_state_is_not_unavailable() {
-        let m = to_dashboard_loading(vec![]);
+        let m = to_dashboard_loading(vec![], vec![]);
         let screen = draw(&m, 80, 24);
         assert!(screen.contains("loading positions"), "NotYet says loading");
         assert!(
@@ -4050,11 +4554,7 @@ mod tests {
 
     #[test]
     fn a_failed_balance_refresh_is_flagged_on_the_dashboard() {
-        let balances = vec![ChainBalance {
-            chain_id: 1,
-            symbol: "ETH".to_owned(),
-            balance: "5".to_owned(),
-        }];
+        let balances = vec![native_row(1, "5", "0.000000000000000005")];
         let mut m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
         m.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
         let screen = draw(&m, 80, 24);
@@ -4100,24 +4600,27 @@ mod tests {
     #[test]
     fn the_positions_budget_sits_exactly_on_its_boundary() {
         // Geometry at 100×24 after the panel split: header row (1) + Queue
-        // panel (3) + balance panel (BALANCE_ROWS) leaves 14 for positions,
-        // whose own borders take 2 → budget 12. The numbers moved with the
-        // layout; what this pins did not — the Gate-2 blocker subtracted the
-        // header TWICE and cut positions that fit, so both edges stay pinned.
-        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(12)));
+        // panel (3) + balance panel leaves the rest to positions, whose own
+        // borders take 2. With no balances the panel asks for one line plus its
+        // borders (3), so the budget here is 15. The numbers moved with the
+        // layout — twice now, and for the same reason both times: the panel
+        // above stopped being a fixed height. What this pins did not move — the
+        // Gate-2 blocker subtracted the header TWICE and cut positions that fit,
+        // so both edges stay pinned.
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(15)));
         let rows = draw_rows(&m, 100, 24);
         assert_eq!(
             position_rows(&rows),
-            12,
+            15,
             "an exact fit shows every position, no marker"
         );
         assert!(!rows.join("\n").contains("more — terminal too small"));
 
-        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(13)));
+        let m = to_dashboard(vec![], PositionsOutcome::Ok(many_positions(16)));
         let rows = draw_rows(&m, 100, 24);
         assert_eq!(
             position_rows(&rows),
-            11,
+            14,
             "one over: the positions that fit stay, the marker takes the last \
              row — nothing that fits is hidden"
         );
