@@ -44,8 +44,10 @@ Run this in **your own terminal window** — never through the agent session
 
 ## Status
 
-**v0.2 — the resident wallet console.** PIN-unlock opens a Dashboard (per-chain
-balances, DeFi positions, "waiting for you" count); the queue view carries
+**v0.2 — the resident wallet console.** PIN-unlock opens a Dashboard (balances
+per asset — native coins and registry tokens alike, with anything the wallet
+could not read named rather than omitted — DeFi positions, "waiting for you"
+count); the queue view carries
 clear-signing cards with a full From→To block (complete EIP-55 addresses, literal
 **UNLIMITED** for infinite approvals, raw calldata); Receive shows the wallet's
 address with a QR of the exact same string; Activity keeps a decision history that

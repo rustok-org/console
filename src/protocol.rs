@@ -1251,8 +1251,9 @@ mod tests {
 
     #[test]
     fn parse_context_tolerates_empty_balances() {
-        // Every chain's provider was unreachable: balances are omitted, not
-        // zeroed or errored (protocol §3.7) — the answer is still ok.
+        // An empty list is still an `ok` answer (protocol §3.7). What it MEANS
+        // is no longer decided here: with `unavailable` empty too, this wallet
+        // holds nothing — a chain that could not be read says so in that list.
         let line = r#"{"ok":true,"address":"0xAbC","balances":[],"allowed_chains":[1]}"#;
         let ContextOutcome::Ok(ctx) = parse_context(line).unwrap() else {
             panic!("ok context");

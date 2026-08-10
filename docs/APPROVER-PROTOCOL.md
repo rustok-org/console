@@ -254,7 +254,10 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
 ```json
 → {"op":"context"}
 ← {"ok":true,"address":"0x…full-EIP55…",
-   "balances":[{"chain_id":1,"symbol":"ETH","balance":"…decimal…"}],
+   "balances":[{"chain_id":1,"symbol":"ETH","balance":"…decimal…","decimals":18,
+                "balance_formatted":"…decimal…","token_address":""}],
+   "unavailable":[{"chain_id":8453,"symbol":"ETH",
+                   "reason":"no_rpc_configured","token_address":""}],
    "allowed_chains":[1,8453],
    "policy_mode":"read_only|supervised|autonomous",
    "policy_origin":"provisioned|acknowledged"}
@@ -273,11 +276,30 @@ must mirror them exactly (e.g. `amount_wei` is a decimal string while a nested
   the top-level `to` (§3.11) — a console rendering a From→To block can place both
   side by side without re-casing either.
 - `balances` mirrors `list`'s `amount_wei` convention: **U256 via Display →
-  decimal string**, at most one entry per chain in `allowed_chains`. A chain with
-  no configured provider, or whose provider call fails, is **omitted** — not
-  zeroed or errored — the response still answers `ok:true` with whatever
-  balances were reachable (best-effort, mirrors the gRPC `WalletContext` RPC
-  this op reuses).
+  decimal string**, in raw units of the asset the row is about. One row per
+  asset, not per chain: each allowed chain's native coin first, then that chain's
+  registry tokens (`RUSTOK_TOKENS_<chain_id>`) in declaration order.
+  - `decimals` — the places `balance` is counted in (18 native, 6 for USDC).
+  - `balance_formatted` — `balance` with `decimals` applied, trailing zeros
+    trimmed. The server renders it once, exactly as it does for a position, so
+    no client has to know an asset's decimals in order to print it.
+  - `token_address` — the token's contract, **empty for the native coin**. A
+    symbol is not unique: native USDC and bridged USDC.e sit side by side on
+    Arbitrum, and only the contract tells them apart.
+  - These three are **always present**. A client that fills a missing `decimals`
+    with 18 turns a USDC balance into dust, so the field is mandatory rather
+    than defaulted.
+- `unavailable` lists the assets that could NOT be read, each with a `reason`:
+  `no_rpc_configured` (the chain has no provider) · `rpc_call_failed` (the call
+  did not come back) · `call_reverted` (the address in the registry is not the
+  ERC-20 it was said to be — a configuration error, not a transient one).
+  The list may be absent, which reads as empty.
+  **An asset missing from `balances` while `unavailable` is empty means zero,
+  and only zero.** Before this field existed, an unreachable chain was simply
+  omitted, and a short list of balances was indistinguishable from an empty
+  wallet — the response still answers `ok:true` with whatever was reachable
+  (best-effort, mirrors the gRPC `WalletContext` RPC this op reuses), but it now
+  says what it could not reach.
 - `allowed_chains` is the server's configured chain allow-list, in order — the
   same list `list`/`get` implicitly operate within.
 - **`policy_mode` + `policy_origin` (proto 2+ wire, meaning since core increment 2)
