@@ -1890,6 +1890,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -1919,6 +1920,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy,
             },
@@ -2185,8 +2187,12 @@ mod tests {
                         chain_id: i,
                         symbol: "ETH".to_owned(),
                         balance: "1000000000000000000".to_owned(),
+                        decimals: 18,
+                        balance_formatted: "1".to_owned(),
+                        token_address: String::new(),
                     })
                     .collect(),
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: policy_of(PolicyMode::Supervised, PolicyOrigin::Provisioned),
             },
@@ -2980,6 +2986,7 @@ mod tests {
             WalletContext {
                 address: String::new(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -3911,18 +3918,43 @@ mod tests {
 
     // ── Stage 5: the Dashboard view ──
 
-    use crate::protocol::{ChainBalance, Position, PositionsOutcome};
+    use crate::protocol::{AssetUnavailable, ChainBalance, Position, PositionsOutcome};
 
     /// Drive a model onto the (home) Dashboard with the given balances, then
     /// feed it the positions reply the scheduler solicits.
     fn to_dashboard(balances: Vec<ChainBalance>, positions: PositionsOutcome) -> Model {
-        let mut m = to_dashboard_loading(balances);
+        to_dashboard_with_unavailable(balances, Vec::new(), positions)
+    }
+
+    /// Same, with assets the core could not read at all.
+    fn to_dashboard_with_unavailable(
+        balances: Vec<ChainBalance>,
+        unavailable: Vec<AssetUnavailable>,
+        positions: PositionsOutcome,
+    ) -> Model {
+        let mut m = to_dashboard_loading(balances, unavailable);
         m.update(Msg::Reply(Reply::Positions(positions)));
         m
     }
 
+    /// A native ETH row as the core sends it: raw wei, the 18 places they are
+    /// counted in, and the string the core already rendered from the two.
+    fn native_row(chain_id: u64, wei: &str, formatted: &str) -> ChainBalance {
+        ChainBalance {
+            chain_id,
+            symbol: "ETH".to_owned(),
+            balance: wei.to_owned(),
+            decimals: 18,
+            balance_formatted: formatted.to_owned(),
+            token_address: String::new(),
+        }
+    }
+
     /// Same, stopped BEFORE the positions reply lands (the loading state).
-    fn to_dashboard_loading(balances: Vec<ChainBalance>) -> Model {
+    fn to_dashboard_loading(
+        balances: Vec<ChainBalance>,
+        unavailable: Vec<AssetUnavailable>,
+    ) -> Model {
         let mut m = Model::new();
         m.update(Msg::Resize {
             width: 80,
@@ -3938,6 +3970,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances,
+                unavailable,
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -3970,11 +4003,7 @@ mod tests {
     /// not lost — it is on the card, where a decision is made.
     #[test]
     fn the_balance_panel_shortens_a_long_amount() {
-        let balances = vec![ChainBalance {
-            chain_id: 1,
-            symbol: "ETH".to_owned(),
-            balance: "5499068022390730".to_owned(), // 0.00549906802239073 ETH
-        }];
+        let balances = vec![native_row(1, "5499068022390730", "0.00549906802239073")];
         let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
         let rows = draw_rows(&m, 100, 24);
         assert!(
@@ -3985,11 +4014,7 @@ mod tests {
 
     #[test]
     fn the_dashboard_shows_balance_positions_and_the_waiting_count() {
-        let balances = vec![ChainBalance {
-            chain_id: 1,
-            symbol: "ETH".to_owned(),
-            balance: "10000000000000000".to_owned(), // 0.01 ETH
-        }];
+        let balances = vec![native_row(1, "10000000000000000", "0.01")];
         let m = to_dashboard(balances, PositionsOutcome::Ok(vec![aave_position()]));
         let rows = draw_rows(&m, 100, 24);
         assert!(
@@ -4024,7 +4049,7 @@ mod tests {
 
     #[test]
     fn the_dashboard_loading_state_is_not_unavailable() {
-        let m = to_dashboard_loading(vec![]);
+        let m = to_dashboard_loading(vec![], vec![]);
         let screen = draw(&m, 80, 24);
         assert!(screen.contains("loading positions"), "NotYet says loading");
         assert!(
@@ -4050,11 +4075,7 @@ mod tests {
 
     #[test]
     fn a_failed_balance_refresh_is_flagged_on_the_dashboard() {
-        let balances = vec![ChainBalance {
-            chain_id: 1,
-            symbol: "ETH".to_owned(),
-            balance: "5".to_owned(),
-        }];
+        let balances = vec![native_row(1, "5", "0.000000000000000005")];
         let mut m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
         m.update(Msg::Reply(Reply::Context(ContextOutcome::WalletLocked)));
         let screen = draw(&m, 80, 24);

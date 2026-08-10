@@ -814,6 +814,7 @@ mod tests {
             WalletContext {
                 address: "0x489Fe09Fbb489Fe09Fbb489Fe09Fbb489F9Fbbbb".to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },

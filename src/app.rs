@@ -1834,6 +1834,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Policy { mode, origin },
             },
@@ -1972,6 +1973,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Policy {
                     mode: PolicyMode::Autonomous,
@@ -2152,6 +2154,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -3526,6 +3529,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
@@ -3673,6 +3677,7 @@ mod tests {
             WalletContext {
                 address: WALLET.to_owned(),
                 balances: vec![],
+                unavailable: vec![],
                 allowed_chains: vec![1],
                 policy: Default::default(),
             },
