@@ -819,7 +819,7 @@ const IDENTITY_COL: u16 = 22;
 /// chain (Captain, 2026-08-10). Past that the list is asked to fit, because the
 /// panel shares the column with positions, and a balance list free to grow would
 /// push them off the screen entirely.
-const BALANCE_ROWS_MAX: usize = 8;
+const BALANCE_ROWS_MAX: u16 = 8;
 
 /// Rows the balance panel asks for: its two borders plus the lines it actually
 /// has, capped by [`BALANCE_ROWS_MAX`].
@@ -835,11 +835,14 @@ fn balance_panel_rows(model: &Model) -> u16 {
         Some(ctx) => (ctx.unavailable.len() + ctx.balances.len()).max(1),
         None => 1,
     };
-    let stale = usize::from(model.context_stale());
-    let inner = (listed + stale).min(BALANCE_ROWS_MAX);
-    // `inner` is at most BALANCE_ROWS_MAX (8) and the borders add 2, so the sum
-    // cannot approach u16::MAX; the cast is exact.
-    u16::try_from(inner + 2).unwrap_or(u16::MAX)
+    // The list comes off the wire, so its length is the core's to choose. A list
+    // longer than a u16 asks for more rows than any terminal has; saturating
+    // here costs nothing, because the cap below is what the panel actually takes.
+    let listed = u16::try_from(listed).unwrap_or(u16::MAX);
+    let inner = listed
+        .saturating_add(u16::from(model.context_stale()))
+        .min(BALANCE_ROWS_MAX);
+    inner + 2
 }
 
 /// Columns reserved for a version label, so the numbers line up under one
