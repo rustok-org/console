@@ -24,8 +24,8 @@ core itself, never by the agent. You read what is actually being signed and pres
 
 1. **The card renders the core's decode, not the agent's words.** A lying agent
    cannot change what you see.
-2. **Approval is unlocked by a PIN** printed once, in *your* terminal, when the
-   wallet is created. The agent has never seen it and cannot type it.
+2. **Approval is unlocked by a PIN you chose**, in *your* terminal, when the
+   wallet was created. The agent has never seen it and cannot type it.
 3. **Fail-closed everywhere.** No console open, no PIN, no answer, expired card,
    piped stdin instead of a real TTY — everything resolves to *reject*.
 
