@@ -1295,8 +1295,12 @@ fn render_mode_switch(frame: &mut Frame, switch: &ModeSwitch, current: PolicyMod
 /// it would be worse than quoting it.
 fn unavailable_reason(reason: &str) -> String {
     match reason {
-        "no_rpc_configured" => "not queried — no RPC".to_owned(),
-        "rpc_call_failed" => "not read — RPC call failed".to_owned(),
+        "no_rpc_configured" => {
+            "not queried — no node for this chain (set RUSTOK_RPC_URLS_<id>)".to_owned()
+        }
+        "rpc_call_failed" => {
+            "not read — the node did not answer (retry, or name your own)".to_owned()
+        }
         "call_reverted" => "not read — call reverted, check the registry".to_owned(),
         other => format!("not read — {other}"),
     }
@@ -1379,7 +1383,13 @@ fn render_dashboard(frame: &mut Frame, pending: usize, model: &Model, versions: 
     push_wrapped(&mut lines, width, waiting, waiting_style);
     frame.render_widget(Paragraph::new(lines).block(queue_block), panels[0]);
 
-    let block = themed_block(" balance ");
+    // The sentence rides the border the panel already draws: a row of its own
+    // would come out of the positions panel below, and a row inside the block
+    // would eventually go behind the "+N more" that hides assets — a disclosure
+    // for quiet days only. It names no host on purpose: nothing in the context
+    // says which node answered, so "public nodes" would be a lie told to the
+    // person who configured their own.
+    let block = themed_block(" balance — nodes see your address and IP ");
     let inner = block.inner(panels[1]);
     let width = usize::from(inner.width);
     let height = usize::from(inner.height);
@@ -4351,7 +4361,7 @@ mod tests {
             "this panel is over its ceiling — the test is vacuous otherwise:\n{rows:#?}"
         );
         assert!(
-            has_line_with(&rows, &["Base", "ETH", "not queried — no RPC"]),
+            has_line_with(&rows, &["Base", "ETH", "no node for this chain"]),
             "an unread native asset survives the cut:\n{rows:#?}"
         );
         assert!(
@@ -4504,6 +4514,63 @@ mod tests {
     /// says which one, on which chain, and why — in words, not in the core's
     /// wire vocabulary.
     #[test]
+    fn an_unread_chain_says_what_to_do_about_it() {
+        // Naming the cause was the round before this one; a cause with no next
+        // step leaves the person exactly where the empty screen did.
+        let m = to_dashboard_with_unavailable(
+            vec![],
+            vec![
+                unread(1, "ETH", "no_rpc_configured"),
+                unread(8453, "ETH", "rpc_call_failed"),
+            ],
+            PositionsOutcome::Ok(vec![]),
+        );
+        let screen = draw(&m, 100, 24);
+
+        assert!(
+            screen.contains("RUSTOK_RPC_URLS_"),
+            "the chain with no node names the variable that gives it one:\n{screen}"
+        );
+        assert!(
+            screen.contains("retry, or name your own"),
+            "a node that did not answer names both ways out:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_balance_panel_says_who_learns_of_it() {
+        let m = to_dashboard(
+            vec![native_row(1, "10000000000000000", "0.01")],
+            PositionsOutcome::Ok(vec![]),
+        );
+        assert!(
+            draw(&m, 100, 24).contains("nodes see your address and IP"),
+            "the disclosure rides the panel it is about"
+        );
+    }
+
+    #[test]
+    fn the_disclosure_survives_a_panel_too_full_to_show_the_assets() {
+        // The reason it lives on the border and not in a row: rows go behind
+        // "+N more" once the panel is over its ceiling, and a disclosure that
+        // hides itself when the screen gets busy is one for quiet days only.
+        let balances: Vec<ChainBalance> = (0..12)
+            .map(|i| native_row(i, "10000000000000000", "0.01"))
+            .collect();
+        let m = to_dashboard(balances, PositionsOutcome::Ok(vec![]));
+        let screen = draw(&m, 100, 24);
+
+        assert!(
+            screen.contains("more — panel is full"),
+            "the panel must be over its ceiling or this proves nothing:\n{screen}"
+        );
+        assert!(
+            screen.contains("nodes see your address and IP"),
+            "the disclosure outlives the truncation:\n{screen}"
+        );
+    }
+
+    #[test]
     fn an_unread_asset_is_named_not_omitted() {
         let m = to_dashboard_with_unavailable(
             vec![native_row(1, "10000000000000000", "0.01")],
@@ -4512,7 +4579,7 @@ mod tests {
         );
         let rows = draw_rows(&m, 100, 24);
         assert!(
-            has_line_with(&rows, &["Base", "ETH", "not read — RPC call failed"]),
+            has_line_with(&rows, &["Base", "ETH", "the node did not answer"]),
             "the unread chain is named:\n{rows:#?}"
         );
         assert!(
