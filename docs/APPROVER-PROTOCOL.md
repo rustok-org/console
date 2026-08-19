@@ -20,7 +20,14 @@
 > `proto: 1` session negotiated by an already-shipped `console v0.1.0` continues
 > to work unchanged — see §3.1 and §6.
 >
-> **proto 3 — CURRENT**, additive over proto 2: the `ack` op (§3.10), by which a
+> **proto 4 — CURRENT**, additive over proto 3: the `set_mode` op (§3.13), by
+> which a human switches this wallet's mode outright — downgrades included —
+> where `ack` (§3.10) could only confirm autonomy the wallet already had. `ack`
+> stays in the protocol unchanged for older consoles; a proto-4 console no
+> longer sends it. The server half shipped in `core feat/the-human-picks-the-mode`
+> (increment 3); this section was written against that code, handler by handler.
+>
+> **proto 3**, additive over proto 2: the `ack` op (§3.10), by which a
 > human confirms this wallet's autonomous mode, plus the `policy_mode` /
 > `policy_origin` pair on `context` (§3.7) and the `not_autonomous` /
 > `policy_store_failed` error codes (§3.12). The server half shipped in
@@ -528,18 +535,86 @@ behind. Until it lands, an `autonomous` wallet still parks every send (§3.7).
 | `protocol_error` | any | malformed line, unknown op, wrong field type, request before/after `hello`, a proto-2 read-op (`context`/`positions`/`activity`, §3.7–§3.9) on a `proto:1` session, or `ack` (§3.10) on a session below `proto:3` — including an `ack` line with no `pin` field at all, which does not deserialize |
 | `oversize` | any | request line > 64 KiB; the connection is then closed (§2) |
 | `unsupported_proto` | hello | major `proto` mismatch; server then closes |
-| `unauthorized` | approve, deny, context, positions, activity, ack | no successful `auth` on this connection |
-| `bad_pin` | auth, approve, ack | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
-| `locked` | auth, approve, ack | lockout active; carries `retry_after_s` |
-| `pin_not_set` | auth, approve, ack | wallet has no PIN record; run `set-pin` |
-| `pin_unavailable` | auth, approve, ack | Argon2 backend failure (transient; never an accept) |
-| `pin_required` | approve, ack | high-risk item approved without a `pin`; or `ack` with an empty `pin` (§3.10) |
+| `unauthorized` | approve, deny, context, positions, activity, ack, set_mode | no successful `auth` on this connection |
+| `bad_pin` | auth, approve, ack, set_mode | wrong PIN; carries `attempts_left` (0 ⇒ now locked) |
+| `locked` | auth, approve, ack, set_mode | lockout active; carries `retry_after_s` |
+| `pin_not_set` | auth, approve, ack, set_mode | wallet has no PIN record; run `set-pin` |
+| `pin_unavailable` | auth, approve, ack, set_mode | Argon2 backend failure (transient; never an accept) |
+| `pin_required` | approve, ack, set_mode | high-risk item approved without a `pin`; or `ack`/`set_mode` with an empty `pin` (§3.10, §3.13) |
 | `unknown_id` | get, approve, deny | id is not a live item (never parked, resolved+swept, or bad UUID) |
 | `already_resolved` | approve, deny | id already terminal (or in-flight); carries `state` |
 | `internal` | approve | unreachable post-execute inconsistency (defensive) |
 | `wallet_locked` | context, positions | the core's own keyring isn't unlocked — distinct from PIN `auth` (§3.7) |
 | `not_autonomous` | ack | the wallet is not autonomous — nothing to confirm, and `ack` never switches modes (§3.10) |
-| `policy_store_failed` | ack | the policy could not be persisted; the in-memory policy was deliberately left unchanged (§3.10) |
+| `policy_store_failed` | ack, set_mode | the policy could not be persisted; the in-memory policy was deliberately left unchanged (§3.10, §3.13) |
+| `unknown_mode` | set_mode | the `mode` word is not one of the three the server knows — refused, never defaulted (§3.13) |
+| `policy_newer_than_build` | set_mode | `policy.json` was written by a newer build; refused untouched, so a rollback cannot destroy it (§3.13) |
+| `policy_unreadable` | set_mode | `policy.json` exists but cannot be read; refused rather than overwritten blind (§3.13) |
+
+### 3.13 `set_mode` (proto 4+) — the human switches this wallet's mode
+
+```json
+→ {"op":"set_mode","mode":"autonomous","pin":"483920"}
+← {"ok":true,"mode":"autonomous","origin":"acknowledged"}
+← {"ok":false,"error":"unauthorized"}             // no auth on this connection
+← {"ok":false,"error":"protocol_error"}           // session negotiated proto < 4 (§3.1)
+← {"ok":false,"error":"unknown_mode"}             // a word outside the three below
+← {"ok":false,"error":"pin_required"}             // `pin` present but empty
+← {"ok":false,"error":"bad_pin","attempts_left":2}
+← {"ok":false,"error":"locked","retry_after_s":287}
+← {"ok":false,"error":"pin_not_set"}
+← {"ok":false,"error":"pin_unavailable"}
+← {"ok":false,"error":"policy_newer_than_build"}  // refused untouched — see below
+← {"ok":false,"error":"policy_unreadable"}        // refused untouched — see below
+← {"ok":false,"error":"policy_store_failed"}      // not persisted; memory left unchanged
+```
+
+Where `ack` (§3.10) confirms autonomy the wallet already has, this op **switches
+modes outright** — `read_only` | `supervised` | `autonomous`, downgrades
+included. It is the switch behind the console's Dashboard overlay.
+
+- **`mode` is one of exactly three words**: `read_only`, `supervised`,
+  `autonomous`. Anything else — a typo included — answers `unknown_mode` and
+  changes nothing: an unrecognised word must not quietly land the wallet
+  somewhere it was not asked to go.
+- **`pin` is REQUIRED in BOTH directions**, downgrades too: a gate with a hole
+  on the way out is not a gate. Someone who has forgotten the PIN is not locked
+  in — `rustok stop` and `rustok set-pin` live outside this socket. Empty
+  `pin` → `pin_required`, checked before the verifier so a typo in the field
+  does not burn one of the three attempts.
+- **Proto-gated at 4**, exactly as `ack` is gated at 3: a session negotiated
+  below 4 gets `protocol_error`; a proto-4 console against an older core gets
+  `unsupported_proto` with the supported list at `hello` (§3.1).
+- **`origin` is always `acknowledged` on success**: any change made through
+  this op was made by a human under a PIN. `provisioned` remains exclusively
+  the first-start heuristic's word (§3.7).
+- **Idempotency is judged on BOTH halves.** Asking for the mode the wallet
+  already stands in **by the human's hand** answers the same `ok` with nothing
+  written. But an `autonomous` wallet the heuristic provisioned still has
+  something to change — its origin — so `set_mode autonomous` there is a real
+  change and the cell that replaces `ack` on modern volumes.
+- **Refusals a rolled-back image can hit are named apart.** A `policy.json`
+  written by a newer build answers `policy_newer_than_build` and is left
+  byte-identical — rolling an image back must not cost what the newer one
+  recorded. A file that exists but cannot be read answers `policy_unreadable`,
+  untouched for the same reason. A *rotten* file (present, readable, not
+  parseable) is overwritten as the rescue it is — that distinction is the
+  server's, made before anything is written.
+- **`policy_store_failed`** keeps §3.10's semantics: nothing persisted, memory
+  deliberately unchanged.
+- **Switching does not touch the parked queue.** Entries parked before the
+  switch stay parked: turning autonomy on does not release them (they are
+  decided one by one, §3.10's rule), and a downgrade to `read_only` makes their
+  release refuse with the named reason the release path already carries.
+- **Check order is normative**: proto → auth → mode word → empty `pin` → PIN
+  verify → policy. The mode word is checked before the PIN so a typo costs a
+  message, not an attempt.
+- **Lockout**: counts into the same cumulative PIN ladder as `auth`, `approve`
+  and `ack` (§4); `attempts_left: 0` drops the pending queue like every other
+  PIN path.
+- **Audited by outcome, not by request**: every applied change — downgrades
+  included, and the origin-only change above — writes a `PolicyChange` audit
+  row; an idempotent no-op writes none (nothing changed).
 
 ## 4. PIN & lockout semantics (server-side, normative)
 

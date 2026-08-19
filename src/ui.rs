@@ -10,8 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
-    AuthError, Confirm, DecisionKind, HistoryEntry, Model, Notice, Phase, Positions, ResolveError,
-    View,
+    AuthError, Confirm, DecisionKind, HistoryEntry, ModeSwitch, Model, Notice, Phase, Positions,
+    ResolveError, View,
 };
 use crate::protocol::{Card, Kind, OutcomeState, Policy, PolicyMode, PolicyOrigin, Summary};
 use crate::{format, qr, theme};
@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64, versions: Version
             confirm,
             notice,
             view,
-            ack,
+            switch,
         } => match view {
             View::Queue => render_watch(
                 frame,
@@ -51,8 +51,8 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64, versions: Version
             }
             View::Dashboard => {
                 render_dashboard(frame, items.len(), model, versions);
-                if let Some(a) = ack {
-                    render_ack_prompt(frame, a.pin_len());
+                if let Some(s) = switch {
+                    render_mode_switch(frame, s, model.policy().mode);
                 }
             }
             View::Activity => render_activity(frame, items.len(), model, now_unix),
@@ -1203,15 +1203,69 @@ fn parking_reason(policy: Policy) -> (&'static str, Style) {
     }
 }
 
-/// The autonomy-confirmation PIN prompt, centred over the screen.
+/// The mode switcher (spec §2.4), centred over the Dashboard.
 ///
-/// Same behaviour as the card's high-risk prompt — on top, masked, nothing
-/// stored — and deliberately not the same state: that one belongs to an item,
-/// this one to the wallet (design §3, correction of 2026-08-07).
-fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
+/// Same behaviour family as the card's high-risk prompt — on top, masked,
+/// nothing stored. Two stages under one box: the pick list, then the PIN row
+/// once a pick is confirmed. The autonomy disclaimer renders whenever the
+/// selector stands on `autonomous`, in BOTH stages: the human reads it before
+/// the PIN and while typing it, never after.
+fn render_mode_switch(frame: &mut Frame, switch: &ModeSwitch, current: PolicyMode) {
+    const DISCLAIMER: [&str; 3] = [
+        "Autonomy has no spending limits in this build:",
+        "the ceiling is the wallet balance. An approval the agent",
+        "signs is not capped and outlives the agent; only a separate transaction revokes it.",
+    ];
+    let selected = switch.selected();
+    let mut lines: Vec<Line> = Vec::with_capacity(10);
+    for mode in [
+        PolicyMode::ReadOnly,
+        PolicyMode::Supervised,
+        PolicyMode::Autonomous,
+    ] {
+        let word = mode.wire_word().unwrap_or("?");
+        let marker = if mode == selected { "▸ " } else { "  " };
+        let tag = if mode == current { "  (current)" } else { "" };
+        let style = if mode == selected {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            theme::label_style()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{word}{tag}"),
+            style,
+        )));
+    }
+    if selected == PolicyMode::Autonomous {
+        lines.push(Line::default());
+        for row in DISCLAIMER {
+            lines.push(Line::from(Span::styled(
+                row,
+                Style::new().fg(theme::high_risk()),
+            )));
+        }
+    }
+    lines.push(Line::default());
+    match switch.pin_len() {
+        Some(pin_len) => {
+            lines.push(Line::from(format!("PIN: {}", "●".repeat(pin_len))));
+            lines.push(Line::from(Span::styled(
+                "enter — apply · esc — cancel",
+                Style::new().fg(theme::faint()),
+            )));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "↑/↓ — choose · enter — continue (PIN) · esc — cancel",
+                Style::new().fg(theme::faint()),
+            )));
+        }
+    }
+
     let area = frame.area();
-    let width = 44.min(area.width);
-    let height = 4.min(area.height);
+    let width = 64.min(area.width);
+    #[allow(clippy::cast_possible_truncation)] // bounded: at most 10 lines + 2 border rows
+    let height = (lines.len() as u16 + 2).min(area.height);
     let rect = ratatui::layout::Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -1222,20 +1276,12 @@ fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
     let block = Block::bordered()
         .border_style(Style::new().fg(theme::high_risk()))
         .title(Line::from(Span::styled(
-            " Confirm autonomy ",
+            " Wallet mode ",
             Style::new()
                 .fg(theme::high_risk())
                 .add_modifier(Modifier::BOLD),
         )));
-    let body = Paragraph::new(vec![
-        Line::from(format!("PIN: {}", "●".repeat(pin_len))),
-        Line::from(Span::styled(
-            "enter — confirm · esc — cancel",
-            Style::new().fg(theme::faint()),
-        )),
-    ])
-    .block(block);
-    frame.render_widget(body, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// Word an unread asset for the human, from the reason the core sent.
