@@ -10,8 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
-    AuthError, Confirm, DecisionKind, HistoryEntry, Model, Notice, Phase, Positions, ResolveError,
-    View,
+    AuthError, Confirm, DecisionKind, HistoryEntry, ModeSwitch, Model, Notice, Phase, Positions,
+    ResolveError, View,
 };
 use crate::protocol::{Card, Kind, OutcomeState, Policy, PolicyMode, PolicyOrigin, Summary};
 use crate::{format, qr, theme};
@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64, versions: Version
             confirm,
             notice,
             view,
-            ack,
+            switch,
         } => match view {
             View::Queue => render_watch(
                 frame,
@@ -51,8 +51,8 @@ pub fn render(frame: &mut Frame, model: &Model, now_unix: u64, versions: Version
             }
             View::Dashboard => {
                 render_dashboard(frame, items.len(), model, versions);
-                if let Some(a) = ack {
-                    render_ack_prompt(frame, a.pin_len());
+                if let Some(s) = switch {
+                    render_mode_switch(frame, s, model.policy().mode);
                 }
             }
             View::Activity => render_activity(frame, items.len(), model, now_unix),
@@ -1203,15 +1203,69 @@ fn parking_reason(policy: Policy) -> (&'static str, Style) {
     }
 }
 
-/// The autonomy-confirmation PIN prompt, centred over the screen.
+/// The mode switcher (spec §2.4), centred over the Dashboard.
 ///
-/// Same behaviour as the card's high-risk prompt — on top, masked, nothing
-/// stored — and deliberately not the same state: that one belongs to an item,
-/// this one to the wallet (design §3, correction of 2026-08-07).
-fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
+/// Same behaviour family as the card's high-risk prompt — on top, masked,
+/// nothing stored. Two stages under one box: the pick list, then the PIN row
+/// once a pick is confirmed. The autonomy disclaimer renders whenever the
+/// selector stands on `autonomous`, in BOTH stages: the human reads it before
+/// the PIN and while typing it, never after.
+fn render_mode_switch(frame: &mut Frame, switch: &ModeSwitch, current: PolicyMode) {
+    const DISCLAIMER: [&str; 3] = [
+        "Autonomy has no spending limits in this build:",
+        "the ceiling is the wallet balance. An approval the agent",
+        "signs is not capped and outlives the agent; only a separate transaction revokes it.",
+    ];
+    let selected = switch.selected();
+    let mut lines: Vec<Line> = Vec::with_capacity(10);
+    for mode in [
+        PolicyMode::ReadOnly,
+        PolicyMode::Supervised,
+        PolicyMode::Autonomous,
+    ] {
+        let word = mode.wire_word().unwrap_or("?");
+        let marker = if mode == selected { "▸ " } else { "  " };
+        let tag = if mode == current { "  (current)" } else { "" };
+        let style = if mode == selected {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            theme::label_style()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{word}{tag}"),
+            style,
+        )));
+    }
+    if selected == PolicyMode::Autonomous {
+        lines.push(Line::default());
+        for row in DISCLAIMER {
+            lines.push(Line::from(Span::styled(
+                row,
+                Style::new().fg(theme::high_risk()),
+            )));
+        }
+    }
+    lines.push(Line::default());
+    match switch.pin_len() {
+        Some(pin_len) => {
+            lines.push(Line::from(format!("PIN: {}", "●".repeat(pin_len))));
+            lines.push(Line::from(Span::styled(
+                "enter — apply · esc — cancel",
+                Style::new().fg(theme::faint()),
+            )));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "↑/↓ — choose · enter — continue (PIN) · esc — cancel",
+                Style::new().fg(theme::faint()),
+            )));
+        }
+    }
+
     let area = frame.area();
-    let width = 44.min(area.width);
-    let height = 4.min(area.height);
+    let width = 64.min(area.width);
+    #[allow(clippy::cast_possible_truncation)] // bounded: at most 10 lines + 2 border rows
+    let height = (lines.len() as u16 + 2).min(area.height);
     let rect = ratatui::layout::Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -1222,20 +1276,12 @@ fn render_ack_prompt(frame: &mut Frame, pin_len: usize) {
     let block = Block::bordered()
         .border_style(Style::new().fg(theme::high_risk()))
         .title(Line::from(Span::styled(
-            " Confirm autonomy ",
+            " Wallet mode ",
             Style::new()
                 .fg(theme::high_risk())
                 .add_modifier(Modifier::BOLD),
         )));
-    let body = Paragraph::new(vec![
-        Line::from(format!("PIN: {}", "●".repeat(pin_len))),
-        Line::from(Span::styled(
-            "enter — confirm · esc — cancel",
-            Style::new().fg(theme::faint()),
-        )),
-    ])
-    .block(block);
-    frame.render_widget(body, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// Word an unread asset for the human, from the reason the core sent.
@@ -4870,5 +4916,110 @@ mod tests {
             has_line_with(&rows, &["session-only"]),
             "the note survives an overflowing list: {rows:?}"
         );
+    }
+
+    // ─── The mode switcher (spec §2.4) — the overlay itself, on a test backend ───
+
+    /// A model standing on the Dashboard with a real policy pair — the same
+    /// message path the app takes, no struct built by hand.
+    fn to_dashboard_with_policy(
+        m: &mut Model,
+        mode: crate::protocol::PolicyMode,
+        origin: crate::protocol::PolicyOrigin,
+    ) {
+        to_watching(m, vec![]);
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            crate::protocol::WalletContext {
+                address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_owned(),
+                balances: vec![],
+                unavailable: vec![],
+                allowed_chains: vec![1],
+                policy: Policy { mode, origin },
+            },
+        )))));
+        m.update(Msg::View(crate::app::View::Dashboard));
+    }
+
+    #[test]
+    fn the_switcher_lists_three_modes_and_marks_the_current() {
+        let mut m = Model::new();
+        to_dashboard_with_policy(
+            &mut m,
+            crate::protocol::PolicyMode::Supervised,
+            crate::protocol::PolicyOrigin::Acknowledged,
+        );
+        m.update(Msg::SwitchStart);
+        let rows = draw_rows(&m, 80, 24);
+        let screen = rows.join("\n");
+        for word in ["read_only", "supervised", "autonomous"] {
+            assert!(screen.contains(word), "the overlay lists {word}");
+        }
+        let current_row = rows
+            .iter()
+            .find(|r| r.contains("(current)"))
+            .expect("the current mode is marked");
+        assert!(
+            current_row.contains("supervised"),
+            "the mark sits on the wallet's own mode: {current_row}"
+        );
+        assert!(
+            screen.contains("choose"),
+            "the picking stage names its keys"
+        );
+        m.update(Msg::SwitchNext); // the selector moves; the mark must not follow
+        let rows = draw_rows(&m, 80, 24);
+        let current_row = rows
+            .iter()
+            .find(|r| r.contains("(current)"))
+            .expect("the mark survives a selector move");
+        assert!(
+            current_row.contains("supervised"),
+            "the mark stays on the wallet's own mode, not the cursor: {current_row}"
+        );
+    }
+
+    #[test]
+    fn the_disclaimer_renders_exactly_when_autonomous_is_selected() {
+        const ANCHOR: &str = "ceiling is the wallet balance";
+        let mut m = Model::new();
+        to_dashboard_with_policy(
+            &mut m,
+            crate::protocol::PolicyMode::Supervised,
+            crate::protocol::PolicyOrigin::Acknowledged,
+        );
+        m.update(Msg::SwitchStart);
+        assert!(
+            !draw(&m, 80, 24).contains(ANCHOR),
+            "no disclaimer while supervised is selected"
+        );
+        m.update(Msg::SwitchNext); // supervised -> autonomous
+        assert!(
+            draw(&m, 80, 24).contains(ANCHOR),
+            "the disclaimer renders the moment autonomous is selected"
+        );
+        m.update(Msg::PinSubmit); // PIN stage opens
+        assert!(
+            draw(&m, 80, 24).contains(ANCHOR),
+            "and stays on screen while the PIN is typed — read before AND during"
+        );
+    }
+
+    #[test]
+    fn the_switcher_pin_stage_masks_digits_like_every_other_pin() {
+        let mut m = Model::new();
+        to_dashboard_with_policy(
+            &mut m,
+            crate::protocol::PolicyMode::Supervised,
+            crate::protocol::PolicyOrigin::Acknowledged,
+        );
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit);
+        for c in "4839".chars() {
+            m.update(Msg::PinDigit(c));
+        }
+        let screen = draw(&m, 80, 24);
+        assert!(screen.contains("●●●●"), "four dots for four digits");
+        assert!(!screen.contains("4839"), "the digits must never render");
+        assert!(screen.contains("apply"), "the PIN stage names its keys");
     }
 }

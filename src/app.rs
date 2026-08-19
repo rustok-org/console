@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    AckOutcome, AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, Policy,
-    PolicyOrigin, PositionsOutcome, ResolveOutcome, Summary, TerminalState, WalletContext,
+    AuthOutcome, Card, ContextOutcome, GetOutcome, OutcomeEntry, OutcomeState, Policy, PolicyMode,
+    PositionsOutcome, ResolveOutcome, SetModeOutcome, Summary, TerminalState, WalletContext,
 };
 use crate::transport::{self, Reply, TransportError};
 use crate::ui;
@@ -104,20 +104,26 @@ impl Pin {
         line
     }
 
-    /// Build the `ack` request line into a `Zeroizing` buffer (protocol §3.10).
+    /// Build the `set_mode` request line into a `Zeroizing` buffer (§3.13).
     ///
     /// Same construction as [`Self::auth_line`] and for the same reason — the
     /// PIN must never exist in an un-zeroized `String`. The op carries the PIN
-    /// itself rather than leaning on the session `auth`: one `ack` lifts the
-    /// parking gate for good, while an `approve` releases one transaction.
+    /// itself rather than leaning on the session `auth`: one `set_mode` moves
+    /// the wallet between modes for good, while an `approve` releases one
+    /// transaction. The mode word is one of the three static strings
+    /// [`PolicyMode::wire_word`] hands out — never user text, so it cannot
+    /// break out of its JSON string.
     #[must_use]
-    pub fn ack_line(&self) -> Zeroizing<String> {
-        const PREFIX: &str = r#"{"op":"ack","pin":""#;
+    pub fn set_mode_line(&self, mode_word: &'static str) -> Zeroizing<String> {
+        const PREFIX: &str = r#"{"op":"set_mode","mode":""#;
+        const MIDDLE: &str = r#"","pin":""#;
         const SUFFIX: &str = r#""}"#;
         let mut line = Zeroizing::new(String::with_capacity(
-            PREFIX.len() + self.0.len() + SUFFIX.len(),
+            PREFIX.len() + mode_word.len() + MIDDLE.len() + self.0.len() + SUFFIX.len(),
         ));
         line.push_str(PREFIX);
+        line.push_str(mode_word);
+        line.push_str(MIDDLE);
         line.push_str(&self.0);
         line.push_str(SUFFIX);
         line
@@ -188,7 +194,7 @@ pub enum Phase {
         /// that is a contract about behaviour, not a shared piece of state:
         /// the card's prompt belongs to an item, and this one belongs to the
         /// wallet, which has no item.
-        ack: Option<AckPrompt>,
+        switch: Option<ModeSwitch>,
     },
     /// The connection is finished — render the reason and exit.
     Fatal(TransportError),
@@ -468,20 +474,83 @@ pub struct Confirm {
     timed_out: bool,
 }
 
-/// The autonomy-confirmation prompt (design §3).
-#[derive(Debug, Default)]
-pub struct AckPrompt {
-    /// Digits so far; only its length ever leaves this struct.
-    pin: Pin,
-    /// True while an `ack` is on the wire — a second Enter must not send twice.
+/// The mode switcher (spec §2.4) — two stages under one overlay.
+///
+/// Stage one picks a mode (`pin` is `None`); Enter confirms the pick and opens
+/// stage two, the PIN entry (`pin` is `Some`). Esc cancels the whole attempt at
+/// either stage: nothing is sent, nothing changes (design §3 — a cancel is not
+/// a refusal, there is nothing yet to refuse).
+#[derive(Debug)]
+pub struct ModeSwitch {
+    /// The mode the selector highlights. Only the three pickable ones —
+    /// [`ModeSwitch::new`] never seeds `Unknown`.
+    selected: PolicyMode,
+    /// `Some` once the pick is confirmed — the PIN stage. Only its length
+    /// ever leaves this struct.
+    pin: Option<Pin>,
+    /// True while a `set_mode` is on the wire — a second Enter must not send twice.
     sent: bool,
 }
 
-impl AckPrompt {
-    /// Digits typed so far — the length only, never the digits (invariant 6).
+impl Default for ModeSwitch {
+    /// The overlay as the binary's key-map tests need it — merely present.
+    /// `Supervised` is [`Self::new`]'s own fallback for an unknown mode, so
+    /// the default states nothing `new` would not.
+    fn default() -> Self {
+        Self::new(PolicyMode::Supervised)
+    }
+}
+
+/// The pickable modes, in the order the overlay lists them.
+const PICKABLE_MODES: [PolicyMode; 3] = [
+    PolicyMode::ReadOnly,
+    PolicyMode::Supervised,
+    PolicyMode::Autonomous,
+];
+
+impl ModeSwitch {
+    /// Open on the wallet's current mode, so Enter-Enter-PIN re-affirms what
+    /// stands (the cell that replaces `ack`). A degraded session's `Unknown`
+    /// falls to `Supervised` — the middle of the ladder, and a mode the human
+    /// sees highlighted rather than one silently assumed.
+    fn new(current: PolicyMode) -> Self {
+        Self {
+            selected: if current.wire_word().is_some() {
+                current
+            } else {
+                PolicyMode::Supervised
+            },
+            pin: None,
+            sent: false,
+        }
+    }
+
+    /// The mode the selector highlights.
     #[must_use]
-    pub fn pin_len(&self) -> usize {
-        self.pin.len()
+    pub fn selected(&self) -> PolicyMode {
+        self.selected
+    }
+
+    /// Digits typed so far — `None` while still picking, the length only,
+    /// never the digits (invariant 6).
+    #[must_use]
+    pub fn pin_len(&self) -> Option<usize> {
+        self.pin.as_ref().map(Pin::len)
+    }
+
+    /// Move the selector; ignored once the PIN stage is open — changing the
+    /// target under a typed PIN would let a disclaimer shown for one mode
+    /// authorize another.
+    fn step(&mut self, delta: isize) {
+        if self.pin.is_some() {
+            return;
+        }
+        let at = PICKABLE_MODES
+            .iter()
+            .position(|m| *m == self.selected)
+            .unwrap_or(1);
+        let next = (at as isize + delta).rem_euclid(PICKABLE_MODES.len() as isize);
+        self.selected = PICKABLE_MODES[next as usize];
     }
 }
 
@@ -578,11 +647,15 @@ pub enum Msg {
     MoveDown,
     /// Open the selected item's card — which opens the confirmation.
     Open,
-    /// Open the autonomy-confirmation prompt (design §3, key `c`).
-    AckStart,
-    /// Close it without sending anything. **Not a reject** — there is nothing
-    /// to reject; the wallet's state is untouched and the invitation remains.
-    AckCancel,
+    /// Open the mode switcher (spec §2.4, key `c`).
+    SwitchStart,
+    /// Move the switcher's selector to the previous mode.
+    SwitchPrev,
+    /// Move the switcher's selector to the next mode.
+    SwitchNext,
+    /// Close the switcher without sending anything. **Not a reject** — there
+    /// is nothing to reject; the wallet's state is untouched.
+    SwitchCancel,
     /// Approve the open card (`y`). A high-risk card asks for the PIN first.
     Approve,
     /// Reject the open card — `n`, Esc or Ctrl-C (`AGENTS.md` #5).
@@ -676,7 +749,7 @@ enum PendingIntent {
     Approve(String),
     ApprovePin(Zeroizing<String>),
     Deny(String),
-    Ack(Zeroizing<String>),
+    SetMode(Zeroizing<String>),
 }
 
 impl std::fmt::Debug for PendingIntent {
@@ -686,7 +759,7 @@ impl std::fmt::Debug for PendingIntent {
             Self::Auth => f.write_str("Auth"),
             Self::Approve(id) => write!(f, "Approve({id})"),
             // The line carries the PIN — never its contents.
-            Self::Ack(_) => f.write_str("Ack(<pin>)"),
+            Self::SetMode(_) => f.write_str("SetMode(<pin>)"),
             Self::ApprovePin(_) => f.write_str("ApprovePin(<redacted>)"),
             Self::Deny(id) => write!(f, "Deny({id})"),
         }
@@ -756,30 +829,45 @@ impl Model {
     /// Digits typed into the autonomy-confirmation prompt, or `None` when none
     /// is up. The **length only** — invariant 6: the PIN is never echoed.
     #[must_use]
-    pub fn ack_pin_len(&self) -> Option<usize> {
+    pub fn switch_pin_len(&self) -> Option<usize> {
         match &self.phase {
-            Phase::Watching { ack: Some(a), .. } => Some(a.pin.len()),
+            Phase::Watching {
+                switch: Some(s), ..
+            } => s.pin_len(),
             _ => None,
         }
     }
 
-    /// Apply an `ack` answer (§3.10).
+    /// Apply a `set_mode` answer (§3.13).
     ///
-    /// The prompt closes on every answer, success or not: a prompt left open
-    /// after `locked` invites typing into a channel that cannot accept it.
-    /// Retrying is pressing the key again, which is one keystroke and states
-    /// plainly that the previous attempt is over.
+    /// The overlay closes on every answer, success or not: an overlay left
+    /// open after `locked` invites typing into a channel that cannot accept
+    /// it. Retrying is pressing the key again, which is one keystroke and
+    /// states plainly that the previous attempt is over.
     ///
-    /// On success the local policy takes the origin the core just reported —
+    /// On success the local policy takes the pair the core just reported —
     /// transcribing the core's own answer, not deciding anything here. The
-    /// banner and the header follow from that pair, so both change with it.
-    fn apply_ack(&mut self, outcome: AckOutcome) {
+    /// banner and the header follow from that pair, so both change with it,
+    /// without a restart (spec §2.4).
+    fn apply_set_mode(&mut self, outcome: SetModeOutcome) {
         let note = match outcome {
-            AckOutcome::Confirmed => {
+            SetModeOutcome::Applied { mode, origin } => {
                 if let Some(w) = self.wallet.as_mut() {
-                    w.policy.origin = PolicyOrigin::Acknowledged;
+                    w.policy = Policy { mode, origin };
                 }
-                Notice::Note("autonomous mode confirmed — sends no longer wait".to_owned())
+                Notice::Note(match mode {
+                    PolicyMode::Autonomous => {
+                        "autonomous mode on — sends go out on their own; already-parked items \
+                         still wait for you"
+                            .to_owned()
+                    }
+                    PolicyMode::Supervised => {
+                        "manual mode — every send parks for your decision".to_owned()
+                    }
+                    PolicyMode::ReadOnly => "read-only — every write is refused".to_owned(),
+                    // The switch landed; the word is the core's to explain.
+                    PolicyMode::Unknown => "mode changed".to_owned(),
+                })
             }
             // The arming answer is not "one more try": on this same response
             // the core denied every pending item (protocol §4), and the next
@@ -787,34 +875,45 @@ impl Model {
             // human at a closed channel and say nothing about the queue that
             // was just refused. `apply_resolve` draws the same line on the
             // card path, for the same reason.
-            AckOutcome::BadPin { attempts_left: 0 } => Notice::Locked {
+            SetModeOutcome::BadPin { attempts_left: 0 } => Notice::Locked {
                 retry_after_s: None, // the arming response carries no delay
             },
-            AckOutcome::BadPin { attempts_left } => Notice::Note(format!(
+            SetModeOutcome::BadPin { attempts_left } => Notice::Note(format!(
                 "wrong PIN — {attempts_left} attempts left; press c to try again"
             )),
             // The core drops the pending queue on this lockout exactly as it
             // does for auth and approve (protocol §4), so this is the same
             // notice, not a lookalike.
-            AckOutcome::Locked { retry_after_s } => Notice::Locked {
+            SetModeOutcome::Locked { retry_after_s } => Notice::Locked {
                 retry_after_s: Some(retry_after_s),
             },
-            AckOutcome::PinNotSet => {
+            SetModeOutcome::PinNotSet => {
                 Notice::Note("this wallet has no PIN — run set-pin, then press c".to_owned())
             }
-            AckOutcome::PinUnavailable => {
+            SetModeOutcome::PinUnavailable => {
                 Notice::Note("the PIN check is unavailable — press c to try again".to_owned())
             }
-            AckOutcome::NotAutonomous => {
-                Notice::Note("this wallet is not autonomous — nothing to confirm".to_owned())
-            }
-            AckOutcome::StoreFailed => Notice::Note(
-                "the wallet could not save the confirmation — nothing changed, press c to try again"
+            // This console only offers the three words the core knows, so
+            // seeing this means console and core are not the pair that ships
+            // together — worth saying, not worth machinery (spec §5).
+            SetModeOutcome::UnknownMode => Notice::Note(
+                "the core did not recognise that mode — console and core versions differ"
+                    .to_owned(),
+            ),
+            SetModeOutcome::NewerBuild => Notice::Note(
+                "policy file is from a newer build — nothing changed; roll the image forward"
+                    .to_owned(),
+            ),
+            SetModeOutcome::Unreadable => Notice::Note(
+                "policy file is unreadable — nothing changed; inspect the data volume".to_owned(),
+            ),
+            SetModeOutcome::StoreFailed => Notice::Note(
+                "the wallet could not save the change — nothing changed, press c to try again"
                     .to_owned(),
             ),
         };
-        if let Phase::Watching { ack, notice, .. } = &mut self.phase {
-            *ack = None;
+        if let Phase::Watching { switch, notice, .. } = &mut self.phase {
+            *switch = None;
             *notice = Some(note);
         }
     }
@@ -948,26 +1047,46 @@ impl Model {
                 }
                 None
             }
-            Msg::AckStart => {
+            Msg::SwitchStart => {
                 // Both guards stated rather than assumed, as for `on_view`: a
                 // card owns the screen while it is the decision surface, and
-                // the prompt is drawn on the Dashboard only — a prompt nobody
-                // can see must not own the keyboard.
-                if self.policy().awaits_acknowledgment()
-                    && let Phase::Watching {
-                        ack,
-                        confirm: None,
-                        view: View::Dashboard,
-                        ..
-                    } = &mut self.phase
+                // the switcher is drawn on the Dashboard only — an overlay
+                // nobody can see must not own the keyboard. Unlike the old
+                // `ack` prompt it opens in EVERY policy state: switching is
+                // the point, not only confirming (spec §2.4).
+                let current = self.policy().mode;
+                if let Phase::Watching {
+                    switch,
+                    confirm: None,
+                    view: View::Dashboard,
+                    ..
+                } = &mut self.phase
                 {
-                    *ack = Some(AckPrompt::default());
+                    *switch = Some(ModeSwitch::new(current));
                 }
                 None
             }
-            Msg::AckCancel => {
-                if let Phase::Watching { ack, .. } = &mut self.phase {
-                    *ack = None;
+            Msg::SwitchCancel => {
+                if let Phase::Watching { switch, .. } = &mut self.phase {
+                    *switch = None;
+                }
+                None
+            }
+            Msg::SwitchPrev => {
+                if let Phase::Watching {
+                    switch: Some(s), ..
+                } = &mut self.phase
+                {
+                    s.step(-1);
+                }
+                None
+            }
+            Msg::SwitchNext => {
+                if let Phase::Watching {
+                    switch: Some(s), ..
+                } = &mut self.phase
+                {
+                    s.step(1);
                 }
                 None
             }
@@ -1032,7 +1151,7 @@ impl Model {
         // future caller will send.
         if let Phase::Watching {
             confirm: None,
-            ack: None,
+            switch: None,
             view: current,
             ..
         } = &mut self.phase
@@ -1056,7 +1175,9 @@ impl Model {
             Phase::Watching {
                 confirm: Some(c), ..
             } if c.sent.is_none() => c.pin.as_mut(),
-            Phase::Watching { ack: Some(a), .. } if !a.sent => Some(&mut a.pin),
+            Phase::Watching {
+                switch: Some(s), ..
+            } if !s.sent => s.pin.as_mut(),
             _ => None,
         }
     }
@@ -1078,8 +1199,14 @@ impl Model {
     }
 
     fn on_pin_submit(&mut self) -> Option<transport::Request> {
-        if matches!(self.phase, Phase::Watching { ack: Some(_), .. }) {
-            return self.on_ack_submit();
+        if matches!(
+            self.phase,
+            Phase::Watching {
+                switch: Some(_),
+                ..
+            }
+        ) {
+            return self.on_switch_submit();
         }
         if matches!(
             self.phase,
@@ -1100,19 +1227,34 @@ impl Model {
         self.dispatch_user(PendingIntent::Auth, || transport::Request::Auth(line))
     }
 
-    /// Submit the autonomy confirmation (§3.10): the PIN rides the operation,
-    /// so the session `auth` does not stand in for it.
-    fn on_ack_submit(&mut self) -> Option<transport::Request> {
-        let Phase::Watching { ack: Some(a), .. } = &mut self.phase else {
+    /// Enter inside the switcher (§3.13) — stage-aware, one key, two meanings.
+    ///
+    /// Picking stage: confirm the pick and open the PIN entry — nothing goes
+    /// on the wire yet. PIN stage: submit `set_mode`; the PIN rides the
+    /// operation, so the session `auth` does not stand in for it.
+    fn on_switch_submit(&mut self) -> Option<transport::Request> {
+        let Phase::Watching {
+            switch: Some(s), ..
+        } = &mut self.phase
+        else {
             return None;
         };
-        if a.sent || a.pin.is_empty() {
+        let Some(pin) = &s.pin else {
+            s.pin = Some(Pin::default());
+            return None;
+        };
+        if s.sent || pin.is_empty() {
             return None;
         }
-        a.sent = true;
-        let line = a.pin.ack_line();
+        // `new` never seeds `Unknown` and `step` cannot reach it, so the word
+        // is always there; a `None` would mean the invariant broke, and NOT
+        // sending is the fail-closed reading of that.
+        let line = s.selected.wire_word().map(|word| pin.set_mode_line(word))?;
+        s.sent = true;
         let parked = line.clone();
-        self.dispatch_user(PendingIntent::Ack(parked), || transport::Request::Ack(line))
+        self.dispatch_user(PendingIntent::SetMode(parked), || {
+            transport::Request::SetMode(line)
+        })
     }
 
     /// Submit the per-request PIN of a high-risk approval.
@@ -1316,7 +1458,7 @@ impl Model {
                 }
             }
             Reply::Context(outcome) => self.apply_context(outcome),
-            Reply::Ack(outcome) => self.apply_ack(outcome),
+            Reply::SetMode(outcome) => self.apply_set_mode(outcome),
             Reply::Positions(outcome) => self.apply_positions(outcome),
             Reply::Activity(outcomes) => self.apply_activity(outcomes),
             Reply::List(items) => self.apply_list(items),
@@ -1425,7 +1567,7 @@ impl Model {
                     // Home is the Dashboard (Gate-1 Stage 5: PIN-unlock →
                     // Dashboard, the letter of the Phase-2 plan).
                     view: View::Dashboard,
-                    ack: None,
+                    switch: None,
                 };
             }
             other => {
@@ -1691,10 +1833,16 @@ impl Model {
             // it is — but only while the prompt that produced it is still up.
             // If the human cancelled meanwhile, the confirmation they walked
             // away from must not go out behind them.
-            Some(PendingIntent::Ack(line)) => {
-                if matches!(self.phase, Phase::Watching { ack: Some(_), .. }) {
+            Some(PendingIntent::SetMode(line)) => {
+                if matches!(
+                    self.phase,
+                    Phase::Watching {
+                        switch: Some(_),
+                        ..
+                    }
+                ) {
                     self.in_flight = true;
-                    Some(transport::Request::Ack(line))
+                    Some(transport::Request::SetMode(line))
                 } else {
                     None
                 }
@@ -1760,7 +1908,7 @@ fn decision_kind(outcome: &ResolveOutcome, timed_out: bool) -> Option<DecisionKi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{AckOutcome, GetOutcome, Kind, PolicyMode, PolicyOrigin, Risk};
+    use crate::protocol::{GetOutcome, Kind, PolicyMode, PolicyOrigin, Risk};
 
     fn summary(id: &str) -> Summary {
         Summary {
@@ -1853,50 +2001,116 @@ mod tests {
     #[test]
     fn the_model_refuses_to_navigate_away_from_an_open_confirmation() {
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
-        m.update(Msg::AckStart);
+        m.update(Msg::SwitchStart);
         m.update(Msg::View(View::Queue));
-        let Phase::Watching { view, ack, .. } = m.phase() else {
+        let Phase::Watching { view, switch, .. } = m.phase() else {
             panic!("still watching");
         };
         assert_eq!(*view, View::Dashboard, "the screen did not move");
-        assert!(ack.is_some(), "and the prompt is still up");
+        assert!(switch.is_some(), "and the switcher is still up");
     }
 
-    /// Design §3: the invitation exists only where there is something to
-    /// confirm, so the key that answers it does too.
+    /// Spec §2.4 — the switch replaces the old confirm-only prompt, so it
+    /// opens in EVERY policy state (switching is the point, not only
+    /// confirming) and pre-selects the wallet's current mode, so Enter-PIN
+    /// re-affirms what stands (the cell that replaces `ack`).
     #[test]
-    fn the_confirmation_prompt_opens_only_where_there_is_something_to_confirm() {
-        for (mode, origin, expected) in [
-            (PolicyMode::Autonomous, PolicyOrigin::Provisioned, true),
-            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged, false),
-            (PolicyMode::Supervised, PolicyOrigin::Provisioned, false),
-            (PolicyMode::ReadOnly, PolicyOrigin::Provisioned, false),
+    fn the_switcher_opens_in_every_state_preselecting_the_current_mode() {
+        for (mode, origin) in [
+            (PolicyMode::Autonomous, PolicyOrigin::Provisioned),
+            (PolicyMode::Autonomous, PolicyOrigin::Acknowledged),
+            (PolicyMode::Supervised, PolicyOrigin::Acknowledged),
+            (PolicyMode::ReadOnly, PolicyOrigin::Acknowledged),
         ] {
             let mut m = watching_with_policy(mode, origin);
-            m.update(Msg::AckStart);
-            assert_eq!(
-                m.ack_pin_len().is_some(),
-                expected,
-                "{mode:?}/{origin:?}: prompt open? expected {expected}"
-            );
+            m.update(Msg::SwitchStart);
+            let Phase::Watching {
+                switch: Some(s), ..
+            } = m.phase()
+            else {
+                panic!("{mode:?}/{origin:?}: the switcher must open");
+            };
+            assert_eq!(s.selected(), mode, "{mode:?}: pre-selected");
+            assert_eq!(s.pin_len(), None, "opens in the picking stage");
         }
+    }
+
+    /// A degraded session's `Unknown` never becomes a request: the selector
+    /// falls to `supervised`, visibly, rather than putting a guess on the wire.
+    #[test]
+    fn an_unknown_mode_preselects_supervised() {
+        let mut m = watching(vec![]);
+        m.update(Msg::View(View::Dashboard)); // no context reply: the mode stays Unknown
+        m.update(Msg::SwitchStart);
+        let Phase::Watching {
+            switch: Some(s), ..
+        } = m.phase()
+        else {
+            panic!("the switcher must open");
+        };
+        assert_eq!(s.selected(), PolicyMode::Supervised);
+    }
+
+    /// The selector cycles through exactly the three pickable modes — and
+    /// freezes once the PIN stage is open: a disclaimer shown for one mode
+    /// must not authorize another.
+    #[test]
+    fn the_selector_cycles_and_freezes_under_the_pin() {
+        let mut m = watching_with_policy(PolicyMode::Supervised, PolicyOrigin::Acknowledged);
+        m.update(Msg::SwitchStart);
+        m.update(Msg::SwitchNext);
+        let selected_of = |m: &Model| {
+            let Phase::Watching {
+                switch: Some(s), ..
+            } = m.phase()
+            else {
+                panic!("switcher up");
+            };
+            s.selected()
+        };
+        assert_eq!(selected_of(&m), PolicyMode::Autonomous);
+        m.update(Msg::SwitchNext);
+        assert_eq!(selected_of(&m), PolicyMode::ReadOnly, "wraps around");
+        m.update(Msg::SwitchPrev);
+        assert_eq!(selected_of(&m), PolicyMode::Autonomous);
+
+        m.update(Msg::PinSubmit); // confirm the pick — PIN stage opens
+        assert_eq!(m.switch_pin_len(), Some(0));
+        m.update(Msg::SwitchNext);
+        assert_eq!(
+            selected_of(&m),
+            PolicyMode::Autonomous,
+            "frozen under the PIN"
+        );
     }
 
     /// The PIN rides the operation (§3.10), so submitting sends `ack` — and the
     /// buffer reports only its length, never its digits (invariant 6).
     #[test]
-    fn the_confirmation_pin_is_counted_not_shown_and_submits_an_ack() {
+    fn the_pin_is_counted_not_shown_and_submits_a_set_mode() {
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
-        m.update(Msg::AckStart);
-        assert_eq!(m.ack_pin_len(), Some(0));
+        m.update(Msg::SwitchStart);
+        assert_eq!(m.switch_pin_len(), None, "picking stage: no PIN yet");
+        m.update(Msg::PinDigit('9'));
+        assert_eq!(
+            m.switch_pin_len(),
+            None,
+            "digits before the stage are dropped"
+        );
+        m.update(Msg::PinSubmit); // confirm the pick
+        assert_eq!(m.switch_pin_len(), Some(0));
         for c in "483920".chars() {
             m.update(Msg::PinDigit(c));
         }
-        assert_eq!(m.ack_pin_len(), Some(6), "length only, never the digits");
+        assert_eq!(m.switch_pin_len(), Some(6), "length only, never the digits");
         let req = m.update(Msg::PinSubmit);
-        assert!(
-            matches!(req, Some(transport::Request::Ack(_))),
-            "submitting the confirmation sends `ack`"
+        let Some(transport::Request::SetMode(line)) = req else {
+            panic!("submitting sends `set_mode`");
+        };
+        assert_eq!(
+            line.as_str(),
+            r#"{"op":"set_mode","mode":"autonomous","pin":"483920"}"#,
+            "the wire line carries the picked mode and the PIN, nothing else"
         );
     }
 
@@ -1904,15 +2118,36 @@ mod tests {
     /// reject — there is nothing to reject. Nothing goes on the wire and the
     /// wallet's state is untouched, so the invitation is still there after.
     #[test]
-    fn cancelling_the_confirmation_sends_nothing_and_changes_nothing() {
+    fn cancelling_the_switcher_sends_nothing_and_changes_nothing() {
+        // Esc in the picking stage.
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
-        m.update(Msg::AckStart);
+        m.update(Msg::SwitchStart);
+        let req = m.update(Msg::SwitchCancel);
+        assert!(
+            req.is_none(),
+            "cancelling the pick puts nothing on the wire"
+        );
+        assert!(
+            !matches!(
+                m.phase(),
+                Phase::Watching {
+                    switch: Some(_),
+                    ..
+                }
+            ),
+            "the overlay is closed"
+        );
+
+        // Esc in the PIN stage, digits already typed.
+        let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit); // confirm the pick
         for c in "4839".chars() {
             m.update(Msg::PinDigit(c));
         }
-        let req = m.update(Msg::AckCancel);
+        let req = m.update(Msg::SwitchCancel);
         assert!(req.is_none(), "cancelling puts nothing on the wire");
-        assert_eq!(m.ack_pin_len(), None, "the prompt is closed");
+        assert_eq!(m.switch_pin_len(), None, "the overlay is closed");
         assert!(
             m.policy().awaits_acknowledgment(),
             "and the wallet still waits for the same confirmation"
@@ -1921,17 +2156,29 @@ mod tests {
 
     /// The whole point: after the core confirms, the wallet stops waiting.
     #[test]
-    fn a_confirmed_mode_stops_asking() {
+    fn an_applied_mode_updates_the_header_pair_without_a_restart() {
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
-        m.update(Msg::AckStart);
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit); // confirm the pick (autonomous, pre-selected)
         m.update(Msg::PinDigit('1'));
         let _ = m.update(Msg::PinSubmit);
-        m.update(Msg::Reply(Reply::Ack(AckOutcome::Confirmed)));
-        assert_eq!(m.ack_pin_len(), None, "the prompt is done");
+        m.update(Msg::Reply(Reply::SetMode(SetModeOutcome::Applied {
+            mode: PolicyMode::Autonomous,
+            origin: PolicyOrigin::Acknowledged,
+        })));
+        assert_eq!(m.switch_pin_len(), None, "the overlay is done");
         assert!(
             !m.policy().awaits_acknowledgment(),
             "nothing left to confirm"
         );
+        assert_eq!(m.policy().origin, PolicyOrigin::Acknowledged);
+
+        // A downgrade lands the same way: BOTH halves come from the answer.
+        m.update(Msg::Reply(Reply::SetMode(SetModeOutcome::Applied {
+            mode: PolicyMode::ReadOnly,
+            origin: PolicyOrigin::Acknowledged,
+        })));
+        assert_eq!(m.policy().mode, PolicyMode::ReadOnly);
         assert_eq!(m.policy().origin, PolicyOrigin::Acknowledged);
     }
 
@@ -1943,10 +2190,14 @@ mod tests {
     fn confirming_does_not_release_the_queue() {
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
         m.update(Msg::Reply(Reply::List(vec![summary("a1"), summary("a2")])));
-        m.update(Msg::AckStart);
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit); // confirm the pick
         m.update(Msg::PinDigit('1'));
         let _ = m.update(Msg::PinSubmit);
-        let after = m.update(Msg::Reply(Reply::Ack(AckOutcome::Confirmed)));
+        let after = m.update(Msg::Reply(Reply::SetMode(SetModeOutcome::Applied {
+            mode: PolicyMode::Autonomous,
+            origin: PolicyOrigin::Acknowledged,
+        })));
         assert!(
             !matches!(after, Some(transport::Request::Approve(_)))
                 && !matches!(after, Some(transport::Request::ApprovePin(_))),
@@ -1982,21 +2233,31 @@ mod tests {
             },
         )))));
         m.update(Msg::Open);
-        m.update(Msg::AckStart);
-        assert_eq!(
-            m.ack_pin_len(),
-            None,
-            "a confirmation must not open over an open card"
+        m.update(Msg::SwitchStart);
+        assert!(
+            !matches!(
+                m.phase(),
+                Phase::Watching {
+                    switch: Some(_),
+                    ..
+                }
+            ),
+            "the switcher must not open over an open card"
         );
 
         // No card, but a screen that does not draw the prompt.
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
         m.update(Msg::View(View::Receive));
-        m.update(Msg::AckStart);
-        assert_eq!(
-            m.ack_pin_len(),
-            None,
-            "a prompt nobody can see must not own the keyboard"
+        m.update(Msg::SwitchStart);
+        assert!(
+            !matches!(
+                m.phase(),
+                Phase::Watching {
+                    switch: Some(_),
+                    ..
+                }
+            ),
+            "an overlay nobody can see must not own the keyboard"
         );
     }
 
@@ -2018,7 +2279,8 @@ mod tests {
             "a request must be in flight for this test to mean anything"
         );
 
-        m.update(Msg::AckStart);
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit); // confirm the pick
         m.update(Msg::PinDigit('1'));
         let parked = m.update(Msg::PinSubmit);
         assert!(
@@ -2026,11 +2288,11 @@ mod tests {
             "the confirmation parks behind the busy channel"
         );
 
-        m.update(Msg::AckCancel);
+        m.update(Msg::SwitchCancel);
         // The answer to the ORIGINAL request arrives and flushes what was parked.
         let flushed = m.update(Msg::Reply(Reply::Positions(PositionsOutcome::Ok(vec![]))));
         assert!(
-            !matches!(flushed, Some(transport::Request::Ack(_))),
+            !matches!(flushed, Some(transport::Request::SetMode(_))),
             "a confirmation the human walked away from must not be sent behind them"
         );
         assert!(
@@ -2052,19 +2314,20 @@ mod tests {
     #[test]
     fn the_arming_wrong_pin_reports_the_lockout_not_another_try() {
         let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
-        m.update(Msg::AckStart);
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit); // confirm the pick
         m.update(Msg::PinDigit('1'));
         let _ = m.update(Msg::PinSubmit);
-        m.update(Msg::Reply(Reply::Ack(AckOutcome::BadPin {
+        m.update(Msg::Reply(Reply::SetMode(SetModeOutcome::BadPin {
             attempts_left: 0,
         })));
 
-        let Phase::Watching { notice, ack, .. } = m.phase() else {
+        let Phase::Watching { notice, switch, .. } = m.phase() else {
             panic!("still watching");
         };
         assert!(
-            ack.is_none(),
-            "the prompt closes — the channel will not take a PIN"
+            switch.is_none(),
+            "the overlay closes — the channel will not take a PIN"
         );
         match notice {
             Some(Notice::Locked { retry_after_s }) => assert_eq!(
@@ -2082,39 +2345,47 @@ mod tests {
     /// alone is blind to a wrong reply, and that blindness is exactly what let
     /// the lockout case go unnoticed.
     #[test]
-    fn each_confirmation_failure_is_reported() {
+    fn each_switch_failure_is_reported() {
         for outcome in [
-            AckOutcome::BadPin { attempts_left: 2 },
-            AckOutcome::Locked { retry_after_s: 30 },
-            AckOutcome::PinNotSet,
-            AckOutcome::PinUnavailable,
-            AckOutcome::NotAutonomous,
-            AckOutcome::StoreFailed,
+            SetModeOutcome::BadPin { attempts_left: 2 },
+            SetModeOutcome::Locked { retry_after_s: 30 },
+            SetModeOutcome::PinNotSet,
+            SetModeOutcome::PinUnavailable,
+            SetModeOutcome::UnknownMode,
+            SetModeOutcome::NewerBuild,
+            SetModeOutcome::Unreadable,
+            SetModeOutcome::StoreFailed,
         ] {
             let mut m = watching_with_policy(PolicyMode::Autonomous, PolicyOrigin::Provisioned);
-            m.update(Msg::AckStart);
+            m.update(Msg::SwitchStart);
+            m.update(Msg::PinSubmit); // confirm the pick
             m.update(Msg::PinDigit('1'));
             let _ = m.update(Msg::PinSubmit);
-            m.update(Msg::Reply(Reply::Ack(outcome)));
+            m.update(Msg::Reply(Reply::SetMode(outcome)));
             assert!(
                 m.policy().awaits_acknowledgment(),
-                "{outcome:?}: a failure never confirms"
+                "{outcome:?}: a failure never changes the mode"
             );
             let Phase::Watching { notice, .. } = m.phase() else {
                 panic!("still watching");
             };
             let notice = notice.as_ref().expect("the human is told");
             match (outcome, notice) {
-                (AckOutcome::Locked { retry_after_s }, Notice::Locked { retry_after_s: got }) => {
+                (
+                    SetModeOutcome::Locked { retry_after_s },
+                    Notice::Locked { retry_after_s: got },
+                ) => {
                     assert_eq!(*got, Some(retry_after_s), "the wait is carried through");
                 }
                 (outcome, Notice::Note(text)) => {
                     let expected = match outcome {
-                        AckOutcome::BadPin { .. } => "wrong PIN",
-                        AckOutcome::PinNotSet => "no PIN",
-                        AckOutcome::PinUnavailable => "unavailable",
-                        AckOutcome::NotAutonomous => "not autonomous",
-                        AckOutcome::StoreFailed => "could not save",
+                        SetModeOutcome::BadPin { .. } => "wrong PIN",
+                        SetModeOutcome::PinNotSet => "no PIN",
+                        SetModeOutcome::PinUnavailable => "unavailable",
+                        SetModeOutcome::UnknownMode => "did not recognise",
+                        SetModeOutcome::NewerBuild => "newer build",
+                        SetModeOutcome::Unreadable => "unreadable",
+                        SetModeOutcome::StoreFailed => "could not save",
                         other => panic!("{other:?} must not land in a plain note"),
                     };
                     assert!(

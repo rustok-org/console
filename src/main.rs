@@ -599,15 +599,20 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             KeyCode::Esc => Some(Msg::Quit),
             _ => None,
         },
-        // The confirmation prompt owns the keyboard while it is up — it is a
-        // PIN entry, so a stray `d` must not navigate away mid-typing. Esc
-        // cancels the attempt; it is NOT a reject, because there is nothing to
-        // reject (design §3).
-        Phase::Watching { ack: Some(_), .. } => match key.code {
+        // The switcher owns the keyboard while it is up — its second stage is
+        // a PIN entry, so a stray `d` must not navigate away mid-typing. Esc
+        // cancels the attempt at either stage; it is NOT a reject, because
+        // there is nothing to reject (design §3, spec §2.4). Up/Down move the
+        // selector; the model ignores them once the PIN stage is open.
+        Phase::Watching {
+            switch: Some(_), ..
+        } => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(Msg::SwitchPrev),
+            KeyCode::Down | KeyCode::Char('j') => Some(Msg::SwitchNext),
             KeyCode::Char(c) if c.is_ascii_digit() => Some(Msg::PinDigit(c)),
             KeyCode::Backspace => Some(Msg::PinBackspace),
             KeyCode::Enter => Some(Msg::PinSubmit),
-            KeyCode::Esc => Some(Msg::AckCancel),
+            KeyCode::Esc => Some(Msg::SwitchCancel),
             _ => None,
         },
         // The queue: no decision is pending, so quitting is free.
@@ -647,7 +652,7 @@ fn map_key(key: &KeyEvent, phase: &Phase) -> Option<Msg> {
             view: View::Dashboard,
             ..
         } => match key.code {
-            KeyCode::Char('c') => Some(Msg::AckStart),
+            KeyCode::Char('c') => Some(Msg::SwitchStart),
             KeyCode::Char('a') | KeyCode::Esc => Some(Msg::View(View::Queue)),
             KeyCode::Char('r') => Some(Msg::View(View::Receive)),
             KeyCode::Char('h') => Some(Msg::View(View::Activity)),
@@ -718,18 +723,18 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Queue,
-            ack: None,
+            switch: None,
         }
     }
 
-    fn dashboard_with_prompt() -> Phase {
+    fn dashboard_with_switcher() -> Phase {
         Phase::Watching {
             items: vec![],
             selected: 0,
             confirm: None,
             notice: None,
             view: View::Dashboard,
-            ack: Some(rustok_console::app::AckPrompt::default()),
+            switch: Some(rustok_console::app::ModeSwitch::default()),
         }
     }
 
@@ -740,23 +745,32 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Dashboard,
-            ack: None,
+            switch: None,
         }
     }
 
-    /// The key map is what this file is for, and the confirmation's keys were
-    /// the one branch in it with no test at all.
+    /// The key map is what this file is for, and the switcher's keys are the
+    /// branch that owns the keyboard while any overlay stage is up.
     #[test]
-    fn c_starts_the_confirmation_and_the_prompt_then_owns_the_keyboard() {
+    fn c_opens_the_switcher_and_the_overlay_then_owns_the_keyboard() {
         assert!(matches!(
             map_key(&key(KeyCode::Char('c')), &dashboard()),
-            Some(Msg::AckStart)
+            Some(Msg::SwitchStart)
         ));
 
         // While it is up, the screen keys are gone: a stray `d` must not walk
         // away mid-PIN, and Esc cancels the attempt rather than rejecting
-        // anything — there is nothing here to reject.
-        let up = dashboard_with_prompt();
+        // anything — there is nothing here to reject. Up/Down move the
+        // selector (the model freezes them once the PIN stage opens).
+        let up = dashboard_with_switcher();
+        assert!(matches!(
+            map_key(&key(KeyCode::Up), &up),
+            Some(Msg::SwitchPrev)
+        ));
+        assert!(matches!(
+            map_key(&key(KeyCode::Down), &up),
+            Some(Msg::SwitchNext)
+        ));
         assert!(matches!(
             map_key(&key(KeyCode::Char('1')), &up),
             Some(Msg::PinDigit('1'))
@@ -767,12 +781,12 @@ mod tests {
         ));
         assert!(matches!(
             map_key(&key(KeyCode::Esc), &up),
-            Some(Msg::AckCancel)
+            Some(Msg::SwitchCancel)
         ));
         for dead in ['d', 'a', 'r', 'h', 'q'] {
             assert!(
                 map_key(&key(KeyCode::Char(dead)), &up).is_none(),
-                "`{dead}` must be dead while the PIN prompt is up"
+                "`{dead}` must be dead while the switcher is up"
             );
         }
     }
@@ -784,7 +798,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Receive,
-            ack: None,
+            switch: None,
         }
     }
 
@@ -1167,7 +1181,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Dashboard,
-            ack: None,
+            switch: None,
         }
     }
 
@@ -1231,7 +1245,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Activity,
-            ack: None,
+            switch: None,
         }
     }
 

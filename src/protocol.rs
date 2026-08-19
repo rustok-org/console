@@ -30,7 +30,11 @@ use serde::{Deserialize, Serialize};
 /// console image tag and lays it beside `core-server`, so the two versions are
 /// locked together by the image build. A reconnect-and-degrade branch would be
 /// machinery for a case the deployment does not produce.
-pub const PROTO_VERSION: u32 = 3;
+///
+/// 4 carries `set_mode` (§3.13) — the human switches the wallet's mode from
+/// the Dashboard, downgrades included; `ack` stays in the protocol for older
+/// consoles, this one no longer sends it.
+pub const PROTO_VERSION: u32 = 4;
 
 // ─────────────────────────── Requests (client → server) ───────────────────────────
 
@@ -398,6 +402,21 @@ impl Policy {
     }
 }
 
+impl PolicyMode {
+    /// The wire word `set_mode` sends (§3.13). `Unknown` has none — it is a
+    /// reading of a degraded session, not a mode a human can ask for, and a
+    /// `None` here is what keeps the switcher from ever putting it on the wire.
+    #[must_use]
+    pub fn wire_word(self) -> Option<&'static str> {
+        match self {
+            Self::ReadOnly => Some("read_only"),
+            Self::Supervised => Some("supervised"),
+            Self::Autonomous => Some("autonomous"),
+            Self::Unknown => None,
+        }
+    }
+}
+
 /// Outcome of `context`. Both non-`Ok` variants degrade the UI (the card falls
 /// back to its To-only layout) — they never gate approve: the From block is
 /// display-only, the signing-critical surface (`to`/amount/decode) does not
@@ -681,6 +700,107 @@ pub fn parse_ack(line: &str) -> Result<AckOutcome, ProtocolError> {
         Some("policy_store_failed") => Ok(AckOutcome::StoreFailed),
         other => Err(ProtocolError::Unexpected(
             other.unwrap_or("ack without ok or error").to_owned(),
+        )),
+    }
+}
+
+/// Outcome of `set_mode` (§3.13) — the human switches the wallet's mode.
+///
+/// A separate type from [`AckOutcome`] for the same reason that one is
+/// separate from [`AuthOutcome`]: this op answers refusals none of the others
+/// can (`unknown_mode`, `policy_newer_than_build`, `policy_unreadable`), and a
+/// shared type would let a handler accept an outcome that only makes sense
+/// elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetModeOutcome {
+    /// The wallet now stands where the human asked — mode and origin as the
+    /// core recorded them, so the header can change without a restart.
+    Applied {
+        /// The mode the core confirmed.
+        mode: PolicyMode,
+        /// Always [`PolicyOrigin::Acknowledged`] on today's core; parsed
+        /// rather than assumed so the header shows what was said, not what
+        /// was expected.
+        origin: PolicyOrigin,
+    },
+    /// Wrong PIN; `attempts_left == 0` means the lockout is now armed.
+    BadPin {
+        /// Attempts before the lockout trips.
+        attempts_left: u32,
+    },
+    /// Lockout active; retry after this many seconds.
+    Locked {
+        /// Seconds until the channel accepts a PIN again.
+        retry_after_s: u64,
+    },
+    /// The wallet has no PIN record.
+    PinNotSet,
+    /// Transient Argon2 backend failure — never an accept.
+    PinUnavailable,
+    /// The core did not recognise the mode name. This console only sends the
+    /// three it renders, so seeing this means the pair is not the pair.
+    UnknownMode,
+    /// `policy.json` was written by a newer build; the core refused to touch
+    /// it. Rolling the image forward (or removing the file) is the way out.
+    NewerBuild,
+    /// `policy.json` cannot be read at all (not merely absent); the core
+    /// refused to overwrite what it cannot see.
+    Unreadable,
+    /// The core could not persist the change and left everything as it was.
+    StoreFailed,
+}
+
+/// Parse a `set_mode` reply (§3.13).
+///
+/// # Errors
+/// [`ProtocolError::Unexpected`] for anything the canon does not list —
+/// including `unauthorized` and `protocol_error`, which mean the channel is
+/// not what we negotiated. This op moves the wallet between modes, so an
+/// answer we do not understand is never read as applied.
+pub fn parse_set_mode(line: &str) -> Result<SetModeOutcome, ProtocolError> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ok: bool,
+        mode: Option<String>,
+        origin: Option<String>,
+        error: Option<String>,
+        attempts_left: Option<u32>,
+        retry_after_s: Option<u64>,
+    }
+    let raw: Raw = parse_line(line)?;
+    if raw.ok {
+        // The same word-maps the context parser uses (§3.7): an ok answer with
+        // a word this build does not know falls to the safe reading rather
+        // than an error — the switch DID land, and refusing to show it would
+        // desynchronise the header from the wallet.
+        return Ok(SetModeOutcome::Applied {
+            mode: match raw.mode.as_deref() {
+                Some("read_only") => PolicyMode::ReadOnly,
+                Some("supervised") => PolicyMode::Supervised,
+                Some("autonomous") => PolicyMode::Autonomous,
+                _ => PolicyMode::Unknown,
+            },
+            origin: match raw.origin.as_deref() {
+                Some("acknowledged") => PolicyOrigin::Acknowledged,
+                _ => PolicyOrigin::Provisioned,
+            },
+        });
+    }
+    match raw.error.as_deref() {
+        Some("bad_pin") => Ok(SetModeOutcome::BadPin {
+            attempts_left: raw.attempts_left.unwrap_or(0),
+        }),
+        Some("locked") => Ok(SetModeOutcome::Locked {
+            retry_after_s: raw.retry_after_s.unwrap_or(0),
+        }),
+        Some("pin_not_set") => Ok(SetModeOutcome::PinNotSet),
+        Some("pin_unavailable") => Ok(SetModeOutcome::PinUnavailable),
+        Some("unknown_mode") => Ok(SetModeOutcome::UnknownMode),
+        Some("policy_newer_than_build") => Ok(SetModeOutcome::NewerBuild),
+        Some("policy_unreadable") => Ok(SetModeOutcome::Unreadable),
+        Some("policy_store_failed") => Ok(SetModeOutcome::StoreFailed),
+        other => Err(ProtocolError::Unexpected(
+            other.unwrap_or("set_mode without ok or error").to_owned(),
         )),
     }
 }
@@ -996,7 +1116,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            r#"{"op":"hello","proto":3,"client":"rustok-console/0.0.1"}"#
+            r#"{"op":"hello","proto":4,"client":"rustok-console/0.0.1"}"#
         );
     }
 
@@ -1223,15 +1343,128 @@ mod tests {
         }
     }
 
-    /// §3.10 — the PIN rides on the operation itself, and the line is built in
-    /// a zeroizing buffer like `auth`, never through the general Serialize path.
+    /// Proto 4 is what carries `set_mode`; a silent drift of this constant
+    /// would strand the switcher behind a `protocol_error`. Same shape as the
+    /// core's own version pins.
     #[test]
-    fn the_ack_line_carries_the_pin_and_nothing_else() {
+    fn the_protocol_version_is_pinned() {
+        assert_eq!(PROTO_VERSION, 4);
+    }
+
+    #[test]
+    fn set_mode_replies_parse_to_their_outcomes() {
+        for (line, expected) in [
+            (
+                r#"{"ok":true,"mode":"autonomous","origin":"acknowledged"}"#,
+                SetModeOutcome::Applied {
+                    mode: PolicyMode::Autonomous,
+                    origin: PolicyOrigin::Acknowledged,
+                },
+            ),
+            (
+                r#"{"ok":true,"mode":"read_only","origin":"acknowledged"}"#,
+                SetModeOutcome::Applied {
+                    mode: PolicyMode::ReadOnly,
+                    origin: PolicyOrigin::Acknowledged,
+                },
+            ),
+            (
+                r#"{"ok":true,"mode":"supervised","origin":"acknowledged"}"#,
+                SetModeOutcome::Applied {
+                    mode: PolicyMode::Supervised,
+                    origin: PolicyOrigin::Acknowledged,
+                },
+            ),
+            (
+                r#"{"ok":false,"error":"bad_pin","attempts_left":2}"#,
+                SetModeOutcome::BadPin { attempts_left: 2 },
+            ),
+            (
+                r#"{"ok":false,"error":"locked","retry_after_s":300}"#,
+                SetModeOutcome::Locked { retry_after_s: 300 },
+            ),
+            (
+                r#"{"ok":false,"error":"pin_not_set"}"#,
+                SetModeOutcome::PinNotSet,
+            ),
+            (
+                r#"{"ok":false,"error":"pin_unavailable"}"#,
+                SetModeOutcome::PinUnavailable,
+            ),
+            (
+                r#"{"ok":false,"error":"unknown_mode"}"#,
+                SetModeOutcome::UnknownMode,
+            ),
+            (
+                r#"{"ok":false,"error":"policy_newer_than_build"}"#,
+                SetModeOutcome::NewerBuild,
+            ),
+            (
+                r#"{"ok":false,"error":"policy_unreadable"}"#,
+                SetModeOutcome::Unreadable,
+            ),
+            (
+                r#"{"ok":false,"error":"policy_store_failed"}"#,
+                SetModeOutcome::StoreFailed,
+            ),
+        ] {
+            assert_eq!(parse_set_mode(line).unwrap(), expected, "line: {line}");
+        }
+    }
+
+    /// The same fail-closed rule as `ack`: this op moves the wallet between
+    /// modes, so an answer outside the canon never reads as applied.
+    #[test]
+    fn an_unknown_set_mode_answer_is_never_applied() {
+        for line in [
+            r#"{"ok":false,"error":"unauthorized"}"#,
+            r#"{"ok":false,"error":"protocol_error"}"#,
+            r#"{"ok":false}"#,
+        ] {
+            assert!(
+                parse_set_mode(line).is_err(),
+                "must not resolve to an outcome: {line}"
+            );
+        }
+    }
+
+    /// The wire words are the three the human can pick; `Unknown` deliberately
+    /// has none — a degraded reading must never become a request.
+    #[test]
+    fn wire_words_cover_exactly_the_pickable_modes() {
+        assert_eq!(PolicyMode::ReadOnly.wire_word(), Some("read_only"));
+        assert_eq!(PolicyMode::Supervised.wire_word(), Some("supervised"));
+        assert_eq!(PolicyMode::Autonomous.wire_word(), Some("autonomous"));
+        assert_eq!(PolicyMode::Unknown.wire_word(), None);
+    }
+
+    /// §3.13 — the PIN rides on the operation itself, and the line is built in
+    /// a zeroizing buffer like `auth`, never through the general Serialize
+    /// path. One case per pickable mode: the word slot is the only thing that
+    /// varies, and each is a static string this test pins verbatim.
+    #[test]
+    fn the_set_mode_line_carries_the_mode_and_the_pin_and_nothing_else() {
         let mut pin = crate::app::Pin::default();
         for c in "483920".chars() {
             pin.push(c);
         }
-        assert_eq!(&*pin.ack_line(), r#"{"op":"ack","pin":"483920"}"#);
+        for (mode, expected) in [
+            (
+                PolicyMode::ReadOnly,
+                r#"{"op":"set_mode","mode":"read_only","pin":"483920"}"#,
+            ),
+            (
+                PolicyMode::Supervised,
+                r#"{"op":"set_mode","mode":"supervised","pin":"483920"}"#,
+            ),
+            (
+                PolicyMode::Autonomous,
+                r#"{"op":"set_mode","mode":"autonomous","pin":"483920"}"#,
+            ),
+        ] {
+            let word = mode.wire_word().expect("pickable modes have wire words");
+            assert_eq!(&*pin.set_mode_line(word), expected);
+        }
     }
 
     /// §3.7: the mode and its origin are ONE statement. A wallet reported as

@@ -24,10 +24,10 @@ use std::thread::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    self, AckOutcome, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, OutcomeEntry,
-    PROTO_VERSION, PositionsOutcome, ResolveOutcome, Summary, encode_request, parse_ack,
-    parse_activity, parse_approve, parse_auth, parse_context, parse_deny, parse_get, parse_hello,
-    parse_list, parse_positions,
+    self, AuthOutcome, ContextOutcome, GetOutcome, HelloOutcome, OutcomeEntry, PROTO_VERSION,
+    PositionsOutcome, ResolveOutcome, SetModeOutcome, Summary, encode_request, parse_activity,
+    parse_approve, parse_auth, parse_context, parse_deny, parse_get, parse_hello, parse_list,
+    parse_positions, parse_set_mode,
 };
 
 /// Informational client id sent in `hello` (the server does not validate it).
@@ -53,9 +53,9 @@ pub enum Request {
     ApprovePin(Zeroizing<String>),
     /// Deny an item by id.
     Deny(String),
-    /// Confirm this wallet's autonomous mode: a pre-serialized `ack` line with
-    /// the PIN inside a [`Zeroizing`] buffer (protocol §3.10).
-    Ack(Zeroizing<String>),
+    /// Switch this wallet's mode: a pre-serialized `set_mode` line with the
+    /// PIN inside a [`Zeroizing`] buffer (protocol §3.13, proto 4).
+    SetMode(Zeroizing<String>),
     /// Ask for the wallet's own context (proto 2+, auth-gated).
     Context,
     /// Ask for the wallet's own DeFi positions (proto 2+, auth-gated).
@@ -74,8 +74,8 @@ pub enum Reply {
     },
     /// Result of an `auth`.
     Auth(AuthOutcome),
-    /// Result of an `ack` (proto 3+, §3.10).
-    Ack(AckOutcome),
+    /// Result of a `set_mode` (proto 4+, §3.13).
+    SetMode(SetModeOutcome),
     /// Result of a `list`.
     List(Vec<Summary>),
     /// Result of a `get`.
@@ -274,7 +274,7 @@ fn serve_one(
     req: &Request,
 ) -> Result<Reply, TransportError> {
     let resp = match req {
-        Request::Auth(line) | Request::Ack(line) => exchange(writer, reader, line)?,
+        Request::Auth(line) | Request::SetMode(line) => exchange(writer, reader, line)?,
         Request::List => {
             let line = encode_request(&protocol::Request::List)
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
@@ -314,7 +314,7 @@ fn serve_one(
     };
     let parsed = match req {
         Request::Auth(_) => parse_auth(&resp).map(Reply::Auth),
-        Request::Ack(_) => parse_ack(&resp).map(Reply::Ack),
+        Request::SetMode(_) => parse_set_mode(&resp).map(Reply::SetMode),
         Request::List => parse_list(&resp).map(Reply::List),
         Request::Get(_) => parse_get(&resp).map(Reply::Get),
         Request::Approve(_) | Request::ApprovePin(_) => parse_approve(&resp).map(Reply::Resolve),
@@ -565,13 +565,14 @@ mod tests {
         assert_eq!(ctx.allowed_chains, vec![1]);
     }
 
-    /// Every other op has a round-trip through the real socket; `ack` did not.
-    /// The parser is unit-tested, but nothing proved the request reaches the
-    /// wire as an `ack` and the answer comes back as `Reply::Ack`.
+    /// Every other op has a round-trip through the real socket; the mode
+    /// switch must too: the parser is unit-tested, but nothing else proves the
+    /// request reaches the wire as a `set_mode` and the answer comes back as
+    /// `Reply::SetMode`.
     #[test]
-    fn ack_round_trips_through_the_socket() {
+    fn set_mode_round_trips_through_the_socket() {
         let server = FakeServer::start(
-            "ack_rt",
+            "set_mode_rt",
             vec![
                 Some(HELLO_OK),
                 Some(r#"{"ok":true,"mode":"autonomous","origin":"acknowledged"}"#),
@@ -579,11 +580,19 @@ mod tests {
         );
         let t = Transport::connect(&server.path);
         assert!(matches!(t.recv(), Some(Reply::Hello { .. })));
-        let line = zeroize::Zeroizing::new(r#"{"op":"ack","pin":"483920"}"#.to_owned());
-        assert!(t.send(Request::Ack(line)));
+        let line = zeroize::Zeroizing::new(
+            r#"{"op":"set_mode","mode":"autonomous","pin":"483920"}"#.to_owned(),
+        );
+        assert!(t.send(Request::SetMode(line)));
         assert!(
-            matches!(t.recv(), Some(Reply::Ack(AckOutcome::Confirmed))),
-            "an ack reply must come back as Reply::Ack"
+            matches!(
+                t.recv(),
+                Some(Reply::SetMode(SetModeOutcome::Applied {
+                    mode: crate::protocol::PolicyMode::Autonomous,
+                    origin: crate::protocol::PolicyOrigin::Acknowledged,
+                }))
+            ),
+            "a set_mode reply must come back as Reply::SetMode"
         );
     }
 
