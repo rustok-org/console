@@ -734,9 +734,7 @@ mod tests {
             confirm: None,
             notice: None,
             view: View::Dashboard,
-            switch: Some(rustok_console::app::ModeSwitch::new(
-                rustok_console::protocol::PolicyMode::Supervised,
-            )),
+            switch: Some(rustok_console::app::ModeSwitch::default()),
         }
     }
 

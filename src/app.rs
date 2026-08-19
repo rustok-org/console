@@ -492,6 +492,15 @@ pub struct ModeSwitch {
     sent: bool,
 }
 
+impl Default for ModeSwitch {
+    /// The overlay as the binary's key-map tests need it — merely present.
+    /// `Supervised` is [`Self::new`]'s own fallback for an unknown mode, so
+    /// the default states nothing `new` would not.
+    fn default() -> Self {
+        Self::new(PolicyMode::Supervised)
+    }
+}
+
 /// The pickable modes, in the order the overlay lists them.
 const PICKABLE_MODES: [PolicyMode; 3] = [
     PolicyMode::ReadOnly,
@@ -504,11 +513,7 @@ impl ModeSwitch {
     /// stands (the cell that replaces `ack`). A degraded session's `Unknown`
     /// falls to `Supervised` — the middle of the ladder, and a mode the human
     /// sees highlighted rather than one silently assumed.
-    ///
-    /// Public for the binary's key-map tests, which need an overlay present;
-    /// the model itself is the only production constructor site.
-    #[must_use]
-    pub fn new(current: PolicyMode) -> Self {
+    fn new(current: PolicyMode) -> Self {
         Self {
             selected: if current.wire_word().is_some() {
                 current

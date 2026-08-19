@@ -4917,4 +4917,99 @@ mod tests {
             "the note survives an overflowing list: {rows:?}"
         );
     }
+
+    // ─── The mode switcher (spec §2.4) — the overlay itself, on a test backend ───
+
+    /// A model standing on the Dashboard with a real policy pair — the same
+    /// message path the app takes, no struct built by hand.
+    fn to_dashboard_with_policy(
+        m: &mut Model,
+        mode: crate::protocol::PolicyMode,
+        origin: crate::protocol::PolicyOrigin,
+    ) {
+        to_watching(m, vec![]);
+        m.update(Msg::Reply(Reply::Context(ContextOutcome::Ok(Box::new(
+            crate::protocol::WalletContext {
+                address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_owned(),
+                balances: vec![],
+                unavailable: vec![],
+                allowed_chains: vec![1],
+                policy: Policy { mode, origin },
+            },
+        )))));
+        m.update(Msg::View(crate::app::View::Dashboard));
+    }
+
+    #[test]
+    fn the_switcher_lists_three_modes_and_marks_the_current() {
+        let mut m = Model::new();
+        to_dashboard_with_policy(
+            &mut m,
+            crate::protocol::PolicyMode::Supervised,
+            crate::protocol::PolicyOrigin::Acknowledged,
+        );
+        m.update(Msg::SwitchStart);
+        let rows = draw_rows(&m, 80, 24);
+        let screen = rows.join("\n");
+        for word in ["read_only", "supervised", "autonomous"] {
+            assert!(screen.contains(word), "the overlay lists {word}");
+        }
+        let current_row = rows
+            .iter()
+            .find(|r| r.contains("(current)"))
+            .expect("the current mode is marked");
+        assert!(
+            current_row.contains("supervised"),
+            "the mark sits on the wallet's own mode: {current_row}"
+        );
+        assert!(
+            screen.contains("choose"),
+            "the picking stage names its keys"
+        );
+    }
+
+    #[test]
+    fn the_disclaimer_renders_exactly_when_autonomous_is_selected() {
+        const ANCHOR: &str = "ceiling is the wallet balance";
+        let mut m = Model::new();
+        to_dashboard_with_policy(
+            &mut m,
+            crate::protocol::PolicyMode::Supervised,
+            crate::protocol::PolicyOrigin::Acknowledged,
+        );
+        m.update(Msg::SwitchStart);
+        assert!(
+            !draw(&m, 80, 24).contains(ANCHOR),
+            "no disclaimer while supervised is selected"
+        );
+        m.update(Msg::SwitchNext); // supervised -> autonomous
+        assert!(
+            draw(&m, 80, 24).contains(ANCHOR),
+            "the disclaimer renders the moment autonomous is selected"
+        );
+        m.update(Msg::PinSubmit); // PIN stage opens
+        assert!(
+            draw(&m, 80, 24).contains(ANCHOR),
+            "and stays on screen while the PIN is typed — read before AND during"
+        );
+    }
+
+    #[test]
+    fn the_switcher_pin_stage_masks_digits_like_every_other_pin() {
+        let mut m = Model::new();
+        to_dashboard_with_policy(
+            &mut m,
+            crate::protocol::PolicyMode::Supervised,
+            crate::protocol::PolicyOrigin::Acknowledged,
+        );
+        m.update(Msg::SwitchStart);
+        m.update(Msg::PinSubmit);
+        for c in "4839".chars() {
+            m.update(Msg::PinDigit(c));
+        }
+        let screen = draw(&m, 80, 24);
+        assert!(screen.contains("●●●●"), "four dots for four digits");
+        assert!(!screen.contains("4839"), "the digits must never render");
+        assert!(screen.contains("apply"), "the PIN stage names its keys");
+    }
 }
