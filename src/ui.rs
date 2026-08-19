@@ -4966,6 +4966,16 @@ mod tests {
             screen.contains("choose"),
             "the picking stage names its keys"
         );
+        m.update(Msg::SwitchNext); // the selector moves; the mark must not follow
+        let rows = draw_rows(&m, 80, 24);
+        let current_row = rows
+            .iter()
+            .find(|r| r.contains("(current)"))
+            .expect("the mark survives a selector move");
+        assert!(
+            current_row.contains("supervised"),
+            "the mark stays on the wallet's own mode, not the cursor: {current_row}"
+        );
     }
 
     #[test]
